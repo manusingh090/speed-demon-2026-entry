@@ -30,7 +30,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 8 | Edges packed into one 32-bit word (head in the low 21 bits, weight above it, heavy weights in a sorted side list) in both numberings; transparent huge pages off | run-b8d2e5b996d8 | 0.346 | 64 | 62.76 |
 | 9 | Bidirectional Dijkstra over the packed forward graph and a packed reverse graph built in place; query ends mapped up front so the id map is freed first | run-9ea1a9d51d35 | 0.240 | 71 | 65.84 |
 | 10 | Count and fill passes in batches of 32 edges with every random line prefetched first; BFS and renumbering prefetch the nodes coming up | run-e72d02d00206 | 0.229 | 72 | 65.95 |
-| 11 | Search constants copied into the thread so the loop keeps them in registers; a queued node's offsets prefetched | pending | | | |
+| 11 | Search constants copied into the thread so the loop keeps them in registers; a queued node's offsets prefetched | run-23727a1a2adb | 0.228 | 73 | 65.96 |
 
 ## What the profile said, step by step
 
@@ -59,6 +59,8 @@ Also measured and kept out at this step: dense per-thread distance arrays (no fa
 **Step 10 on the board.** run-e72d02d00206: 0.229 s against 0.240 s, but the extra code took the formatted size from 362 to 400 lines, so K moved only from 20.74 to 20.84. In the same run Track A's unchanged code measured 0.039 s against its usual 0.031 s: the box's run-to-run spread is as large as most single steps.
 
 **Step 10 to 11.** The annotated search still reloaded the mask, shift and heavy-weight marker through the thread lambda's by-reference captures on every edge; they are copies inside the thread now. A node's offsets are prefetched when it is queued. The laptop could not separate this from noise (user CPU 1.4 to 1.7 s for both); it removes three loads per edge, so it stays, and the board run is the measurement. Same hash on all seven datasets.
+
+**After step 11: what was measured and not kept.** Wall-clock phase timers (local, ms): count pass about 30 to 40, fill 35 to 45, blob ordering about 35, new ids 9, renumbering 18, reverse graph 15, searches 60 to 75. Per-thread timers on the search showed all twelve threads finishing within about 5 ms of each other, so there is no tail of large queries to rebalance. Three ideas for the build did not separate from noise and were dropped: parsing the text once and keeping (tail, word) pairs for the fill pass (225 vs 223 ms, 3 MB more), pre-faulting each thread's slice of the input file with `MADV_POPULATE_READ`, and pre-faulting each thread's slice of the cursor and link arrays with `MADV_POPULATE_WRITE` (fill pass perhaps 3 ms faster, inside the spread). The laptop's run-to-run spread is about 15% and the box's up to 25%, so steps worth 5% or less can no longer be told apart; the next step for D has to be a larger structural change.
 
 ## Tried and kept out
 
