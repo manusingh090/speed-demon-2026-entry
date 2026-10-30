@@ -15,6 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | Scan output bucketed by term range in kernel-mapped blocks, scattered bucket by bucket | pending | | | |
 | 9 | Queries stored flat instead of two vectors each | pending | | | |
 | 10 | Terms renumbered by sampled frequency; tokenizer keeps one mask per 64-byte window | pending | | | |
+| 11 | Scan output in 3-byte entries, posting lists as 16-bit per-thread offsets decoded per query | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -34,6 +35,7 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 | 8 | same as 7 | 92 | peak was the scan output plus the lists; now about one of them |
 | 9 | same | 89 | query parse allocations gone |
 | 10 | 0.33 vs 0.45 for the original (same session) | 92 | per-term scan state of common terms now compact |
+| 11 | 0.33, same as 10 (same session) | 76 | scan output 48 to 36 MB, lists 48 to 24 MB |
 
 ## What the profile said, step by step
 
@@ -56,4 +58,5 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 - Prefetching the term key as well as the slot (second prefetch stage): no change.
 - Atomic versus plain OR for bitmap bits: about 5%, not worth the race at thread boundaries.
 - Buckets balanced by sampled postings instead of 512 ids: hundreds more block lists, 96 MB and slower.
+- Numbering terms rarest first, so the heaviest bucket is scattered last: about 5% slower and no smaller.
 - Renumbering only the bitmap terms to the front: kept memory at 88 MB but lost the speed of the full frequency order.

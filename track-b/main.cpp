@@ -272,49 +272,61 @@ struct Index {
     std::vector<u32> dense;       // per term: its bitmap number, or NONE for a list
     std::vector<u64> bits;        // the bitmaps, `words` each
     std::vector<u32> df;          // per term: number of documents containing it
-    std::vector<u32> start;       // per term, offset into post; start[n] is the total
-    std::unique_ptr<u32[]> post;  // doc ids, ascending within each term
-    std::vector<u32> text;        // per doc: offset of its text, then of its end (2 per doc)
+    // A list term's documents are stored per thread, in thread order: thread t's
+    // segment holds doc - first[t] as 16 bits (a thread covers far fewer than
+    // 65,536 documents), so each posting takes two bytes.
+    int threads = 0;
+    std::vector<u32> first;            // per thread: its first doc id
+    std::vector<u32> start;            // per term, offset into post; start[n] is the total
+    std::vector<std::vector<u32>> seg_end;  // per thread, per term: where its segment ends
+    std::unique_ptr<uint16_t[]> post;  // doc offsets, ascending within each segment
+    std::vector<u32> text;             // per doc: offset of its text, then of its end (2 per doc)
 };
 
-// An append-only list of u32 kept in 1 MB blocks mapped straight from the
-// kernel (pages count only once written). drain() unmaps each block as soon as
-// it has been read, so the memory really goes back; malloc would keep it.
+// An append-only list of 24-bit entries kept in blocks mapped straight from
+// the kernel (pages count only once written). drain() unmaps each block as soon
+// as it has been read, so the memory really goes back; malloc would keep it.
 class BlockList {
 public:
-    static constexpr size_t BLOCK = 1 << 18;
-    ~BlockList() { for (u32* b : blocks_) munmap(b, BLOCK * 4); }
+    static constexpr size_t BLOCK = 1 << 18;          // entries per block
+    static constexpr size_t BYTES = 3 * BLOCK + 1;    // a 4-byte store at the last entry spills one byte
+    ~BlockList() { for (uint8_t* b : blocks_) munmap(b, BYTES); }
 
     void push(u32 x) {
         if (fill_ == BLOCK) {
-            cur_ = static_cast<u32*>(mmap(nullptr, BLOCK * 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            cur_ = static_cast<uint8_t*>(mmap(nullptr, BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
             blocks_.push_back(cur_);
             fill_ = 0;
         }
-        cur_[fill_++] = x;
+        memcpy(cur_ + 3 * fill_++, &x, 4);
     }
 
     template <class F>
     void drain(F&& f) {
         for (size_t b = 0; b < blocks_.size(); ++b) {
             size_t n = b + 1 == blocks_.size() ? fill_ : BLOCK;
-            for (size_t i = 0; i < n; ++i) f(blocks_[b][i]);
-            munmap(blocks_[b], BLOCK * 4);
+            for (size_t i = 0; i < n; ++i) {
+                u32 x;
+                memcpy(&x, blocks_[b] + 3 * i, 4);
+                f(x & 0xFFFFFF);
+            }
+            munmap(blocks_[b], BYTES);
         }
         blocks_.clear();
     }
 
 private:
-    std::vector<u32*> blocks_;
-    u32* cur_ = nullptr;
+    std::vector<uint8_t*> blocks_;
+    uint8_t* cur_ = nullptr;
     size_t fill_ = BLOCK;
 };
 
 // The scan files each posting under a bucket of 512 consecutive term ids, as
-// the term's offset in the bucket (9 bits) above the doc id (23 bits). The
-// scatter then fills the posting lists one bucket at a time, so the lists'
-// pages are touched only as the scan output that fills them is freed.
-constexpr u32 BUCKET_BITS = 9, DOC_BITS = 23;
+// the term's offset in the bucket (9 bits) above the doc's offset in the
+// thread's range (15 bits). The scatter then fills the posting lists one
+// bucket at a time, so the lists' pages are touched only as the scan output
+// that fills them is freed.
+constexpr u32 BUCKET_BITS = 9, DOC_BITS = 15;
 
 u32 parse_id(const uint8_t* p) {
     u32 v = 0;
@@ -333,7 +345,8 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         while (last > 0 && base[last - 1] != '\n') --last;
         ix.docs = parse_id(base + last) + 1;
     }
-    if (ix.docs >> DOC_BITS) { fputs("too many documents\n", stderr); _exit(1); }
+    ix.threads = nthreads;
+    ix.first.resize(nthreads);
     ix.text.resize(2 * size_t(ix.docs));
     ix.words = (ix.docs + 63) / 64;
     ix.dense.assign(nterms, NONE);
@@ -379,7 +392,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         pool.emplace_back([&, t] {
             const uint8_t* begin = base + cut[t];
             const uint8_t* end = base + cut[t + 1];
-            const u32 first = begin < end ? parse_id(begin) : 0;
+            const u32 first = ix.first[t] = begin < end ? parse_id(begin) : 0;
             auto& cnt = count[t];
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
@@ -408,16 +421,17 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
             std::fill(last_doc.begin(), last_doc.end(), NONE);
             auto& out = seen[t];
             out.resize(nbuckets);
-            walk(end, [&](u32 id, u32 doc) {
+            const u32 docs = walk(end, [&](u32 id, u32 doc) {
                 if (u32 d = ix.dense[id]; d != NONE) {
                     // Neighbouring threads can share a boundary word.
                     std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
                         .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
                 } else {
-                    out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | doc);
+                    out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | (doc - first));
                     ++cnt[id];
                 }
             }, [] {});
+            if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
         });
     }
     for (auto& th : pool) th.join();
@@ -436,9 +450,10 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         }
     }
     ix.start[nterms] = total;
-    ix.post.reset(new u32[total]);  // not zeroed: every slot is written below
+    ix.post.reset(new uint16_t[total]);  // not zeroed: every slot is written below
     // Each thread drains its own lists bucket by bucket into its own segment of
-    // every term, so the threads never share a cursor.
+    // every term, so the threads never share a cursor. The cursors end at the
+    // segment ends, which the queries use to decode the lists.
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
             for (u32 b = 0; b < nbuckets; ++b)
@@ -449,6 +464,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
         });
     }
     for (auto& th : pool) th.join();
+    ix.seg_end = std::move(count);
 
     ix.df.resize(nterms);
     for (u32 id = 0; id < nterms; ++id) {
@@ -560,10 +576,15 @@ public:
     }
 
 private:
-    Postings postings(u32 id) const {
-        u32 d = ix_.dense[id];
-        return {ix_.post.get() + ix_.start[id], ix_.df[id],
-                d == NONE ? nullptr : &ix_.bits[d * ix_.words], ix_.words};
+    // A bitmap term's bitmap, or a list term's documents decoded into list_
+    // (valid until the next call).
+    Postings postings(u32 id) {
+        if (u32 d = ix_.dense[id]; d != NONE) return {nullptr, ix_.df[id], &ix_.bits[d * ix_.words], ix_.words};
+        list_.resize(ix_.df[id]);
+        u32 i = ix_.start[id], n = 0;
+        for (int t = 0; t < ix_.threads; ++t)
+            for (u32 e = ix_.seg_end[t][id]; i < e; ++i) list_[n++] = ix_.first[t] + ix_.post[i];
+        return {list_.data(), n, nullptr, ix_.words};
     }
 
     // The running result is a sorted list (cur_) or, once a bitmap term has been
@@ -731,7 +752,7 @@ private:
     const Index& ix_;
     const TermTable& terms_;
     const File& docs_;
-    std::vector<u32> cur_, tmp_, order_;
+    std::vector<u32> cur_, tmp_, order_, list_;
     std::vector<u64> bm_;
     bool dense_ = false;
 };

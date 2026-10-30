@@ -88,7 +88,7 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 | Track | State | Local wall | Local peak | Notes |
 |---|---|---|---|---|
 | A | C++, pushed, all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S 222 after clang-format (was 373; ref 56); see track-a/README.md |
-| B | C++, pushed, all hashes pass incl. worked | 0.29 to 0.35 s | 92 MB | S 773 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
+| B | C++, pushed, all hashes pass incl. worked | 0.30 to 0.35 s | 76 MB | S about 790 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
 | C | C++, pushed, all hashes pass incl. worked and rules examples | 62 to 77 ms | 13 MB | S about 374 after clang-format (ref 108); see track-c/README.md |
 | D | not started (reference) | | | |
 
