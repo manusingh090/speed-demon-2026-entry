@@ -79,7 +79,7 @@ speed-demon-2026-entry/          github.com/manusingh090/speed-demon-2026-entry 
 
 Each track folder is built and measured on its own. Code shared between tracks must be copied into each folder and counts toward S in each.
 
-A track folder that is byte-identical to the starter (ignoring Markdown and `.speed-demon.toml`) is reported `unchanged` and never runs. Tracks A, C and D are still the unchanged starter.
+A track folder that is byte-identical to the starter (ignoring Markdown and `.speed-demon.toml`) is reported `unchanged` and never runs. Tracks C and D are still the unchanged starter.
 
 `.speed-demon.toml` per track: set `team`, `language`, `dependency_count`. Track B has `team = "manusingh090"`, `language = "C++"`, `dependency_count = 0`. Make the team name match what was entered on the Tally form.
 
@@ -87,7 +87,7 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 
 | Track | State | Local wall | Local peak | Notes |
 |---|---|---|---|---|
-| A | not started (reference) | | | |
+| A | C++, pushed (5446b81), all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S about 373 after clang-format (ref 56); see track-a/README.md |
 | B | C++, pushed, all hashes pass | 0.35 to 0.45 s | 134 MB | see section 7 |
 | C | not started (reference) | | | |
 | D | not started (reference) | | | |
@@ -201,6 +201,10 @@ ENTRYPOINT ["/app/run"]
 Delete the reference files (`run.py`, `<x>.py`) from the track folder when replacing them; they would count toward S.
 
 ### Track A: Ingest (3.1M log lines, 239 MB, ref 32 s)
+
+- Done (see `track-a/README.md`). Worked example dataset is `data/a-worked` (reference hash `0782f9b9a885bdbcdfadf330f6bea55accdc06018c0108f69ea43372d2fac692`); tiny hash `c24fa507c963eaeac9224fd8435019b4f4e8c002ece7e32f316681a3957eb92f`.
+- S is counted after `clang-format --style=LLVM` (80 columns), so long lines wrap and count twice. Check locally with the pip `clang-format` wheel. Reference S per track (harness/reference_axes.json): A 56, B 91, C 108, D 43.
+- Laptop profile of the pushed version: parse about 20 ms (of which page faults 3 to 7 ms, SIMD scan alone 9 to 11 ms), hours 9 ms, write overlapped. MAP_POPULATE was slower (serial populate, +15 ms).
 
 - Input `/data/requests.log`: `ts method endpoint status latency_us`, single spaces, LF. Timestamp always 27 bytes fixed width, span fixed to 72 hours (2026-10-30T18:00Z to 2026-11-02T17:59:59Z), so the hour index can be computed from fixed byte offsets (day and hour digits) with no date library. Lines are **not** sorted; no bound on disorder.
 - Group by (hour, endpoint) where endpoint is an exact byte string; 1,842 endpoints, Zipf popularity, so a hash map from endpoint bytes to a small id, then a 72 x 1842 grid of groups.
