@@ -1,10 +1,10 @@
 // Speed Demon 2026, Track D (Traverse).
 //
 // Node ids in graph.txt are a random relabelling, so a search over them would
-// miss the cache on almost every step. The graph is built in two parallel
-// passes over the memory-mapped text (line-aligned ranges, one per thread):
-// out-degrees, then every edge's head and weight in CSR arrays. After the
-// nodes are renumbered, the CSR is copied into the new numbering.
+// miss the cache on almost every step. The memory-mapped text is parsed once
+// (line-aligned ranges, one per thread), each thread filing its edges by tail
+// range; each owner of a range then builds its slice of the CSR arrays. After
+// the nodes are renumbered, the CSR is copied into the new numbering.
 // The renumbering cuts the road network into compact blobs of about 512 nodes:
 // each thread grows a blob by BFS over unclaimed nodes, then starts the next
 // one from the blob's frontier, so consecutive ids are close on the map and a
@@ -173,29 +173,44 @@ int main() {
     std::vector<std::atomic<u8>> target(n);  // 1 = queried target, 2 = also has an in-edge
     for (auto [s, t] : queries) target[t].store(1, std::memory_order_relaxed);
 
-    // Passes 1 and 2: out-degrees, then each edge's head at its tail's next slot.
-    std::vector<std::atomic<u32>> next(n + 1);
+    // One parse: each thread files its edges by tail range, one owner per
+    // thread. Then each owner counts and places the edges of its own nodes into
+    // its own contiguous slice of the CSR arrays: no atomics, local writes.
+    struct Line {
+        u32 u, v, w;
+    };
+    const u32 span = (n + nthreads - 1) / nthreads;  // nodes per owner
+    std::vector<std::vector<std::vector<Line>>> filed(nthreads, std::vector<std::vector<Line>>(nthreads));
     run_threads(nthreads, [&](int t) {
-        parse(t, [&](u32 u, u32 v, u32) {
-            next[u].fetch_add(1, std::memory_order_relaxed);
+        for (auto& f : filed[t]) f.reserve((cut[t + 1] - cut[t]) / 18 / nthreads * 9 / 8);
+        parse(t, [&](u32 u, u32 v, u32 w) {
+            filed[t][u / span].push_back({u, v, w});
             if (target[v].load(std::memory_order_relaxed)) target[v].store(2, std::memory_order_relaxed);
         });
     });
-    std::vector<u32> start(n + 1);
-    for (u32 u = 0, total = 0; u <= n; ++u) {
-        start[u] = total;
-        total += next[u].load(std::memory_order_relaxed);
-        next[u].store(start[u], std::memory_order_relaxed);
+    std::vector<u32> base(nthreads + 1);  // first edge of each owner's slice
+    for (int o = 0; o < nthreads; ++o) {
+        base[o + 1] = base[o];
+        for (int t = 0; t < nthreads; ++t) base[o + 1] += filed[t][o].size();
     }
-    std::vector<u32> heads(start[n]), weights(start[n]);
-    run_threads(nthreads, [&](int t) {
-        parse(t, [&](u32 u, u32 v, u32 w) {
-            u32 e = next[u].fetch_add(1, std::memory_order_relaxed);
-            heads[e] = v;
-            weights[e] = w;
-        });
+    std::vector<u32> start(n + 1), heads(base[nthreads]), weights(base[nthreads]);
+    start[n] = base[nthreads];
+    run_threads(nthreads, [&](int o) {
+        const u32 lo = std::min<u64>(n, u64(o) * span), hi = std::min<u64>(n, u64(o + 1) * span);
+        std::vector<u32> next(hi - lo + 1);
+        for (int t = 0; t < nthreads; ++t)
+            for (const Line& l : filed[t][o]) ++next[l.u - lo + 1];
+        next[0] = base[o];
+        for (u32 i = 0; i < hi - lo; ++i) start[lo + i] = next[i], next[i + 1] += next[i];
+        for (int t = 0; t < nthreads; ++t) {
+            for (const Line& l : filed[t][o]) {
+                u32 e = next[l.u - lo]++;
+                heads[e] = l.v;
+                weights[e] = l.w;
+            }
+            std::vector<Line>().swap(filed[t][o]);
+        }
     });
-    std::vector<std::atomic<u32>>().swap(next);
 
     // Blobs. A thread grows each blob by BFS over unclaimed nodes until it holds
     // BLOB nodes; the blob's unexpanded nodes' unclaimed neighbours become the

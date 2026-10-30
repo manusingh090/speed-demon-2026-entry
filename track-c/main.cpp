@@ -26,6 +26,7 @@
 #include <immintrin.h>
 #include <string>
 #include <string_view>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -324,6 +325,12 @@ void put_money(std::string& out, i64 cents) {
 }
 
 int main() {
+    // Threads get 1 MB stacks: an 8 MB stack can hold a 2 MB transparent huge
+    // page, which its first touch would claim in full.
+    pthread_attr_t small_stack;
+    pthread_attr_init(&small_stack);
+    pthread_attr_setstacksize(&small_stack, 1 << 20);
+    pthread_setattr_default_np(&small_stack);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
