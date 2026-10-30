@@ -18,6 +18,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 11 | Scan output in 3-byte entries, posting lists as 16-bit per-thread offsets decoded per query | run-a75abbe64920 | 0.292 | 167 | 61.0 |
 | 12 | malloc mmap threshold pinned, so freed scan state really goes back | run-5c032275f3b6 | 0.301 | 175 | 60.5 |
 | 13 | Transparent huge pages off (the box backed partly written blocks with whole 2 MB pages) | run-e6924d8063c9 | 0.292 | 69.6 | 64.8 |
+| 14 | Scan output as 16-bit units: term offset in its bucket and a 7-bit doc gap, with an escape for larger gaps | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -39,6 +40,7 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 | 10 | 0.33 vs 0.45 for the original (same session) | 92 | per-term scan state of common terms now compact |
 | 11 | 0.33, same as 10 (same session) | 76 | scan output 48 to 36 MB, lists 48 to 24 MB |
 | 12 | 0.33, same as 11 | 71 | glibc had kept freed per-thread arrays resident (found on Track D) |
+| 14 | 0.323 vs 0.339 (9 alternating runs) | 61 vs 71 | scan output 36 to about 24 MB |
 
 ## What the profile said, step by step
 
@@ -53,6 +55,8 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 **Step 5 to 6.** BOOL was now the larger query cost: a bitmap term at the start of a query, or OR-ed in, expanded into a list of up to 250,000 ids, and each later step copied it again. The running result now stays a bitmap once that happens, so AND, OR and NOT against another bitmap are word loops, and count, sum and the ten smallest ids come from popcounts.
 
 **Step 6 to 10 (second session).** A single-threaded breakdown of the scan showed tokenizing about 500 ms, term lookups about 290 ms and the per-term bookkeeping (dedupe, bitmap OR, list push) about 420 ms. Prefetching each token's table slot and resolving it 8 tokens later (step 7) gave the first large gain. Peak memory was the scan output (48 MB) plus the lists it is scattered into (48 MB): filing the output by term bucket and scattering bucket by bucket with kernel-mapped blocks (step 8) dropped the peak from 134 to 92 MB at the same speed; with malloc the freed blocks stayed resident, which is why an earlier free-as-you-drain attempt had saved nothing. Renumbering terms by sampled frequency (step 10) made the per-term state of the common terms compact and was about 8% faster.
+
+**Step 13 to 14.** Memory by phase (cgroup `memory.current` read between phases): 8 MB after the queries, 66 MB at the end of the scan, a peak of 70 MB during the scatter, then 52 MB. The scan output was the bulk of it: 12.1M (term, doc) pairs at 3 bytes, about 36 MB, held until the scatter frees it. A thread meets its documents in order, so within one bucket's stream the docs never go down, and a pair fits in 16 bits as the term's 9-bit offset in its bucket and the 7-bit gap since that bucket's previous doc. Gaps of 127 or more (rare: a bucket of 512 terms usually has a posting every few docs) are written as 127 followed by a unit holding the whole gap. The scatter decodes the stream as it drains it. Peak 71 to 61 MB locally and the run slightly faster (less to write and read), same hash on full, sample, tiny, the worked example and a seed-5 sample checked against the reference.
 
 ## Tried and kept out
 
