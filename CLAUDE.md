@@ -88,7 +88,7 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 | Track | State | Local wall | Local peak | Notes |
 |---|---|---|---|---|
 | A | C++, pushed, all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S 222 after clang-format (was 373; ref 56); see track-a/README.md |
-| B | C++, pushed, all hashes pass | 0.35 to 0.45 s | 134 MB | see section 7 |
+| B | C++, pushed, all hashes pass incl. worked | 0.29 to 0.35 s | 92 MB | S 773 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
 | C | C++, pushed, all hashes pass incl. worked and rules examples | 62 to 77 ms | 13 MB | S about 374 after clang-format (ref 108); see track-c/README.md |
 | D | not started (reference) | | | |
 
@@ -256,6 +256,8 @@ Lessons, each one measured:
 - **Fixed-size output slots per query** let queries run in any order on any thread and be written with one call.
 - **Use the sample to make decisions at run time** (which terms are dense) instead of hard-coding thresholds from the public data; the scoring data is a different seed.
 - `std::barrier` (C++20) is a clean way to run "sample, decide, then scan" inside one thread pool.
+
+Second pass on Track B (Oct 31): the scan is bound by memory accesses, not tokenizing (a 35% faster tokenizer changed almost nothing end to end). What moved it: prefetching term-table slots 8 tokens ahead, renumbering terms by sampled frequency, and for memory, bucketing the scan output and freeing it with munmap while scattering (malloc keeps freed blocks resident, so free-as-you-go only works with kernel-mapped blocks).
 
 ## 8. Useful links
 

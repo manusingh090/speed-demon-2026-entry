@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <memory>
+#include <span>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -46,6 +47,7 @@ struct File {
     size_t size = 0;
 };
 
+// Maps the file over a spare zero page, so 64-byte loads near its end are safe.
 File map_file(const std::string& path) {
     File f;
     int fd = open(path.c_str(), O_RDONLY);
@@ -53,11 +55,12 @@ File map_file(const std::string& path) {
     struct stat st;
     fstat(fd, &st);
     f.size = st.st_size;
-    if (f.size) {
-        void* p = mmap(nullptr, f.size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
-        f.data = static_cast<const uint8_t*>(p);
+    void* p = mmap(nullptr, f.size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (f.size && mmap(p, f.size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        perror("mmap");
+        _exit(1);
     }
+    f.data = static_cast<const uint8_t*>(p);
     close(fd);
     return f;
 }
@@ -104,8 +107,20 @@ public:
         }
     }
 
-    u32 find(const Key& k) const {
-        u64 h = hash_key(k);
+    // Old id i becomes new_id[i]; keys move with their ids.
+    void renumber(const std::vector<u32>& new_id) {
+        std::vector<Key> keys(keys_.size());
+        std::vector<uint8_t> lens(lens_.size());
+        for (u32 i = 0; i < keys_.size(); ++i) keys[new_id[i]] = keys_[i], lens[new_id[i]] = lens_[i];
+        keys_.swap(keys);
+        lens_.swap(lens);
+        rehash(slots_.size());
+    }
+
+    void prefetch(u64 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & mask_]), _MM_HINT_T0); }
+
+    // h is hash_key(k), computed (and prefetched) earlier by the caller.
+    u32 find(const Key& k, u64 h) const {
         for (size_t i = h & mask_;; i = (i + 1) & mask_) {
             u64 s = slots_[i];
             if (s == 0) return NONE;
@@ -131,35 +146,87 @@ private:
     size_t mask_ = 0;
 };
 
-// Calls emit(term_id) for every token of text [q, e) that is a known term
-// (NONE for tokens that are not). Tokens longer than 32 bytes cannot be terms.
-// The key is read from the text 8 bytes at a time: token bytes are all [A-Za-z0-9],
-// so OR-ing 0x20 lowercases letters and leaves digits alone. `limit` is the end
-// of the mapping; tokens closer to it than 32 bytes are copied instead.
-template <class F>
-inline void for_each_token(const uint8_t* q, const uint8_t* e, const uint8_t* limit,
-                           const TermTable& terms, F&& emit) {
-    while (q < e) {
-        if (!LOWER.t[*q]) { ++q; continue; }
-        const uint8_t* s = q;
-        while (q < e && LOWER.t[*q]) ++q;
-        const size_t len = q - s;
-        if (len > MAX_TERM) { emit(NONE); continue; }
-        Key k{{0, 0, 0, 0}};
-        memcpy(k.w, s, s + MAX_TERM <= limit ? MAX_TERM : len);
-        for (size_t i = 0; i < 4; ++i) {
-            size_t n = len > 8 * i ? std::min<size_t>(len - 8 * i, 8) : 0;
-            u64 mask = n == 8 ? ~0ull : (1ull << (8 * n)) - 1;
-            k.w[i] = (k.w[i] | 0x2020202020202020ull) & mask;
-        }
-        emit(terms.find(k));
-    }
+// Bit i is set when byte i of the 64 at p is a token byte, [A-Za-z0-9]: after
+// OR-ing 0x20 a letter lies in 'a'..'z', and a digit lies in '0'..'9' as is.
+inline u64 token_bytes(const uint8_t* p) {
+    auto half = [](const uint8_t* q) {
+        __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
+        __m256i letter = _mm256_sub_epi8(_mm256_or_si256(v, _mm256_set1_epi8(0x20)), _mm256_set1_epi8('a'));
+        __m256i digit = _mm256_sub_epi8(v, _mm256_set1_epi8('0'));
+        __m256i zero = _mm256_setzero_si256();
+        __m256i in = _mm256_or_si256(_mm256_cmpeq_epi8(_mm256_subs_epu8(letter, _mm256_set1_epi8(25)), zero),
+                                     _mm256_cmpeq_epi8(_mm256_subs_epu8(digit, _mm256_set1_epi8(9)), zero));
+        return u32(_mm256_movemask_epi8(in));
+    };
+    return half(p) | u64(half(p + 32)) << 32;
 }
 
+// Calls emit(term_id) for every token of text [q, e) that is a known term
+// (NONE for tokens that are not; tokens longer than 32 bytes are skipped).
+// Token bounds come from one class mask per 64-byte window (a token that runs
+// into the window's end starts the next window). The key is read from the
+// text 8 bytes at a time: token bytes are all [A-Za-z0-9], so OR-ing 0x20
+// lowercases letters and leaves digits alone. Each key's table slot is
+// prefetched and the key looked up LAG tokens later, so the misses overlap.
+template <class F>
+inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& terms, F&& emit) {
+    constexpr size_t LAG = 8;
+    Key keys[LAG];
+    u64 hashes[LAG];
+    size_t n = 0;
+    u64 m = 0;  // token bytes of the window at q not yet consumed
+    for (bool fresh = true; q < e;) {
+        if (fresh) {
+            m = token_bytes(q);
+            if (e - q < 64) m &= (1ull << (e - q)) - 1;
+            fresh = false;
+        }
+        if (m == 0) { q += 64; fresh = true; continue; }
+        const uint8_t* s = q + __builtin_ctzll(m);
+        const u64 after = ~m & (~0ull << __builtin_ctzll(m));  // bytes past the token start that end it
+        if (after == 0 && s != q) { q = s; fresh = true; continue; }  // re-window at the token
+        const uint8_t* t = after ? q + __builtin_ctzll(after) : s + 64;
+        while (t < e && LOWER.t[*t]) ++t;  // only a token of 64 bytes or more
+        m &= after ? ~0ull << __builtin_ctzll(after) : 0;
+        if (t > q + 64) { q = t; fresh = true; }
+        const size_t len = t - s;
+        if (len > MAX_TERM) continue;
+        Key k;
+        for (size_t i = 0; i < 4; ++i) {
+            size_t b = len > 8 * i ? std::min<size_t>(len - 8 * i, 8) : 0;
+            u64 w;
+            memcpy(&w, s + 8 * i, 8);
+            k.w[i] = (w | 0x2020202020202020ull) & (b == 8 ? ~0ull : (1ull << (8 * b)) - 1);
+        }
+        const u64 h = hash_key(k);
+        terms.prefetch(h);
+        const size_t slot = n++ % LAG;
+        if (n > LAG) emit(terms.find(keys[slot], hashes[slot]));
+        keys[slot] = k;
+        hashes[slot] = h;
+    }
+    for (size_t i = n > LAG ? n - LAG : 0; i < n; ++i) emit(terms.find(keys[i % LAG], hashes[i % LAG]));
+}
+
+// One query, as views into the flat arrays below.
 struct Query {
     bool phrase;
-    std::vector<u32> terms;  // term ids
-    std::vector<char> ops;   // BOOL only: 'A', 'O' or 'N' between terms
+    std::span<const u32> terms;  // term ids
+    std::span<const char> ops;   // BOOL only: 'A', 'O' or 'N' between terms
+};
+
+// All queries, flat: query i's terms are terms[first[i], first[i + 1]), and
+// for BOOL ops[first[i] + k] joins its terms k and k + 1.
+struct Queries {
+    std::vector<u32> terms, first{0};
+    std::vector<char> ops;
+    std::vector<bool> phrase;
+
+    size_t size() const { return phrase.size(); }
+    Query operator[](size_t i) const {
+        size_t b = first[i], n = first[i + 1] - b;
+        return {phrase[i], {terms.data() + b, n}, {ops.data() + b, n - 1}};
+    }
 };
 
 Key make_key(const uint8_t* p, size_t len) {
@@ -168,25 +235,29 @@ Key make_key(const uint8_t* p, size_t len) {
     return k;
 }
 
-std::vector<Query> parse_queries(const File& f, TermTable& terms) {
-    std::vector<Query> qs;
+Queries parse_queries(const File& f, TermTable& terms) {
+    Queries qs;
     const uint8_t* p = f.data;
     const uint8_t* end = f.data + f.size;
     while (p < end) {
         const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
         if (!nl) nl = end;
-        Query q;
-        q.phrase = p[0] == 'P';
-        const uint8_t* s = p + (q.phrase ? 8 : 5);  // past `PHRASE "` or `BOOL `
-        const uint8_t* e = q.phrase ? nl - 1 : nl;  // drop the closing quote
+        const bool phrase = p[0] == 'P';
+        const uint8_t* s = p + (phrase ? 8 : 5);  // past `PHRASE "` or `BOOL `
+        const uint8_t* e = phrase ? nl - 1 : nl;  // drop the closing quote
         for (int word = 0; s < e; ++word) {
             const uint8_t* sp = static_cast<const uint8_t*>(memchr(s, ' ', e - s));
             if (!sp) sp = e;
-            if (!q.phrase && word % 2 == 1) q.ops.push_back(static_cast<char>(*s));
-            else q.terms.push_back(terms.insert(make_key(s, sp - s)));
+            if (!phrase && word % 2 == 1) {
+                qs.ops.back() = static_cast<char>(*s);  // the slot of the term before it
+            } else {
+                qs.terms.push_back(terms.insert(make_key(s, sp - s)));
+                qs.ops.push_back(0);
+            }
             s = sp + 1;
         }
-        qs.push_back(std::move(q));
+        qs.phrase.push_back(phrase);
+        qs.first.push_back(qs.terms.size());
         p = nl + 1;
     }
     return qs;
@@ -206,16 +277,20 @@ struct Index {
     std::vector<u32> text;        // per doc: offset of its text, then of its end (2 per doc)
 };
 
-// An append-only list of u32 kept in 1 MB blocks. drain() frees each block as
-// soon as it has been read, so the scan's output and the posting lists it is
-// scattered into are never both fully resident.
+// An append-only list of u32 kept in 1 MB blocks mapped straight from the
+// kernel (pages count only once written). drain() unmaps each block as soon as
+// it has been read, so the memory really goes back; malloc would keep it.
 class BlockList {
 public:
     static constexpr size_t BLOCK = 1 << 18;
-    ~BlockList() { for (u32* b : blocks_) delete[] b; }
+    ~BlockList() { for (u32* b : blocks_) munmap(b, BLOCK * 4); }
 
     void push(u32 x) {
-        if (fill_ == BLOCK) blocks_.push_back(cur_ = new u32[BLOCK]), fill_ = 0;
+        if (fill_ == BLOCK) {
+            cur_ = static_cast<u32*>(mmap(nullptr, BLOCK * 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+            blocks_.push_back(cur_);
+            fill_ = 0;
+        }
         cur_[fill_++] = x;
     }
 
@@ -224,7 +299,7 @@ public:
         for (size_t b = 0; b < blocks_.size(); ++b) {
             size_t n = b + 1 == blocks_.size() ? fill_ : BLOCK;
             for (size_t i = 0; i < n; ++i) f(blocks_[b][i]);
-            delete[] blocks_[b];
+            munmap(blocks_[b], BLOCK * 4);
         }
         blocks_.clear();
     }
@@ -235,13 +310,19 @@ private:
     size_t fill_ = BLOCK;
 };
 
+// The scan files each posting under a bucket of 512 consecutive term ids, as
+// the term's offset in the bucket (9 bits) above the doc id (23 bits). The
+// scatter then fills the posting lists one bucket at a time, so the lists'
+// pages are touched only as the scan output that fills them is freed.
+constexpr u32 BUCKET_BITS = 9, DOC_BITS = 23;
+
 u32 parse_id(const uint8_t* p) {
     u32 v = 0;
     while (*p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
     return v;
 }
 
-Index build_index(const File& f, const TermTable& terms, int nthreads) {
+Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms, int nthreads) {
     Index ix;
     const u32 nterms = terms.size();
     const uint8_t* base = f.data;
@@ -252,32 +333,45 @@ Index build_index(const File& f, const TermTable& terms, int nthreads) {
         while (last > 0 && base[last - 1] != '\n') --last;
         ix.docs = parse_id(base + last) + 1;
     }
+    if (ix.docs >> DOC_BITS) { fputs("too many documents\n", stderr); _exit(1); }
     ix.text.resize(2 * size_t(ix.docs));
     ix.words = (ix.docs + 63) / 64;
     ix.dense.assign(nterms, NONE);
+    const u32 nbuckets = (nterms >> BUCKET_BITS) + 1;
 
     // Each thread takes a byte range snapped to line starts. It first samples
     // the start of its range so the dense terms can be picked, then scans it all:
-    // dense terms set bits, other terms go to `seen` as each document's distinct
-    // term ids followed by a NONE marker.
+    // dense terms set bits, other terms' (term, doc) pairs go to `seen`, one
+    // block list per bucket of terms.
     std::vector<size_t> cut(nthreads + 1);
     for (int t = 0; t <= nthreads; ++t) {
         size_t c = size * t / nthreads;
         while (c > 0 && c < size && base[c - 1] != '\n') ++c;
         cut[t] = c;
     }
-    std::vector<BlockList> seen(nthreads);
+    std::vector<std::vector<BlockList>> seen(nthreads);
     std::vector<std::vector<u32>> count(nthreads);
-    std::vector<u32> first_doc(nthreads), sampled(nthreads);
+    std::vector<u32> sampled(nthreads);
+    // After the sample: renumber the terms by sampled frequency, most frequent
+    // first (the scan's per-term state for common terms then shares a few
+    // cache lines), and make the terms over 1/32 of the sample bitmaps.
     std::barrier sync(nthreads, [&]() noexcept {
         u64 docs = 0;
         for (u32 s : sampled) docs += s;
-        u32 ndense = 0;
+        std::vector<u64> df(nterms);
+        std::vector<u32> order(nterms), new_id(nterms);
         for (u32 id = 0; id < nterms; ++id) {
-            u64 df = 0;
-            for (int t = 0; t < nthreads; ++t) df += count[t][id];
-            if (df * 32 > docs) ix.dense[id] = ndense++;
+            for (int t = 0; t < nthreads; ++t) df[id] += count[t][id];
+            order[id] = id;
         }
+        std::stable_sort(order.begin(), order.end(), [&](u32 a, u32 b) { return df[a] > df[b]; });
+        u32 ndense = 0;
+        for (u32 rank = 0; rank < nterms; ++rank) {
+            new_id[order[rank]] = rank;
+            if (df[order[rank]] * 32 > docs) ix.dense[rank] = ndense++;
+        }
+        terms.renumber(new_id);
+        for (u32& id : query_terms) id = new_id[id];
         ix.bits.assign(ndense * ix.words, 0);
     });
     std::vector<std::thread> pool;
@@ -286,7 +380,6 @@ Index build_index(const File& f, const TermTable& terms, int nthreads) {
             const uint8_t* begin = base + cut[t];
             const uint8_t* end = base + cut[t + 1];
             const u32 first = begin < end ? parse_id(begin) : 0;
-            first_doc[t] = first;
             auto& cnt = count[t];
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
@@ -300,7 +393,7 @@ Index build_index(const File& f, const TermTable& terms, int nthreads) {
                     const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
                     ix.text[2 * size_t(doc)] = tx - base;
                     ix.text[2 * size_t(doc) + 1] = nl - base;
-                    for_each_token(tx, nl, base + size, terms, [&](u32 id) {
+                    for_each_token(tx, nl, terms, [&](u32 id) {
                         if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, term(id, doc);
                     });
                     done();
@@ -314,16 +407,17 @@ Index build_index(const File& f, const TermTable& terms, int nthreads) {
             std::fill(cnt.begin(), cnt.end(), 0);
             std::fill(last_doc.begin(), last_doc.end(), NONE);
             auto& out = seen[t];
+            out.resize(nbuckets);
             walk(end, [&](u32 id, u32 doc) {
                 if (u32 d = ix.dense[id]; d != NONE) {
                     // Neighbouring threads can share a boundary word.
                     std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
                         .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
                 } else {
-                    out.push(id);
+                    out[id >> BUCKET_BITS].push((id & ((1u << BUCKET_BITS) - 1)) << DOC_BITS | doc);
                     ++cnt[id];
                 }
-            }, [&] { out.push(NONE); });
+            }, [] {});
         });
     }
     for (auto& th : pool) th.join();
@@ -343,14 +437,15 @@ Index build_index(const File& f, const TermTable& terms, int nthreads) {
     }
     ix.start[nterms] = total;
     ix.post.reset(new u32[total]);  // not zeroed: every slot is written below
+    // Each thread drains its own lists bucket by bucket into its own segment of
+    // every term, so the threads never share a cursor.
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
-            auto& cur = count[t];
-            u32 doc = first_doc[t];
-            seen[t].drain([&](u32 id) {
-                if (id == NONE) ++doc;
-                else ix.post[cur[id]++] = doc;
-            });
+            for (u32 b = 0; b < nbuckets; ++b)
+                seen[t][b].drain([&](u32 x) {
+                    u32 id = b << BUCKET_BITS | x >> DOC_BITS;
+                    ix.post[count[t][id]++] = x & ((1u << DOC_BITS) - 1);
+                });
         });
     }
     for (auto& th : pool) th.join();
@@ -555,7 +650,7 @@ private:
     // Finds phrase[j] in [b, e) with a 32-byte scan for its first letter in either
     // case (byte | 0x20), then checks the whole token, and the phrase around it,
     // only where such a byte starts a token.
-    bool contains(const uint8_t* b, const uint8_t* e, const std::vector<u32>& phrase, size_t j) const {
+    bool contains(const uint8_t* b, const uint8_t* e, std::span<const u32> phrase, size_t j) const {
         const u32 anchor = phrase[j];
         const uint8_t first = terms_.bytes(anchor)[0];
         const __m256i want = _mm256_set1_epi8(first), case_bit = _mm256_set1_epi8(0x20);
@@ -581,7 +676,7 @@ private:
     // With phrase[j] at text [s, t), do the j tokens before it and the tokens
     // after it spell the rest of the phrase?
     bool around(const uint8_t* b, const uint8_t* e, const uint8_t* s, const uint8_t* t,
-                const std::vector<u32>& phrase, size_t j) const {
+                std::span<const u32> phrase, size_t j) const {
         for (size_t i = j; i-- > 0;) {
             while (s > b && !LOWER.t[s[-1]]) --s;
             const uint8_t* end = s;
@@ -649,8 +744,8 @@ int main() {
     File df = map_file("/data/docs.txt");
 
     TermTable terms;
-    std::vector<Query> queries = parse_queries(qf, terms);
-    Index ix = build_index(df, terms, nthreads);
+    Queries queries = parse_queries(qf, terms);
+    Index ix = build_index(df, terms, queries.terms, nthreads);
 
     // Answer queries in parallel; each result goes to its own fixed-size slot
     // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).
