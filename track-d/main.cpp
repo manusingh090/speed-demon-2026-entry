@@ -53,7 +53,18 @@ struct RadixHeap {
     b[slot(k)].push_back({k, u});
     ++sz;
   }
+  // The smallest key (the heap must not be empty).
+  u64 top() {
+    pop_ready();
+    return last;
+  }
   Item pop() {
+    pop_ready();
+    --sz;
+    auto e = b[0].back();
+    return b[0].pop_back(), e;
+  }
+  void pop_ready() {
     if (b[0].empty()) {
       int i = 1;
       while (b[i].empty())
@@ -67,11 +78,13 @@ struct RadixHeap {
         b[slot(e.d)].push_back(e);
       b[i].clear();
     }
-    --sz;
-    auto e = b[0].back();
-    return b[0].pop_back(), e;
   }
 };
+using Spill = std::vector<std::pair<u32, u32>>;
+// The weight of edge e from its list of heavy weights (sorted by edge).
+u32 heavy_weight(const Spill &s, u32 e) {
+  return std::lower_bound(s.begin(), s.end(), std::pair(e, 0u))->second;
+}
 struct Distances {
   static constexpr u32 P = 512;
   std::vector<u16> tab;
@@ -89,6 +102,11 @@ struct Distances {
         std::fill_n(&pool[u64(pg - 1) * P], P, INF);
     }
     return pool[u64(pg - 1) * P + v % P];
+  }
+  // Read without handing out a page: INF for a node this search never reached.
+  u64 get(u32 v) const {
+    u16 pg = tab[v / P];
+    return pg ? pool[u64(pg - 1) * P + v % P] : INF;
   }
   void reset() {
     for (u32 i : used)
@@ -164,7 +182,6 @@ int main() {
   // near 2^32) is stored as all ones, with its value in a list sorted by edge.
   const int hb = 32 - __builtin_clz(n | 1);
   const u32 hmask = (1u << hb) - 1, big = ~0u >> hb;
-  using Spill = std::vector<std::pair<u32, u32>>;
   std::vector<Spill> spill(nt);
   auto sorted = [&] {
     Spill all;
@@ -183,9 +200,7 @@ int main() {
     });
   });
   Spill heavy = sorted();
-  auto weight = [&](u32 e, u32 w) {
-    return w != big ? w : std::lower_bound(heavy.begin(), heavy.end(), std::pair(e, 0u))->second;
-  };
+  auto weight = [&](u32 e, u32 w) { return w != big ? w : heavy_weight(heavy, e); };
   munmap((void *)graph, gsz + 4096);
   next = Buf<u32>();
   std::vector<std::atomic<u8>> claimed(n);
@@ -259,51 +274,94 @@ int main() {
   });
   link = Buf<u32>(), start = Buf<u32>();
   heavy = sorted();
-  std::vector<u32> order(queries.size());
-  for (u32 i = 0; i < order.size(); ++i)
-    order[i] = i;
-  std::sort(order.begin(), order.end(), [&](u32 a, u32 b) {
-    return id[queries[a].first] < id[queries[b].first];
+  // Queries in the new numbering, sorted by source so neighbouring searches
+  // share cached pages; then the old-to-new map can go.
+  const size_t nq = queries.size();
+  std::vector<std::pair<u32, u32>> ends(nq);
+  std::vector<u32> order(nq);
+  for (u32 i = 0; i < nq; ++i)
+    ends[i] = {id[queries[i].first], id[queries[i].second]}, order[i] = i;
+  std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return ends[a] < ends[b]; });
+  id = Buf<u32>();
+  // In-edges in the same word format, for the backward half of each search.
+  // Counts go to rfirst[v + 1]; after the prefix sum rfirst[v] is v's first
+  // slot and is used as v's cursor, which leaves it at v's end, so shifting
+  // the array up by one restores the offsets without a second array.
+  Buf<u32> rfirst(n + 1), redges(m);
+  auto each_edge = [&](int t, auto &&fn) {
+    for (u32 u = u64(n) * t / nt; u < u64(n) * (t + 1) / nt; ++u)
+      for (u32 e = first[u]; e < first[u + 1]; ++e)
+        fn(u, e, edges[e]);
+  };
+  run_threads(nt, [&](int t) {
+    each_edge(t, [&](u32, u32, u32 x) {
+      std::atomic_ref(rfirst[(x & hmask) + 1]).fetch_add(1, std::memory_order_relaxed);
+    });
   });
-  std::vector<u64> ans(queries.size());
+  for (u32 v = 0; v < n; ++v)
+    rfirst[v + 1] += rfirst[v];
+  run_threads(nt, [&](int t) {
+    each_edge(t, [&](u32 u, u32 e, u32 x) {
+      u32 j = std::atomic_ref(rfirst[x & hmask]).fetch_add(1, std::memory_order_relaxed);
+      redges[j] = u | (x & ~hmask);
+      if (x >> hb == big)
+        spill[t].emplace_back(j, weight(e, big));
+    });
+  });
+  for (u32 v = n; v > 0; --v)
+    rfirst[v] = rfirst[v - 1];
+  rfirst[0] = 0;
+  Spill rheavy = sorted();
+
+  // Bidirectional Dijkstra: grow whichever side has the smaller queue, record
+  // the best s-t length seen where the two sides meet, and stop once the two
+  // smallest queued keys add up to at least that length (nothing left can
+  // beat it). A road network's ball of radius r/2 around each end holds about
+  // half as many nodes as one ball of radius r, so each query settles about
+  // half as many. A side that runs dry ends the search: it has reached every
+  // node it can, so the best meeting seen is the answer.
+  std::vector<u64> ans(nq);
   std::atomic<size_t> qidx{0};
-  const u32 *fp = first.p.get(), *ep = edges.p.get();
+  struct Side {
+    const u32 *off, *adj;
+    const Spill *heavy;
+  };
+  const Side out_side{first.p.get(), edges.p.get(), &heavy},
+      in_side{rfirst.p.get(), redges.p.get(), &rheavy};
+  const u32 mask = hmask, shift = hb, wide = big;
   run_threads(nt, [&](int) {
-    Distances dist(n);
-    RadixHeap heap;
-    for (size_t q; (q = qidx++) < queries.size();) {
+    Distances dist[2] = {Distances(n), Distances(n)};
+    RadixHeap queue[2];
+    for (size_t q; (q = qidx++) < nq;) {
       size_t i = order[q];
       auto [s0, t0] = queries[i];
       ans[i] = s0 == t0 ? 0 : INF;
       if (s0 == t0 || target[t0].load(std::memory_order_relaxed) != 2)
         continue;
-      u32 s = id[s0], t = id[t0];
+      auto [s, t] = ends[i];
       u64 best = INF;
-      dist[s] = 0;
-      heap.push(0, s);
-      while (heap.sz) {
-        auto [d, u] = heap.pop();
-        if (d >= best || u == t) {
-          best = u == t ? d : best;
-          break;
-        }
-        if (d > dist[u])
+      dist[0][s] = 0, queue[0].push(0, s);
+      dist[1][t] = 0, queue[1].push(0, t);
+      while (queue[0].sz && queue[1].sz && queue[0].top() + queue[1].top() < best) {
+        int k = queue[1].sz < queue[0].sz;
+        const Side &g = k ? in_side : out_side;
+        Distances &mine = dist[k], &other = dist[1 - k];
+        auto [d, u] = queue[k].pop();
+        if (d > mine[u])
           continue;
-        for (u32 e = fp[u], end = fp[u + 1]; e < end; ++e) {
-          u32 v = ep[e] & hmask;
-          u64 nd = d + weight(e, ep[e] >> hb);
-          if (nd < best && nd < dist[v]) {
-            dist[v] = nd;
-            if (v == t)
-              best = nd;
-            else
-              heap.push(nd, v);
+        for (u32 e = g.off[u], end = g.off[u + 1]; e < end; ++e) {
+          u32 x = g.adj[e], v = x & mask, w = x >> shift;
+          u64 nd = d + (w != wide ? w : heavy_weight(*g.heavy, e));
+          if (nd < best && nd < mine[v]) {
+            mine[v] = nd, queue[k].push(nd, v);
+            if (u64 o = other.get(v); o != INF)
+              best = std::min(best, nd + o);
           }
         }
       }
       ans[i] = best;
-      heap.clear();
-      dist.reset();
+      for (int k = 0; k < 2; ++k)
+        queue[k].clear(), dist[k].reset();
     }
   });
   std::string out;
