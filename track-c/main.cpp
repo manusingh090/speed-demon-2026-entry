@@ -38,10 +38,16 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
 
-// Zero-filled anonymous memory; pages are charged only once touched.
+// Zero-filled anonymous memory; pages are charged only once touched. A table
+// that every thread writes all over is populated up front instead: faulting
+// it in page by page from twelve threads at once made the threads queue on
+// the kernel's page-table locks (about 12% of all cycles), and each page was
+// faulted twice, once on its first read (the shared zero page) and again on
+// its first write.
 template <class T>
-T* zeroed(size_t n) {
-    void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+T* zeroed(size_t n, bool populate = false) {
+    void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | (populate ? MAP_POPULATE : 0), -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
     return static_cast<T*>(p);
 }
@@ -196,8 +202,8 @@ private:
         u32 want = ((u64(1) << std::min(len, HEAD)) - 1) << 8;
         return (equal & want) == want;
     }
-    std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);  // 0 = free
-    Slot* slots_ = zeroed<Slot>(SLOTS);
+    std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS, true);  // 0 = free
+    Slot* slots_ = zeroed<Slot>(SLOTS, true);
     u32* overflow_ = zeroed<u32>(SLOTS);  // arena offset of a long name's tail
     char* arena_ = zeroed<char>(64 << 20);
     std::atomic<u32> used_{0}, next_id_{0};
@@ -213,7 +219,7 @@ struct Totals {
 // by all threads. Most marks are first sightings, so they are atomic ORs.
 struct NamesSeen {
     static constexpr u32 WORDS = NameTable::IDS / 64;
-    std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS);
+    std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS, true);
 
     std::atomic<u64>& word(u32 c, u32 name) { return bits[c * WORDS + name / 64]; }
 
@@ -236,29 +242,40 @@ struct NamesSeen {
 // byte per "" pair when it is quoted (q counts every quote in it).
 u32 text_length(const char* s, const char* e, u32 q) { return (e - s) - (q ? q / 2 + 1 : 0); }
 
-// Parse every record that starts in [p, end). Sums go to totals. A record's
-// name is probed (its slot prefetched) when the record is parsed, looked up
-// LAG records later (its bitset word prefetched) and marked LAG records after
-// that, so each cache miss has a steady lead to land in.
+// Parse every record that starts in [p, end). A record's region row and name
+// slot are prefetched when it is parsed; LAG records later its country is
+// read, its sums go to totals, its name is looked up and that name's bitset
+// word prefetched; LAG records after that the name is marked. So each of the
+// three random reads (region table, name table, bitsets) has a steady lead.
 void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
                    size_t regions, NameTable& names, NamesSeen& seen, Totals* totals) {
     constexpr u64 LAG = 16;
     struct Pending {
         const char* name;
-        u32 len, country;
+        u32 len, region, id, name_bytes, note_bytes;
         NameTable::Probe probe;
+        i64 cents;
     } pending[LAG];
     struct Mark {
         u32 country, id;
     } marks[LAG];
     u64 n = 0, last = UINT64_MAX;  // records started; all of them once known
-    auto advance = [&] {           // retire what sits in ring slot n % LAG
+    auto advance = [&]() __attribute__((always_inline)) {  // retire ring slot n % LAG
         u32 k = n % LAG;
         if (n >= 2 * LAG && n - 2 * LAG < last) seen.mark(marks[k].country, marks[k].id);
         if (n >= LAG && n - LAG < last) {
             const Pending& old = pending[k];
-            marks[k] = {old.country, names.id(old.name, old.len, old.probe)};
-            seen.prefetch(marks[k].country, marks[k].id);
+            u32 c = old.region < regions ? country_of[old.region] : 0;
+            Totals& t = totals[c];
+            ++t.count;
+            t.id_sum += old.id;
+            t.amount_sum += old.cents;
+            t.amount_min = std::min(t.amount_min, old.cents);
+            t.amount_max = std::max(t.amount_max, old.cents);
+            t.name_bytes += old.name_bytes;
+            t.note_bytes += old.note_bytes;
+            marks[k] = {c, names.id(old.name, old.len, old.probe)};
+            seen.prefetch(c, marks[k].id);
         }
     };
 
@@ -278,20 +295,15 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         i64 cents = digits(amount + negative, amount_end - 3) * 100 + digits(amount_end - 2, amount_end);
         if (negative) cents = -cents;
 
-        u32 c = region < regions ? country_of[region] : 0;
-        Totals& t = totals[c];
-        ++t.count;
-        t.id_sum += id;
-        t.amount_sum += cents;
-        t.amount_min = std::min(t.amount_min, cents);
-        t.amount_max = std::max(t.amount_max, cents);
+        // Region ids are below 10^7 (fit u32); one past the table means none.
+        u32 r = region < regions ? u32(region) : u32(regions);
+        _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
         u32 name_quotes = q2 - q1;
-        t.name_bytes += text_length(f1 + 1, f2, name_quotes);
-        t.note_bytes += text_length(f2 + 1, f3, q3 - q2);
         bool quoted = name_quotes != 0;
         advance();
         Pending& next = pending[n++ % LAG];
-        next = {f1 + 1 + quoted, u32(f2 - f1 - 1 - 2 * quoted), c, {}};
+        next = {f1 + 1 + quoted, u32(f2 - f1 - 1 - 2 * quoted), r, u32(id),
+                text_length(f1 + 1, f2, name_quotes), text_length(f2 + 1, f3, q3 - q2), {}, cents};
         next.probe = names.probe(next.name, next.len);
         p = eol + 1;
     }
@@ -333,7 +345,7 @@ int main() {
     // the last line holds the largest id.
     const char* last = static_cast<const char*>(memrchr(regions, '\n', rsize - 1)) + 1;
     const size_t nregions = atoll(last) + 1;
-    u8* country_of = zeroed<u8>(nregions);  // 0 = no such region
+    u8* country_of = zeroed<u8>(nregions, true);  // 0 = no such region
     std::vector<size_t> rcut = split(regions, strchr(regions, '\n') - regions + 1, rsize, nthreads, "\n");
     std::vector<std::atomic<u8>> present(1 << 15);
     std::array<u8, 1 << 15> index_of{};
