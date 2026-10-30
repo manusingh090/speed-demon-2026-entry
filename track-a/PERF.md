@@ -7,6 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | C++: mmap, 12 threads, records per hour in blocks, per-hour counting sort and nth_element, writer thread | pending | | | |
 | 2 | Same design in 222 formatted lines instead of 373 | run-3c1dcbde6115 | 0.0293 | 31.8 | 79.7 |
+| 3 | One thread pool with a barrier; each hour written with pwrite at an offset handed on by the hour before, instead of per-hour strings and a writer thread; chunks released from the front of each region in 256 KB batches instead of one madvise per chunk; THP off | pending | | | |
 
 ## Local measurements
 
@@ -26,6 +27,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **v2 to v3.** Page faults on the input were 3 to 7 ms (a variant that only touched each page); `MAP_POPULATE` was slower (serial, +15 ms). The rest was per-line parsing, so the method, endpoint and line ends now come from one 64-byte compare. The gain was inside laptop noise.
 
 **Step 2.** S is counted after `clang-format --style=LLVM`, which wraps at 80 columns. Folding the per-hour summary into `main`, using `std::to_chars` and `fwrite`, and a fixed-size endpoint table (a seed has 1,842 endpoints) took it from 373 to 222 lines with no change in speed.
+
+**Step 3.** Phase timers showed the hour phase at about 17 ms for work that is only a counting sort and small selections. Dropping the per-chunk `madvise` (about 1,600 calls, each a TLB shootdown across every thread) cut it to about 12 ms, but peak memory went from 23 to 32 MB: the finished hours' strings piled up in malloc arenas, and the output file's own pages count toward the cgroup as it is written. So the strings went: each thread formats an hour into one reusable buffer, takes its file offset from the hour before, passes the next offset on and writes with `pwrite`. Chunks still have to go back while the output grows, but the log is in arrival order, so the front of each thread's region empties hour by hour; one `madvise` per 256 KB of finished chunks does it. Transparent huge pages are off, as on B and C, so a part-written region is not backed by 2 MB pages on the box. Locally (11 alternating runs): median 40 ms and 21 MB, against 44 ms and 23 MB for step 2, same hash on full, sample, tiny and the worked example. Formatted code lines 245 to 254.
 
 ## Tried and kept out
 

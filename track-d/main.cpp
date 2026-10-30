@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <malloc.h>
+#include <memory>
 #include <string>
 #include <sys/mman.h>
 #include <thread>
@@ -94,6 +95,14 @@ struct Distances {
     used.clear();
   }
 };
+template <class T> struct Buf {
+  struct Free {
+    void operator()(T *q) const { free(q); }
+  };
+  std::unique_ptr<T[], Free> p;
+  explicit Buf(size_t n = 0) : p(static_cast<T *>(calloc(n + 1, sizeof(T)))) {}
+  T &operator[](size_t i) const { return p[i]; }
+};
 template <class F> void run_threads(int n, F &&fn) {
   std::vector<std::thread> pool;
   for (int t = 0; t < n; ++t)
@@ -134,30 +143,28 @@ int main() {
   std::vector<std::atomic<u8>> target(n);
   for (auto [s, t] : queries)
     target[t].store(1, std::memory_order_relaxed);
-  std::vector<std::atomic<u32>> next(n + 1);
+  Buf<u32> next(n + 1);
   run_threads(nt, [&](int t) {
     parse(t, [&](u32 u, u32 v, u32) {
-      next[u].fetch_add(1, std::memory_order_relaxed);
+      std::atomic_ref(next[u]).fetch_add(1, std::memory_order_relaxed);
       if (target[v].load(std::memory_order_relaxed))
         target[v].store(2, std::memory_order_relaxed);
     });
   });
-  std::vector<u32> start(n + 1);
-  for (u32 u = 0, tot = 0; u <= n; ++u) {
-    start[u] = tot;
-    tot += next[u].load(std::memory_order_relaxed);
-    next[u].store(start[u], std::memory_order_relaxed);
-  }
-  std::vector<u32> heads(start[n]), weights(start[n]);
+  Buf<u32> start(n + 1);
+  for (u32 u = 0, tot = 0; u <= n; ++u)
+    start[u] = tot, tot += next[u], next[u] = start[u];
+  const u32 m = start[n];
+  Buf<u32> heads(m), weights(m);
   run_threads(nt, [&](int t) {
     parse(t, [&](u32 u, u32 v, u32 w) {
-      u32 e = next[u].fetch_add(1, std::memory_order_relaxed);
+      u32 e = std::atomic_ref(next[u]).fetch_add(1, std::memory_order_relaxed);
       heads[e] = v;
       weights[e] = w;
     });
   });
   munmap((void *)graph, gsz + 4096);
-  std::vector<std::atomic<u32>>().swap(next);
+  next = Buf<u32>();
   std::vector<std::atomic<u8>> claimed(n);
   auto claim = [&](u32 v) {
     u8 no = 0;
@@ -195,33 +202,39 @@ int main() {
             seeds.push_back(heads[e]);
     }
   });
-  std::vector<u32> id(n), first(n + 1);
-  u32 k = 0;
-  for (auto &ord : chain) {
-    for (u32 u : ord)
+  Buf<u32> id(n), first(n + 1);
+  std::vector<u32> base(nt + 1);
+  for (int t = 0; t < nt; ++t)
+    base[t + 1] = base[t] + chain[t].size();
+  run_threads(nt, [&](int t) {
+    u32 k = base[t];
+    for (u32 u : chain[t])
       id[u] = k++;
-    std::vector<u32>().swap(ord);
-  }
+    std::vector<u32>().swap(chain[t]);
+  });
+  u32 k = base[nt];
   for (u32 u = 0; u < n; ++u)
     if (!claimed[u].load(std::memory_order_relaxed))
       id[u] = k++;
   std::vector<std::atomic<u8>>().swap(claimed);
-  for (u32 u = 0; u < n; ++u)
-    first[id[u] + 1] = start[u + 1] - start[u];
+  run_threads(nt, [&](int t) {
+    for (u32 u = u64(n) * t / nt; u < u64(n) * (t + 1) / nt; ++u)
+      first[id[u] + 1] = start[u + 1] - start[u];
+  });
   for (u32 v = 0; v < n; ++v)
     first[v + 1] += first[v];
-  auto renum = [&](std::vector<u32> &old, auto &&fn) {
-    std::vector<u32> fresh(old.size());
+  auto renum = [&](Buf<u32> &old, auto &&fn) {
+    Buf<u32> fresh(m);
     run_threads(nt, [&](int t) {
       for (u32 u = u64(n) * t / nt; u < u64(n) * (t + 1) / nt; ++u)
         for (u32 e = start[u], j = first[id[u]]; e < start[u + 1]; ++e, ++j)
           fresh[j] = fn(old[e]);
     });
-    old.swap(fresh);
+    std::swap(old, fresh);
   };
   renum(weights, [](u32 w) { return w; });
   renum(heads, [&](u32 v) { return id[v]; });
-  std::vector<u32>().swap(start);
+  start = Buf<u32>();
   std::vector<u32> order(queries.size());
   for (u32 i = 0; i < order.size(); ++i)
     order[i] = i;
@@ -230,7 +243,7 @@ int main() {
   });
   std::vector<u64> ans(queries.size());
   std::atomic<size_t> qidx{0};
-  const u32 *fp = first.data(), *hp = heads.data(), *wp = weights.data();
+  const u32 *fp = first.p.get(), *hp = heads.p.get(), *wp = weights.p.get();
   run_threads(nt, [&](int) {
     Distances dist(n);
     RadixHeap heap;

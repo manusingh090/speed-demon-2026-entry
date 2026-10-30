@@ -26,6 +26,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 4 | 0.45 to 0.52 | 82 | queries 0.22 to 0.24, placement passes about 0.06 to 0.15 each |
 | 5 | 0.43 vs 0.50 for step 4 (same session) | 102 | third parse with random atomic placement replaced by a parallel copy |
 | 6 | 0.44, same as 5 | 85 | the 17 MB were freed vectors glibc kept |
+| 7 | Build arrays allocated with calloc (lazily zeroed by the kernel, first touched by the threads that fill them) instead of vectors zero-filled on one thread; new ids and per-node degrees in the new numbering filled in parallel | pending | | | |
 
 ## What the profile said, step by step
 
@@ -36,6 +37,10 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 **Step 3 to 4.** Small blobs (512 nodes, grown by BFS, chained by starting each blob from the last one's frontier) give 2-D locality. Peak memory was the per-thread distance arrays (12 x 14 MB); pages of 512 distances handed out on first touch and recycled per query brought the peak from 246 to 82 MB. The CSR copy in step 3 also held the graph twice (116 MB); building the final CSR by a third parse instead keeps one copy.
 
 **Step 4 to 6.** The third parse placed every edge with a random atomic increment and a random write, about 0.11 to 0.15 s. Keeping the weights from the second pass (as a separate array next to the heads) and copying both into the new numbering in parallel is faster, and copying weights first, then heads, freeing each old array straight after, keeps the peak at about one and a half graphs. The measured peak was still 17 MB above that: glibc raises its mmap threshold after the first large free, so later large vectors came from the heap and stayed resident when freed. Pinning the threshold with `mallopt` fixed it.
+
+**Step 6 to 7.** Phase timers: count 0.04 s, fill 0.10, order 0.045, renumber 0.075, search 0.19. About 110 MB of build arrays (offsets, heads, weights, both renumbered copies, ids) were value-initialised by `std::vector`, a single-threaded memset that also took every page fault on one thread, before parallel passes overwrote them. With `calloc` (glibc skips the memset for fresh mmapped blocks) the zeroing happens lazily, spread over the threads that first write each page. The two serial loops that assign new ids from each thread's blob chain and scatter degrees into the new numbering now run in parallel. Locally 385 ms against 428 ms for step 6 over 9 alternating runs, same 84 MB peak and hash on all four datasets. Formatted code lines 277 to 290.
+
+Also measured and kept out at this step: dense per-thread distance arrays (no faster, 236 MB), and heads and weights interleaved into one array (no faster within noise, 97 MB).
 
 ## Tried and kept out
 
