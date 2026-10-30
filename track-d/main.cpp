@@ -263,13 +263,20 @@ int main() {
     std::vector<u32>().swap(start);
     const std::vector<u32>&to = heads, &w = weights;
 
-    // Queries, claimed one at a time.
+    // Queries, claimed one at a time in the order of their sources' new ids,
+    // so the threads search neighbouring parts of the map at the same time and
+    // share what is in the last-level cache.
+    std::vector<u32> by_place(queries.size());
+    for (u32 i = 0; i < by_place.size(); ++i) by_place[i] = i;
+    std::sort(by_place.begin(), by_place.end(),
+              [&](u32 a, u32 b) { return id[queries[a].first] < id[queries[b].first]; });
     std::vector<u64> answer(queries.size());
     std::atomic<size_t> claim_query{0};
     run_threads(nthreads, [&](int) {
         Distances dist(n);
         RadixHeap heap;
-        for (size_t i; (i = claim_query++) < queries.size();) {
+        for (size_t k; (k = claim_query++) < queries.size();) {
+            const size_t i = by_place[k];
             auto [s0, t0] = queries[i];
             answer[i] = s0 == t0 ? 0 : INF;
             if (s0 == t0 || target[t0].load(std::memory_order_relaxed) != 2) continue;

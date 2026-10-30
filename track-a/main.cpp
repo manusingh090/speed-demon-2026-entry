@@ -26,12 +26,14 @@
 #include <utility>
 #include <vector>
 
-using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 
 constexpr int HOURS = 72;          // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
-constexpr u16 ERR_BIT = 1u << 15;  // 5xx flag, above the local endpoint id
+// A record is one u32: the latency above a 12-bit key (11-bit local endpoint
+// id, then the 5xx flag). Latencies of 2^20 us or more (about 1% of lines)
+// do not fit and go to a side list with their key.
+constexpr u32 KEY_BITS = 12, ID_MASK = (1u << 11) - 1, ERR_BIT = 1u << 11, BIG = 1u << 20;
 
 u64 load8(const char* p) {
     u64 v;
@@ -72,7 +74,7 @@ u32 parse_digits(const char* end, u32 len) {
 // keeps both loads in bounds). Ids follow first sight; names point into the log.
 class EndpointTable {
 public:
-    static constexpr u32 SLOTS = 1 << 13, MAX = SLOTS / 2;  // a seed has 1,842
+    static constexpr u32 SLOTS = 1 << 12, MAX = SLOTS / 2;  // ids fit 11 bits; a seed has 1,842
     std::vector<std::string_view> names;
 
     u32 intern(const char* s, u32 len) {
@@ -94,21 +96,30 @@ private:
     std::vector<u32> slots_ = std::vector<u32>(SLOTS);  // id + 1, 0 when empty
 };
 
-// A chunk of one hour's requests from one thread: latencies and keys (local
-// endpoint id plus the 5xx flag) in parallel arrays.
+// A chunk of one hour's records from one thread, 16 KB. Each thread carves
+// its blocks from one region it maps up front, and an hour's blocks are given
+// back to the kernel (MADV_DONTNEED) as soon as the hour is done: malloc
+// would keep freed blocks resident, and an mmap per block would serialise the
+// threads on the address-space lock.
 struct Block {
-    static constexpr u32 CAP = 2048;
+    static constexpr u32 CAP = (16384 - 16) / 4;
     Block* next;
     u32 n = 0;
-    u32 lat[CAP];
-    u16 key[CAP];
+    u32 rec[CAP];
 };
 
 struct Worker {
     EndpointTable endpoints;
     Block* head[HOURS] = {};
+    std::vector<std::pair<u32, u32>> big[HOURS];  // (latency, key) of the long ones
+
+    char* region = nullptr;
+    size_t used = 0;
 
     void parse(const char* p, const char* end) {
+        // A line is at least 40 bytes; each hour may leave one block part full.
+        const size_t reserve = ((end - p) / 40 / Block::CAP + 1 + HOURS) * sizeof(Block);
+        region = static_cast<char*>(mmap(nullptr, reserve, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
         while (p < end) {
             // YYYY-MM-DDTHH: month digit at 6, day at 8-9, hour at 11-12. The
             // day index counts Oct 30, Oct 31, Nov 1, Nov 2.
@@ -125,17 +136,21 @@ struct Worker {
             const char* ep = m + __builtin_ctzll(sp) + 1;
             const char* ee = nl ? m + __builtin_ctzll(sp & (sp - 1)) : find(ep, ' ');
             const char* eol = nl ? m + __builtin_ctzll(nl) : find(ee + 5, '\n');
-            u16 err = ee[1] == '5' ? ERR_BIT : 0;
-
+            const u32 key = endpoints.intern(ep, ee - ep) | (ee[1] == '5' ? ERR_BIT : 0);
+            const u32 lat = parse_digits(eol, eol - ee - 5);
+            p = eol + 1;
+            if (lat >= BIG) {
+                big[h].push_back({lat, key});
+                continue;
+            }
             Block*& b = head[h];
             if (!b || b->n == Block::CAP) {
-                Block* fresh = new Block;
+                auto* fresh = reinterpret_cast<Block*>(region + used);
+                used += sizeof(Block);
                 fresh->next = b;
                 b = fresh;
             }
-            b->lat[b->n] = parse_digits(eol, eol - ee - 5);
-            b->key[b->n++] = endpoints.intern(ep, ee - ep) | err;
-            p = eol + 1;
+            b->rec[b->n++] = lat << KEY_BITS | key;
         }
     }
 };
@@ -213,20 +228,25 @@ int main() {
             // Counting sort of the hour's latencies by endpoint rank.
             count.assign(ne + 1, 0);
             errors.assign(ne, 0);
-            for (int t = 0; t < nthreads; ++t)
+            for (int t = 0; t < nthreads; ++t) {
+                auto tally = [&](u32 key) {
+                    u32 e = rank[t][key & ID_MASK];
+                    ++count[e + 1];
+                    errors[e] += (key & ERR_BIT) != 0;
+                };
                 for (Block* b = workers[t].head[h]; b; b = b->next)
-                    for (u32 i = 0; i < b->n; ++i) {
-                        u32 e = rank[t][b->key[i] & ~ERR_BIT];
-                        ++count[e + 1];
-                        errors[e] += b->key[i] >> 15;
-                    }
+                    for (u32 i = 0; i < b->n; ++i) tally(b->rec[i]);
+                for (auto [l, key] : workers[t].big[h]) tally(key);
+            }
             for (u32 e = 0; e < ne; ++e) count[e + 1] += count[e];
             cursor.assign(count.begin(), count.end() - 1);
             lat.resize(count[ne]);
-            for (int t = 0; t < nthreads; ++t)
-                for (Block* b = workers[t].head[h]; b; delete std::exchange(b, b->next))
+            for (int t = 0; t < nthreads; ++t) {
+                for (Block* b = workers[t].head[h]; b; madvise(std::exchange(b, b->next), sizeof(Block), MADV_DONTNEED))
                     for (u32 i = 0; i < b->n; ++i)
-                        lat[cursor[rank[t][b->key[i] & ~ERR_BIT]]++] = b->lat[i];
+                        lat[cursor[rank[t][b->rec[i] & ID_MASK]]++] = b->rec[i] >> KEY_BITS;
+                for (auto [l, key] : workers[t].big[h]) lat[cursor[rank[t][key & ID_MASK]]++] = l;
+            }
 
             char label[22], line[256];
             hour_label(h, label);
