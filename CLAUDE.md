@@ -79,7 +79,7 @@ speed-demon-2026-entry/          github.com/manusingh090/speed-demon-2026-entry 
 
 Each track folder is built and measured on its own. Code shared between tracks must be copied into each folder and counts toward S in each.
 
-A track folder that is byte-identical to the starter (ignoring Markdown and `.speed-demon.toml`) is reported `unchanged` and never runs. Tracks C and D are still the unchanged starter.
+A track folder that is byte-identical to the starter (ignoring Markdown and `.speed-demon.toml`) is reported `unchanged` and never runs. Track D is still the unchanged starter.
 
 `.speed-demon.toml` per track: set `team`, `language`, `dependency_count`. Track B has `team = "manusingh090"`, `language = "C++"`, `dependency_count = 0`. Make the team name match what was entered on the Tally form.
 
@@ -89,7 +89,7 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 |---|---|---|---|---|
 | A | C++, pushed, all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S 222 after clang-format (was 373; ref 56); see track-a/README.md |
 | B | C++, pushed, all hashes pass | 0.35 to 0.45 s | 134 MB | see section 7 |
-| C | not started (reference) | | | |
+| C | C++, pushed, all hashes pass incl. worked and rules examples | 62 to 77 ms | 13 MB | S about 374 after clang-format (ref 108); see track-c/README.md |
 | D | not started (reference) | | | |
 
 Board snapshot, Oct 30 17:35 UTC (58 teams; refresh with `python tools/board.py`). Board T values are the box's own timer and read much lower than our laptop's in-container timer, so compare K, not seconds:
@@ -217,6 +217,10 @@ Delete the reference files (`run.py`, `<x>.py`) from the track folder when repla
 - Current board leader K is about 37, so the bar is high here. Some top entries finish in under 0.1 s.
 
 ### Track C: Join (3.32M CSV records, 204 MB, ref 14.4 s)
+
+- Done (see `track-c/README.md`). Hand-written datasets: `data/c-worked` (reference hash `72ed9e59bff2dad354a9fb4cbc2d4b102477f634230b47e86035864c88d27444`) and `data/c-rules` (`0c084eef633858f79b023d1d767c8c474e73ad5c37f3f587c1145c3aa36e52ec`, LF-only header, last record without terminator, BOMs inside quotes), both built from `WORKED_*` and `RULES_*` in `../harness/tests/test_c_join.py`. Tiny hash `e4e43bc39920e9d446c3fcd700fdd35b3959e9495c6aaa738491df38a1aed733`.
+- What was measured: name interning dominates. Shared bitsets written by every thread are fine as atomic ORs, but a shared cache line that every thread writes (name entry plus its country bits in one line) was much slower. Logging (country, name id) pairs per thread cost 13 MB more and was slower. Batched prefetch helped little; a rolling pipeline (probe, look up 16 records later, mark 16 after that) gained about 10% single-threaded. Huge pages raised M to 17 MB for no clear gain.
+- `std::barrier` runs its completion function at every phase, not only the first: guard it.
 
 - This is the correctness track. Section 2.1 of `c-join.md` is the parser contract; follow it exactly: quoted fields with `""` escapes, LF inside quotes is data, CRLF or LF terminators, a UTF-8 BOM (`EF BB BF`) at the start of the file **and** after some record terminators (skip it only there; inside quotes it is data).
 - Join `region_id` against `/data/regions.csv` (plain, ascending ids up to 999,999, so a direct array `region_id -> country index` works; ids above the range or missing map to `_UNMATCHED`).
