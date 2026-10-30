@@ -19,6 +19,7 @@
 #include <span>
 #include <string>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -761,6 +762,9 @@ private:
 }  // namespace
 
 int main() {
+    // With transparent huge pages, a block written only in part can be backed
+    // by a whole 2 MB page; plain pages keep memory to what is written.
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     // Large blocks always come from mmap and go back to the kernel when freed
     // (glibc otherwise raises this threshold after the first free and keeps them).
     mallopt(M_MMAP_THRESHOLD, 1 << 16);
