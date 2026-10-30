@@ -374,8 +374,10 @@ int main() {
   };
   const Side out_side{first.p.get(), edges.p.get(), &heavy},
       in_side{rfirst.p.get(), redges.p.get(), &rheavy};
-  const u32 mask = hmask, shift = hb, wide = big;
   run_threads(nt, [&](int) {
+    // Copies the loop can keep in registers (through the captures it would
+    // reload them for every edge).
+    const u32 mask = hmask, shift = hb, wide = big;
     Distances dist[2] = {Distances(n), Distances(n)};
     RadixHeap queue[2];
     for (size_t q; (q = qidx++) < nq;) {
@@ -400,6 +402,7 @@ int main() {
           u64 nd = d + (w != wide ? w : heavy_weight(*g.heavy, e));
           if (nd < best && nd < mine[v]) {
             mine[v] = nd, queue[k].push(nd, v);
+            __builtin_prefetch(&g.off[v]);
             if (u64 o = other.get(v); o != INF)
               best = std::min(best, nd + o);
           }

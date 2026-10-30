@@ -29,7 +29,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 7 | Build arrays allocated with calloc (lazily zeroed by the kernel, first touched by the threads that fill them) instead of vectors zero-filled on one thread; new ids and per-node degrees in the new numbering filled in parallel | run-f9dd6c762386 | 0.360 | 102 | 60.53 |
 | 8 | Edges packed into one 32-bit word (head in the low 21 bits, weight above it, heavy weights in a sorted side list) in both numberings; transparent huge pages off | run-b8d2e5b996d8 | 0.346 | 64 | 62.76 |
 | 9 | Bidirectional Dijkstra over the packed forward graph and a packed reverse graph built in place; query ends mapped up front so the id map is freed first | run-9ea1a9d51d35 | 0.240 | 71 | 65.84 |
-| 10 | Count and fill passes in batches of 32 edges with every random line prefetched first; BFS and renumbering prefetch the nodes coming up | pending | | | |
+| 10 | Count and fill passes in batches of 32 edges with every random line prefetched first; BFS and renumbering prefetch the nodes coming up | run-e72d02d00206 | 0.229 | 72 | 65.95 |
+| 11 | Search constants copied into the thread so the loop keeps them in registers; a queued node's offsets prefetched | pending | | | |
 
 ## What the profile said, step by step
 
@@ -54,6 +55,10 @@ Also measured and kept out at this step: dense per-thread distance arrays (no fa
 **Step 9 on the board.** run-9ea1a9d51d35: 0.240 s against 0.346 s, 71 MiB, K 20.74, 65.84 points.
 
 **Step 9 to 10.** With the search halved, `perf` put the build ahead of it: the fill pass 25.5% of CPU (about 110 ns per edge), blob ordering 17%, renumbering 9%, the count pass 7%. The fill pass's cost is a property of x86: an atomic add waits for every store before it, so with one edge at a time each edge's cache miss (the random cursor, then the random slot) waited for the previous one's. Edges now go through in batches of 32: parse 32, prefetch all 32 cursors, take the 32 slots (now cache hits) while prefetching the 32 destinations, then write. The count pass does the same for its cursors and the in-edge flags. The BFS knows its queue ahead, so it fetches node offsets 8 entries ahead and edge lists 4 ahead; the renumbering walks old ids in order, so it fetches the new offsets and the heads' new ids 8 nodes ahead and the destination slots 4 ahead. Locally user CPU fell from 1.5 to 2.0 s to 1.2 to 1.35 s and wall time from about 0.26 s to about 0.18 to 0.24 s, same 73 MB; the fill pass is down to about 11% of CPU and the renumbering to 5.5%. Same hash on full, sample, tiny, the worked example and seeds 7, 13 and 21.
+
+**Step 10 on the board.** run-e72d02d00206: 0.229 s against 0.240 s, but the extra code took the formatted size from 362 to 400 lines, so K moved only from 20.74 to 20.84. In the same run Track A's unchanged code measured 0.039 s against its usual 0.031 s: the box's run-to-run spread is as large as most single steps.
+
+**Step 10 to 11.** The annotated search still reloaded the mask, shift and heavy-weight marker through the thread lambda's by-reference captures on every edge; they are copies inside the thread now. A node's offsets are prefetched when it is queued. The laptop could not separate this from noise (user CPU 1.4 to 1.7 s for both); it removes three loads per edge, so it stays, and the board run is the measurement. Same hash on all seven datasets.
 
 ## Tried and kept out
 
