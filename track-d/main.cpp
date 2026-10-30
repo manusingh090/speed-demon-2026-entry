@@ -155,11 +155,20 @@ int main() {
       ++c;
     cut[t] = c;
   }
+  // Edges come in batches of 32, so each pass can prefetch every random line
+  // a batch touches before touching any. On x86 an atomic add waits for the
+  // stores before it to finish; one edge at a time, each edge's cache miss
+  // would wait for the previous one's.
+  constexpr int BATCH = 32;
   auto parse = [&](int t, auto &&fn) {
+    u32 bu[BATCH], bv[BATCH], bw[BATCH];
+    int k = 0;
     for (const char *q = graph + cut[t]; q < graph + cut[t + 1];) {
       u32 u = number(q), v = number(q), w = number(q);
       if (u != v)
-        fn(u, v, w);
+        bu[k] = u, bv[k] = v, bw[k] = w, ++k;
+      if (k == BATCH || (k && q >= graph + cut[t + 1]))
+        fn(bu, bv, bw, k), k = 0;
     }
   };
   std::vector<std::atomic<u8>> target(n);
@@ -167,10 +176,14 @@ int main() {
     target[t].store(1, std::memory_order_relaxed);
   Buf<u32> next(n + 1);
   run_threads(nt, [&](int t) {
-    parse(t, [&](u32 u, u32 v, u32) {
-      std::atomic_ref(next[u]).fetch_add(1, std::memory_order_relaxed);
-      if (target[v].load(std::memory_order_relaxed))
-        target[v].store(2, std::memory_order_relaxed);
+    parse(t, [&](u32 *bu, u32 *bv, u32 *, int k) {
+      for (int j = 0; j < k; ++j)
+        __builtin_prefetch(&next[bu[j]], 1), __builtin_prefetch(&target[bv[j]]);
+      for (int j = 0; j < k; ++j) {
+        std::atomic_ref(next[bu[j]]).fetch_add(1, std::memory_order_relaxed);
+        if (target[bv[j]].load(std::memory_order_relaxed))
+          target[bv[j]].store(2, std::memory_order_relaxed);
+      }
     });
   });
   Buf<u32> start(n + 1);
@@ -192,11 +205,20 @@ int main() {
   };
   Buf<u32> link(m);
   run_threads(nt, [&](int t) {
-    parse(t, [&](u32 u, u32 v, u32 w) {
-      u32 e = std::atomic_ref(next[u]).fetch_add(1, std::memory_order_relaxed);
-      if (w >= big)
-        spill[t].emplace_back(e, w), w = big;
-      link[e] = v | w << hb;
+    parse(t, [&](u32 *bu, u32 *bv, u32 *bw, int k) {
+      u32 slot[BATCH];
+      for (int j = 0; j < k; ++j)
+        __builtin_prefetch(&next[bu[j]], 1);
+      for (int j = 0; j < k; ++j) {
+        slot[j] = std::atomic_ref(next[bu[j]]).fetch_add(1, std::memory_order_relaxed);
+        __builtin_prefetch(&link[slot[j]], 1);
+      }
+      for (int j = 0; j < k; ++j) {
+        u32 w = bw[j];
+        if (w >= big)
+          spill[t].emplace_back(slot[j], w), w = big;
+        link[slot[j]] = bv[j] | w << hb;
+      }
     });
   });
   Spill heavy = sorted();
@@ -229,15 +251,27 @@ int main() {
         break;
       size_t i = ord.size(), blob = i;
       ord.push_back(seed);
-      for (; i < ord.size() && ord.size() - blob < 512; ++i)
+      // Queue order is known ahead: fetch the offsets 8 nodes ahead and the
+      // edge lists 4 ahead, so neither waits when its node comes up.
+      auto ahead = [&] {
+        if (i + 8 < ord.size())
+          __builtin_prefetch(&start[ord[i + 8]]);
+        if (i + 4 < ord.size())
+          __builtin_prefetch(&link[start[ord[i + 4]]]);
+      };
+      for (; i < ord.size() && ord.size() - blob < 512; ++i) {
+        ahead();
         for (u32 e = start[ord[i]];
              e < start[ord[i] + 1] && ord.size() - blob < 512; ++e)
           if (claim(link[e] & hmask))
             ord.push_back(link[e] & hmask);
-      for (; i < ord.size(); ++i)
+      }
+      for (; i < ord.size(); ++i) {
+        ahead();
         for (u32 e = start[ord[i]]; e < start[ord[i] + 1]; ++e)
           if (!claimed[link[e] & hmask].load(std::memory_order_relaxed))
             seeds.push_back(link[e] & hmask);
+      }
     }
   });
   Buf<u32> id(n), first(n + 1);
@@ -264,13 +298,25 @@ int main() {
   // The same words in the new numbering: heads renumbered, weight bits kept.
   Buf<u32> edges(m);
   run_threads(nt, [&](int t) {
-    for (u32 u = u64(n) * t / nt; u < u64(n) * (t + 1) / nt; ++u)
+    const u32 lo = u64(n) * t / nt, hi = u64(n) * (t + 1) / nt;
+    for (u32 u = lo; u < hi; ++u) {
+      // Old ids are visited in order, so the random reads of later nodes can
+      // start early: their new offsets and heads' new ids 8 nodes ahead, and
+      // the slots they write 4 ahead.
+      if (u + 8 < hi) {
+        __builtin_prefetch(&first[id[u + 8]]);
+        for (u32 e = start[u + 8]; e < start[u + 9]; ++e)
+          __builtin_prefetch(&id[link[e] & hmask]);
+      }
+      if (u + 4 < hi)
+        __builtin_prefetch(&edges[first[id[u + 4]]], 1);
       for (u32 e = start[u], j = first[id[u]]; e < start[u + 1]; ++e, ++j) {
         u32 x = link[e];
         if (x >> hb == big)
           spill[t].emplace_back(j, weight(e, big));
         edges[j] = id[x & hmask] | (x & ~hmask);
       }
+    }
   });
   link = Buf<u32>(), start = Buf<u32>();
   heavy = sorted();
