@@ -346,9 +346,13 @@ int main() {
     };
     std::barrier sync(nthreads, number_countries);
 
-    // records.csv: skip the BOM and header, then split after CRLFs.
+    // records.csv: skip the BOM and header, then split after CRLFs into four
+    // pieces per thread, claimed in turn, so a thread whose pieces are slow
+    // (more first sightings of names) is evened out by the others.
     size_t start = size ? static_cast<const char*>(memchr(records, '\n', size)) - records + 1 : 0;
-    std::vector<size_t> cut = split(records, start, size, nthreads, "\r\n");
+    const int pieces = 4 * nthreads;
+    std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
+    std::atomic<int> claim{0};
     std::vector<std::array<Totals, 256>> totals(nthreads);
     NameTable names;
     NamesSeen seen;
@@ -366,8 +370,9 @@ int main() {
                 country_of[digits(p, comma)] = index_of[code(comma + 1)];
             }
             sync.arrive_and_wait();
-            parse_records(records + cut[t], records + cut[t + 1], records + size, country_of,
-                          nregions, names, seen, totals[t].data());
+            for (int k; (k = claim++) < pieces;)
+                parse_records(records + cut[k], records + cut[k + 1], records + size, country_of,
+                              nregions, names, seen, totals[t].data());
             sync.arrive_and_wait();
             for (u32 c = t; c <= codes.size(); c += nthreads) totals[t][c].distinct = seen.count(c);
         });

@@ -5,7 +5,10 @@ Every step from the reference to your final version, each with the live-board ru
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
-| 1 | | | | | |
+| 1 | C++: 64-byte structural scan with a carry-less prefix XOR for quotes, eight-digit number decode, direct region table, lock-free name interning and per-country name bitsets, both prefetched records ahead; huge pages off | run-e93a8bd735f4 | 0.0471 | 13 | 72.34 |
+| 2 | records.csv cut into four pieces per thread, claimed in turn, instead of one fixed range per thread | pending | | | |
+
+**Step 1 to 2.** Per-thread timers on the record pass showed the threads finishing 8 to 10 ms apart out of about 45 ms, even when they started together: ranges with more first sightings of names (inserts, not lookups) run slower. Pieces claimed from a shared counter let the fast threads take up the slack. Timing-only variants put the rest of the record pass in perspective: with name interning switched off it takes 22 to 32 ms instead of about 45, and with only the bitset marks off about 43, so interning is the next target. Locally the change is inside the laptop's noise (two builds of the same code differ by 4 ms of median), so the board run is the measurement. Same hash on full, sample, tiny, the worked example and the rules file.
 
 ## Board runs
 

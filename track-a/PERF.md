@@ -7,7 +7,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | C++: mmap, 12 threads, records per hour in blocks, per-hour counting sort and nth_element, writer thread | pending | | | |
 | 2 | Same design in 222 formatted lines instead of 373 | run-3c1dcbde6115 | 0.0293 | 31.8 | 79.7 |
-| 3 | One thread pool with a barrier; each hour written with pwrite at an offset handed on by the hour before, instead of per-hour strings and a writer thread; chunks released from the front of each region in 256 KB batches instead of one madvise per chunk; THP off | pending | | | |
+| 3 | One thread pool with a barrier; each hour written with pwrite at an offset handed on by the hour before, instead of per-hour strings and a writer thread; chunks released from the front of each region in 256 KB batches instead of one madvise per chunk; THP off | run-ab09a84f93b8 | 0.0310 | 20 | 80.64 |
 
 ## Local measurements
 
@@ -46,3 +46,4 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | b4606d2 | run-cae4bc93c3f8 | 0.0294 | 33.5 | 38.87 | 79.48 | Same Track A code |
 | c451b56 | run-95a7235e8965 | 0.0295 | 34.2 | 38.61 | 79.34 | Same Track A code |
 | 5a6463e | run-18cf1fb4a517 | 0.0304 | 32.8 | 38.36 | 79.19 | Same Track A code |
+| 836c19e | run-ab09a84f93b8 | 0.0310 | 20 | 40.99 | 80.64 | Step 3: pwrite per hour, batched chunk release, THP off |
