@@ -13,10 +13,16 @@
 // sorts the names, so an endpoint's global id is its rank in output order.
 //
 // Phase 2, hours. Threads claim hours in order. An hour's ~43k latencies are
-// counting-sorted by endpoint rank into per-thread scratch, three selections
-// per group give the percentiles, and the lines are formatted into a reusable
-// per-thread buffer. Each hour learns its file offset from the hour before and
-// writes itself with pwrite, so no output text is ever held for later.
+// counting-sorted by endpoint rank into per-thread scratch and three
+// selections per group give the percentiles. Each group's numbers are kept
+// (24 bytes a line) along with the exact size the hour's text will take, since
+// a number's width is known without formatting it.
+//
+// Phase 3, text. The last thread into the barrier turns the sizes into
+// offsets, sizes the output file and maps it; then every thread formats its
+// hours straight into the file. No hour waits for another and no write call
+// queues on the file's lock, and the output's pages fill only after the
+// records have been released.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -25,6 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <immintrin.h>
 #include <memory>
 #include <string_view>
@@ -32,6 +39,7 @@
 #include <sys/prctl.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 using u32 = uint32_t;
@@ -47,6 +55,13 @@ constexpr u32 KEY_BITS = 12, ERR = 1u << 11, ID_MASK = ERR - 1, PACKED_MAX = 1u 
 inline u32 eq32(const char* p, char c) {
     __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
     return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
+}
+
+// The number of decimal digits in x.
+inline u32 width(u32 x) {
+    static constexpr u32 TEN[10] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
+    u32 w = (32 - __builtin_clz(x | 1)) * 1233 >> 12;  // floor(log10) or one more
+    return w + ((x | 1) >= TEN[w]);
 }
 
 // The first c at or after s; one is known to follow.
@@ -89,8 +104,20 @@ struct Interner {
                 names.push_back(s);
                 id = names.size();
             }
-            if (names[id - 1] == s) return id - 1;
+            if (same(names[id - 1], s)) return id - 1;
         }
+    }
+
+    // Both names point into the log, where 32 bytes can always be read (the
+    // rest of the line and the spare page follow), so a name of up to 32
+    // bytes is compared in one step instead of a memcmp call per line.
+    static bool same(std::string_view x, std::string_view s) {
+        if (x.size() != s.size()) return false;
+        if (s.size() > 32) return memcmp(x.data(), s.data(), s.size()) == 0;
+        __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.data()));
+        __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s.data()));
+        u32 differ = ~u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)));
+        return (differ & (~0u >> (32 - s.size()))) == 0;
     }
 };
 
@@ -171,7 +198,7 @@ int main() {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     int in = open("/data/requests.log", O_RDONLY);
-    int out = open("/out/summary.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (in < 0 || out < 0) { perror("open"); return 1; }
 
     // Map the log over one spare zero page, so the 64-byte scans stay in bounds.
@@ -199,15 +226,28 @@ int main() {
             for (u32& id : ps.rank) id = rank_of[id];
     });
 
-    // Hour h's first byte in the file, published once hour h - 1 is formatted.
-    std::vector<std::atomic<u64>> offset(HOURS + 1);
-    std::vector<std::atomic<bool>> known(HOURS + 1);
-    known[0] = true;
     // An hour is finished once its records are copied out; one thread at a
     // time then releases whatever chunks that frees.
     std::vector<std::atomic<bool>> finished(HOURS);
     std::atomic_flag releasing;
-    std::atomic<int> claim{0};
+    std::atomic<int> claim{0}, claim_text{0};
+    struct Line {
+        u32 e, n, p50, p95, p99, errors;
+    };
+    auto ppm = [](const Line& l) { return u32(u64(l.errors) * 1000000 / l.n); };
+    std::vector<std::vector<Line>> lines(HOURS);
+    std::vector<u64> at(HOURS + 1);  // an hour's text size, then its offset
+    char* text = nullptr;
+    std::barrier sized(nt, [&]() noexcept {
+        u64 total = 0;
+        for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
+        at[HOURS] = total;
+        if (total == 0) return;
+        void* p = MAP_FAILED;
+        if (ftruncate(out, total) == 0) p = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+        if (p == MAP_FAILED) { perror("output"); _exit(1); }
+        text = static_cast<char*>(p);
+    });
 
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
@@ -216,16 +256,14 @@ int main() {
 
         const u32 ne = names.size();
         std::vector<u32> start(ne + 1), errors(ne), latency;
-        // A line is at most 21 + 125 + 6 * 11 bytes. Left uninitialised, so
-        // only the pages an hour actually writes count.
-        std::unique_ptr<char[]> text(new char[size_t(ne) * 224]);
         for (int h; (h = claim++) < HOURS;) {
             // Counting sort of the hour's latencies by endpoint rank: count into
             // start[e + 1], prefix, then place each latency at its group's cursor.
             std::fill(start.begin(), start.end(), 0);
             std::fill(errors.begin(), errors.end(), 0);
             for (auto& ps : parsers) ps.each(h, [&](u32 e, u32 err, u32) { ++start[e + 1], errors[e] += err != 0; });
-            for (u32 e = 0; e < ne; ++e) start[e + 1] += start[e];
+            u32 groups = 0;
+            for (u32 e = 0; e < ne; ++e) groups += start[e + 1] != 0, start[e + 1] += start[e];
             latency.resize(start[ne]);
             std::vector<u32> cursor(start.begin(), start.end() - 1);
             for (auto& ps : parsers) ps.each(h, [&](u32 e, u32, u32 l) { latency[cursor[e]++] = l; });
@@ -235,10 +273,9 @@ int main() {
                 releasing.clear();
             }
 
-            char label[24];
-            int day = (h + 18) / 24;
-            snprintf(label, sizeof label, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11, day < 2 ? 30 + day : day - 1, (h + 18) % 24);
-            char* o = text.get();
+            auto& out_lines = lines[h];
+            out_lines.reserve(groups);
+            u64 size = 0;
             for (u32 e = 0; e < ne; ++e) {
                 u32 n = start[e + 1] - start[e];
                 if (n == 0) continue;
@@ -254,27 +291,30 @@ int main() {
                     std::nth_element(a, a + r95, a + r99);
                     std::nth_element(a, a + r50, a + r95);
                 }
+                const Line& l = out_lines.emplace_back(e, n, a[r50], a[r95], a[r99], errors[e]);
+                // Label, name, six numbers each after a space, newline.
+                size += 21 + names[e].size() + 7;
+                for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) size += width(x);
+            }
+            at[h] = size;
+        }
+        sized.arrive_and_wait();
+
+        for (int h; (h = claim_text++) < HOURS;) {
+            char label[24];
+            int day = (h + 18) / 24;
+            snprintf(label, sizeof label, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11, day < 2 ? 30 + day : day - 1, (h + 18) % 24);
+            char* o = text + at[h];
+            for (const Line& l : lines[h]) {
                 o = std::copy_n(label, 21, o);
-                o = std::copy(names[e].begin(), names[e].end(), o);
-                for (u32 x : {n, a[r50], a[r95], a[r99], errors[e], u32(u64(errors[e]) * 1000000 / n)}) {
+                o = std::copy(names[l.e].begin(), names[l.e].end(), o);
+                for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) {
                     *o++ = ' ';
                     o = std::to_chars(o, o + 10, x).ptr;
                 }
                 *o++ = '\n';
             }
-
-            // Take this hour's offset from the one before, pass the next one on,
-            // then write; the write never waits for another thread.
-            known[h].wait(false);
-            u64 at = offset[h], len = o - text.get();
-            offset[h + 1] = at + len;
-            known[h + 1] = true;
-            known[h + 1].notify_all();
-            for (u64 done = 0; done < len;) {
-                ssize_t w = pwrite(out, text.get() + done, len - done, at + done);
-                if (w <= 0) { perror("pwrite"); _exit(1); }
-                done += w;
-            }
+            std::vector<Line>().swap(lines[h]);
         }
     });
     for (auto& th : pool) th.join();
