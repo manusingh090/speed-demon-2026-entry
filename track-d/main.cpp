@@ -1,12 +1,10 @@
 // Speed Demon 2026, Track D (Traverse).
 //
 // Node ids in graph.txt are a random relabelling, so a search over them would
-// miss the cache on almost every step. The graph is built in three parallel
+// miss the cache on almost every step. The graph is built in two parallel
 // passes over the memory-mapped text (line-aligned ranges, one per thread):
-//  1. out-degrees;
-//  2. the heads of every node's edges, in a CSR array without weights;
-//  3. after renumbering, every edge (head and weight) placed straight into a
-//     CSR array in the new numbering.
+// out-degrees, then every edge's head and weight in CSR arrays. After the
+// nodes are renumbered, the CSR is copied into the new numbering.
 // The renumbering cuts the road network into compact blobs of about 512 nodes:
 // each thread grows a blob by BFS over unclaimed nodes, then starts the next
 // one from the blob's frontier, so consecutive ids are close on the map and a
@@ -24,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <malloc.h>
 #include <memory>
 #include <string>
 #include <sys/mman.h>
@@ -58,10 +57,6 @@ u32 number(const char*& p) {
     ++p;
     return v;
 }
-
-struct Edge {
-    u32 to, w;
-};
 
 // A radix heap: Dijkstra's keys never drop below the last one popped, so an
 // entry lives in the bucket of the highest bit where it differs from that key
@@ -142,6 +137,9 @@ void run_threads(int n, F&& body) {
 }
 
 int main() {
+    // Large blocks always come from mmap and go back to the kernel when freed
+    // (glibc otherwise raises this threshold after the first free and keeps them).
+    mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t gsize, qsize;
     const char* graph = map_file("/data/graph.txt", gsize);
@@ -189,10 +187,15 @@ int main() {
         total += next[u].load(std::memory_order_relaxed);
         next[u].store(start[u], std::memory_order_relaxed);
     }
-    std::vector<u32> heads(start[n]);
+    std::vector<u32> heads(start[n]), weights(start[n]);
     run_threads(nthreads, [&](int t) {
-        parse(t, [&](u32 u, u32 v, u32) { heads[next[u].fetch_add(1, std::memory_order_relaxed)] = v; });
+        parse(t, [&](u32 u, u32 v, u32 w) {
+            u32 e = next[u].fetch_add(1, std::memory_order_relaxed);
+            heads[e] = v;
+            weights[e] = w;
+        });
     });
+    std::vector<std::atomic<u32>>().swap(next);
 
     // Blobs. A thread grows each blob by BFS over unclaimed nodes until it holds
     // BLOB nodes; the blob's unexpanded nodes' unclaimed neighbours become the
@@ -239,20 +242,26 @@ int main() {
     }
     for (u32 u = 0; u < n; ++u)
         if (!claimed[u].load(std::memory_order_relaxed)) id[u] = k++;
-    std::vector<u32>().swap(heads);
     std::vector<std::atomic<u8>>().swap(claimed);
 
-    // Pass 3: the CSR in the new numbering.
+    // The CSR in the new numbering, copied node by node in parallel: weights
+    // first, then heads, freeing each old array as soon as it is copied, so at
+    // most one and a half graphs are ever resident.
     std::vector<u32> first(n + 1);
     for (u32 u = 0; u < n; ++u) first[id[u] + 1] = start[u + 1] - start[u];
     for (u32 v = 0; v < n; ++v) first[v + 1] += first[v];
-    for (u32 v = 0; v < n; ++v) next[v].store(first[v], std::memory_order_relaxed);
+    auto renumber = [&](std::vector<u32>& old, auto&& map) {
+        std::vector<u32> fresh(old.size());
+        run_threads(nthreads, [&](int t) {
+            for (u32 u = u64(n) * t / nthreads; u < u64(n) * (t + 1) / nthreads; ++u)
+                for (u32 e = start[u], j = first[id[u]]; e < start[u + 1]; ++e, ++j) fresh[j] = map(old[e]);
+        });
+        old.swap(fresh);
+    };
+    renumber(weights, [](u32 w) { return w; });
+    renumber(heads, [&](u32 v) { return id[v]; });
     std::vector<u32>().swap(start);
-    std::vector<Edge> edges(first[n]);
-    run_threads(nthreads, [&](int t) {
-        parse(t, [&](u32 u, u32 v, u32 w) { edges[next[id[u]].fetch_add(1, std::memory_order_relaxed)] = {id[v], w}; });
-    });
-    std::vector<std::atomic<u32>>().swap(next);
+    const std::vector<u32>&to = heads, &w = weights;
 
     // Queries, claimed one at a time.
     std::vector<u64> answer(queries.size());
@@ -273,9 +282,9 @@ int main() {
                 if (d > dist[u]) continue;  // stale: u was settled closer
                 if (u == t) { answer[i] = d; break; }
                 for (u32 e = first[u]; e < first[u + 1]; ++e) {
-                    u64 nd = d + edges[e].w;
-                    u64& dv = dist[edges[e].to];
-                    if (nd < dv) dv = nd, heap.push(nd, edges[e].to);
+                    u64 nd = d + w[e];
+                    u64& dv = dist[to[e]];
+                    if (nd < dv) dv = nd, heap.push(nd, to[e]);
                 }
             }
             dist.reset();

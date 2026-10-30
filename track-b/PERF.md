@@ -16,6 +16,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Queries stored flat instead of two vectors each | pending | | | |
 | 10 | Terms renumbered by sampled frequency; tokenizer keeps one mask per 64-byte window | pending | | | |
 | 11 | Scan output in 3-byte entries, posting lists as 16-bit per-thread offsets decoded per query | pending | | | |
+| 12 | malloc mmap threshold pinned, so freed scan state really goes back | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -36,6 +37,7 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 | 9 | same | 89 | query parse allocations gone |
 | 10 | 0.33 vs 0.45 for the original (same session) | 92 | per-term scan state of common terms now compact |
 | 11 | 0.33, same as 10 (same session) | 76 | scan output 48 to 36 MB, lists 48 to 24 MB |
+| 12 | 0.33, same as 11 | 71 | glibc had kept freed per-thread arrays resident (found on Track D) |
 
 ## What the profile said, step by step
 

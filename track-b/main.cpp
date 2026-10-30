@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <malloc.h>
 #include <immintrin.h>
 #include <memory>
 #include <span>
@@ -760,6 +761,9 @@ private:
 }  // namespace
 
 int main() {
+    // Large blocks always come from mmap and go back to the kernel when freed
+    // (glibc otherwise raises this threshold after the first free and keeps them).
+    mallopt(M_MMAP_THRESHOLD, 1 << 16);
     const int nthreads = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
     File qf = map_file("/data/queries.txt");
     File df = map_file("/data/docs.txt");

@@ -88,9 +88,9 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 | Track | State | Local wall | Local peak | Notes |
 |---|---|---|---|---|
 | A | C++, pushed, all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S 222 after clang-format (was 373; ref 56); see track-a/README.md |
-| B | C++, pushed, all hashes pass incl. worked | 0.30 to 0.35 s | 76 MB | S about 790 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
+| B | C++, pushed, all hashes pass incl. worked | 0.30 to 0.35 s | 71 MB | S about 790 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
 | C | C++, pushed, all hashes pass incl. worked and rules examples | 62 to 77 ms | 13 MB | S about 374 after clang-format (ref 108); see track-c/README.md |
-| D | C++, pushed, all hashes pass incl. worked | 0.45 to 0.52 s | 82 MB | S 276 after clang-format (ref 43); tiny hash ecaca77d..., worked 2e9871bb...; see track-d/README.md |
+| D | C++, pushed, all hashes pass incl. worked | 0.42 to 0.45 s | 85 MB | S about 285 after clang-format (ref 43); tiny hash ecaca77d..., worked 2e9871bb...; see track-d/README.md |
 
 Board snapshot, Oct 30 17:35 UTC (58 teams; refresh with `python tools/board.py`). Board T values are the box's own timer and read much lower than our laptop's in-container timer, so compare K, not seconds:
 
@@ -251,6 +251,7 @@ Lessons, each one measured:
 - **Count the work, not just the time.** Counting tokens processed showed we re-tokenized 63M tokens, more than the corpus has, because long documents dominate candidate sets.
 - **Byte stores followed by a wide load stall the CPU** (store forwarding). Build keys with 8-byte loads plus a mask instead of byte by byte.
 - **`x | 0x20` lowercases letters and leaves digits alone**, so ASCII alphanumeric tokens lowercase eight bytes at a time.
+- **glibc keeps freed large blocks resident** once its dynamic mmap threshold has risen (after the first large free). `mallopt(M_MMAP_THRESHOLD, 1 << 16)` at the start of main makes freed arrays really go back: 17 MB on Track D, 5 MB on Track B, nothing on C.
 - **Peak memory is about what is alive at the same time.** Freeing a buffer while scattering into another array does not help if the scatter touches every page of the destination early. Shrink what you store instead (bitmaps for dense sets).
 - **mmap the input.** Input pages are not charged to us, so reading the 254 MB file costs 0 MB of M.
 - **Dense sets as bitmaps, sparse as sorted lists**, and keep a running result as a bitmap once it gets big; count and sum come from popcounts (sum of bit positions = sum over k of 2^k x popcount(word & mask_k)).
