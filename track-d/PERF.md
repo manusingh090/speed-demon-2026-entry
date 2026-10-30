@@ -53,3 +53,5 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 |---|---|---|---|---|---|---|
 | 8041c6b | run-e87fa4aef6e8 | 0.3766 | 79.6 | 16.62 | 61.04 | Steps 5 and 6 (staged copy, malloc threshold) |
 | b4606d2 | run-fa7637b07d93 | 0.3823 | 83.4 | 16.51 | 60.89 | Same Track D code |
+| c451b56 | run-66c30a95d45a | 0.3787 | 83.8 | 16.57 | 60.97 | Same Track D code |
+| 5a6463e | run-b2302fb71532 | 0.3722 | 113.8 | 15.57 | 59.62 | One parse with edges filed per owner instead of the second parse: no faster on the box and 30 MiB more; reverted |

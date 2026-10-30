@@ -41,3 +41,5 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | ac44ba2 | run-3c1dcbde6115 | 0.0293 | 31.8 | 39.34 | 79.74 | Trimmed version (step 2) first measured on the board |
 | 8041c6b | run-e7a6c67e6934 | 0.0329 | 34.4 | 36.55 | 78.15 | Same Track A code; box variance between runs |
 | b4606d2 | run-cae4bc93c3f8 | 0.0294 | 33.5 | 38.87 | 79.48 | Same Track A code |
+| c451b56 | run-95a7235e8965 | 0.0295 | 34.2 | 38.61 | 79.34 | Same Track A code |
+| 5a6463e | run-18cf1fb4a517 | 0.0304 | 32.8 | 38.36 | 79.19 | Same Track A code |
