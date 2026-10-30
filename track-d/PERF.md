@@ -27,6 +27,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 5 | 0.43 vs 0.50 for step 4 (same session) | 102 | third parse with random atomic placement replaced by a parallel copy |
 | 6 | 0.44, same as 5 | 85 | the 17 MB were freed vectors glibc kept |
 | 7 | Build arrays allocated with calloc (lazily zeroed by the kernel, first touched by the threads that fill them) instead of vectors zero-filled on one thread; new ids and per-node degrees in the new numbering filled in parallel | pending | | | |
+| 8 | Edges packed into one 32-bit word (head in the low 21 bits, weight above it, heavy weights in a sorted side list) in both numberings; transparent huge pages off | pending | | | |
 
 ## What the profile said, step by step
 
@@ -41,6 +42,10 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 **Step 6 to 7.** Phase timers: count 0.04 s, fill 0.10, order 0.045, renumber 0.075, search 0.19. About 110 MB of build arrays (offsets, heads, weights, both renumbered copies, ids) were value-initialised by `std::vector`, a single-threaded memset that also took every page fault on one thread, before parallel passes overwrote them. With `calloc` (glibc skips the memset for fresh mmapped blocks) the zeroing happens lazily, spread over the threads that first write each page. The two serial loops that assign new ids from each thread's blob chain and scatter degrees into the new numbering now run in parallel. Locally 385 ms against 428 ms for step 6 over 9 alternating runs, same 84 MB peak and hash on all four datasets. Formatted code lines 277 to 290.
 
 Also measured and kept out at this step: dense per-thread distance arrays (no faster, 236 MB), and heads and weights interleaved into one array (no faster within noise, 97 MB).
+
+**Step 7 on the board.** run-f9dd6c762386: 0.360 s but 102 MiB against 83 MiB for step 6, so K fell from 16.79 to 16.24. Locally the peak did not move (84 MB), even with glibc asked for huge pages, so the box's transparent huge pages are the likely cause; step 8 turns them off for this process, as Tracks A, B and C already do.
+
+**Step 7 to 8.** Search costs about 85 ns per settled node, and two cheaper experiments showed the queue is not the limit: Dial's bucket queue (an 8,192-slot ring, which holds every main-body weight; the largest is under 3,500) was no faster and cost 9 MB, and 6 or 8 search threads were slower than 12. What the search waits on is memory, so the edges got smaller. Each edge is now one word: the head's id in the low bits (21 for 1.74M nodes) and the weight in the 11 bits above. A weight of 2,047 or more (about 0.1% of edges, plus the injected ones near 2^32) is stored as all ones, and its value sits in a list sorted by edge position, found by binary search. The fill pass writes that word in the old numbering (one random write per edge instead of two), the BFS reads heads through a mask, and the renumbering is one pass that maps the head and keeps the weight bits. Peak was the old heads and weights alive next to the new arrays; now it is one 20 MB array next to another. Locally (9 alternating runs): 359 ms and 65 MB against 402 ms and 84 MB. Same hash on full, sample, tiny, the worked example (which has 2^32 - 1 weights and an answer above 2^32) and a seed-7 sample checked against the reference.
 
 ## Tried and kept out
 

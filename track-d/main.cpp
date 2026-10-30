@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -111,6 +112,9 @@ template <class F> void run_threads(int n, F &&fn) {
     th.join();
 }
 int main() {
+  // Plain pages: with transparent huge pages a part-touched array can be
+  // backed by whole 2 MB pages and count against peak memory.
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   mallopt(M_MMAP_THRESHOLD, 1 << 16);
   const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
   size_t gsz, qsz;
@@ -155,14 +159,33 @@ int main() {
   for (u32 u = 0, tot = 0; u <= n; ++u)
     start[u] = tot, tot += next[u], next[u] = start[u];
   const u32 m = start[n];
-  Buf<u32> heads(m), weights(m);
+  // One 32-bit word per edge: the head in the low hb bits, the weight above it.
+  // A weight that does not fit (about 0.1% of edges, and the injected ones
+  // near 2^32) is stored as all ones, with its value in a list sorted by edge.
+  const int hb = 32 - __builtin_clz(n | 1);
+  const u32 hmask = (1u << hb) - 1, big = ~0u >> hb;
+  using Spill = std::vector<std::pair<u32, u32>>;
+  std::vector<Spill> spill(nt);
+  auto sorted = [&] {
+    Spill all;
+    for (auto &s : spill)
+      all.insert(all.end(), s.begin(), s.end()), Spill().swap(s);
+    std::sort(all.begin(), all.end());
+    return all;
+  };
+  Buf<u32> link(m);
   run_threads(nt, [&](int t) {
     parse(t, [&](u32 u, u32 v, u32 w) {
       u32 e = std::atomic_ref(next[u]).fetch_add(1, std::memory_order_relaxed);
-      heads[e] = v;
-      weights[e] = w;
+      if (w >= big)
+        spill[t].emplace_back(e, w), w = big;
+      link[e] = v | w << hb;
     });
   });
+  Spill heavy = sorted();
+  auto weight = [&](u32 e, u32 w) {
+    return w != big ? w : std::lower_bound(heavy.begin(), heavy.end(), std::pair(e, 0u))->second;
+  };
   munmap((void *)graph, gsz + 4096);
   next = Buf<u32>();
   std::vector<std::atomic<u8>> claimed(n);
@@ -194,12 +217,12 @@ int main() {
       for (; i < ord.size() && ord.size() - blob < 512; ++i)
         for (u32 e = start[ord[i]];
              e < start[ord[i] + 1] && ord.size() - blob < 512; ++e)
-          if (claim(heads[e]))
-            ord.push_back(heads[e]);
+          if (claim(link[e] & hmask))
+            ord.push_back(link[e] & hmask);
       for (; i < ord.size(); ++i)
         for (u32 e = start[ord[i]]; e < start[ord[i] + 1]; ++e)
-          if (!claimed[heads[e]].load(std::memory_order_relaxed))
-            seeds.push_back(heads[e]);
+          if (!claimed[link[e] & hmask].load(std::memory_order_relaxed))
+            seeds.push_back(link[e] & hmask);
     }
   });
   Buf<u32> id(n), first(n + 1);
@@ -223,18 +246,19 @@ int main() {
   });
   for (u32 v = 0; v < n; ++v)
     first[v + 1] += first[v];
-  auto renum = [&](Buf<u32> &old, auto &&fn) {
-    Buf<u32> fresh(m);
-    run_threads(nt, [&](int t) {
-      for (u32 u = u64(n) * t / nt; u < u64(n) * (t + 1) / nt; ++u)
-        for (u32 e = start[u], j = first[id[u]]; e < start[u + 1]; ++e, ++j)
-          fresh[j] = fn(old[e]);
-    });
-    std::swap(old, fresh);
-  };
-  renum(weights, [](u32 w) { return w; });
-  renum(heads, [&](u32 v) { return id[v]; });
-  start = Buf<u32>();
+  // The same words in the new numbering: heads renumbered, weight bits kept.
+  Buf<u32> edges(m);
+  run_threads(nt, [&](int t) {
+    for (u32 u = u64(n) * t / nt; u < u64(n) * (t + 1) / nt; ++u)
+      for (u32 e = start[u], j = first[id[u]]; e < start[u + 1]; ++e, ++j) {
+        u32 x = link[e];
+        if (x >> hb == big)
+          spill[t].emplace_back(j, weight(e, big));
+        edges[j] = id[x & hmask] | (x & ~hmask);
+      }
+  });
+  link = Buf<u32>(), start = Buf<u32>();
+  heavy = sorted();
   std::vector<u32> order(queries.size());
   for (u32 i = 0; i < order.size(); ++i)
     order[i] = i;
@@ -243,7 +267,7 @@ int main() {
   });
   std::vector<u64> ans(queries.size());
   std::atomic<size_t> qidx{0};
-  const u32 *fp = first.p.get(), *hp = heads.p.get(), *wp = weights.p.get();
+  const u32 *fp = first.p.get(), *ep = edges.p.get();
   run_threads(nt, [&](int) {
     Distances dist(n);
     RadixHeap heap;
@@ -266,8 +290,8 @@ int main() {
         if (d > dist[u])
           continue;
         for (u32 e = fp[u], end = fp[u + 1]; e < end; ++e) {
-          u32 v = hp[e];
-          u64 nd = d + wp[e];
+          u32 v = ep[e] & hmask;
+          u64 nd = d + weight(e, ep[e] >> hb);
           if (nd < best && nd < dist[v]) {
             dist[v] = nd;
             if (v == t)
