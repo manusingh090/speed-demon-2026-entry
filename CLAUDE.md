@@ -79,7 +79,7 @@ speed-demon-2026-entry/          github.com/manusingh090/speed-demon-2026-entry 
 
 Each track folder is built and measured on its own. Code shared between tracks must be copied into each folder and counts toward S in each.
 
-A track folder that is byte-identical to the starter (ignoring Markdown and `.speed-demon.toml`) is reported `unchanged` and never runs. Track D is still the unchanged starter.
+A track folder that is byte-identical to the starter (ignoring Markdown and `.speed-demon.toml`) is reported `unchanged` and never runs. All four tracks now have solutions.
 
 `.speed-demon.toml` per track: set `team`, `language`, `dependency_count`. Track B has `team = "manusingh090"`, `language = "C++"`, `dependency_count = 0`. Make the team name match what was entered on the Tally form.
 
@@ -90,7 +90,7 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 | A | C++, pushed, all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S 222 after clang-format (was 373; ref 56); see track-a/README.md |
 | B | C++, pushed, all hashes pass incl. worked | 0.30 to 0.35 s | 76 MB | S about 790 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
 | C | C++, pushed, all hashes pass incl. worked and rules examples | 62 to 77 ms | 13 MB | S about 374 after clang-format (ref 108); see track-c/README.md |
-| D | not started (reference) | | | |
+| D | C++, pushed, all hashes pass incl. worked | 0.45 to 0.52 s | 82 MB | S 276 after clang-format (ref 43); tiny hash ecaca77d..., worked 2e9871bb...; see track-d/README.md |
 
 Board snapshot, Oct 30 17:35 UTC (58 teams; refresh with `python tools/board.py`). Board T values are the box's own timer and read much lower than our laptop's in-container timer, so compare K, not seconds:
 
@@ -231,6 +231,8 @@ Delete the reference files (`run.py`, `<x>.py`) from the track folder when repla
 - Reference is only 14.4 s, so wall time ratios are smaller here; the gate (correct output) is where most teams fail.
 
 ### Track D: Traverse (5M edges, 1.74M nodes, 2,000 queries, ref 73 s)
+
+- Done (see `track-d/README.md` and `PERF.md`). What mattered: renumbering nodes for locality (random ids cost about 480 ns per settled node), and the shape of the order: compact 512-node blobs beat both a global BFS order and a few large BFS regions. Per-thread dense distance arrays are 167 MB; recycled 4 KB pages cost a few MB.
 
 - `graph.txt`: header `n m`, then `u v w` lines, unsorted, weights uint32 including 0. Parallel edges, duplicates and self-loops exist. Answers can exceed 2^32 (use u64 distances), `-1` when unreachable, `0` when s == t.
 - Most of the time is parsing 92 MB of integers and building a CSR adjacency (count out-degrees, prefix sum, scatter), all parallelisable.
