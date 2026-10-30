@@ -15,8 +15,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | Scan output bucketed by term range in kernel-mapped blocks, scattered bucket by bucket | pending | | | |
 | 9 | Queries stored flat instead of two vectors each | pending | | | |
 | 10 | Terms renumbered by sampled frequency; tokenizer keeps one mask per 64-byte window | pending | | | |
-| 11 | Scan output in 3-byte entries, posting lists as 16-bit per-thread offsets decoded per query | pending | | | |
-| 12 | malloc mmap threshold pinned, so freed scan state really goes back | pending | | | |
+| 11 | Scan output in 3-byte entries, posting lists as 16-bit per-thread offsets decoded per query | run-a75abbe64920 | 0.292 | 167 | 61.0 |
+| 12 | malloc mmap threshold pinned, so freed scan state really goes back | run-5c032275f3b6 | 0.301 | 175 | 60.5 |
+| 13 | Transparent huge pages off (the box backed partly written blocks with whole 2 MB pages) | run-e6924d8063c9 | 0.292 | 69.6 | 64.8 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -62,3 +63,13 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 - Buckets balanced by sampled postings instead of 512 ids: hundreds more block lists, 96 MB and slower.
 - Numbering terms rarest first, so the heaviest bucket is scattered last: about 5% slower and no smaller.
 - Renumbering only the bitmap terms to the front: kept memory at 88 MB but lost the speed of the full frequency order.
+
+## Board runs
+
+Runs measured on the scoring box after the team was registered. M is the box's cgroup peak in MiB; K and points as the board reports them.
+
+| Commit | Run ID | T (s) | M (MiB) | K | Points | What it measured |
+|---|---|---|---|---|---|---|
+| 59e9bc3 | run-a75abbe64920 | 0.2924 | 167.0 | 16.63 | 61.04 | Step 11 (3-byte scan output, 16-bit lists): 76 MB locally, 167 MiB on the box |
+| 8041c6b | run-5c032275f3b6 | 0.3011 | 175.2 | 16.23 | 60.51 | Step 12 (malloc threshold): 71 MB locally, still 175 MiB on the box |
+| b4606d2 | run-e6924d8063c9 | 0.2918 | 69.6 | 19.82 | 64.85 | Step 13: transparent huge pages off; the box now matches the laptop |

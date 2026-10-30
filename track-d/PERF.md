@@ -44,3 +44,12 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 - Copying the whole CSR at once into the new numbering (step 3): 116 MB peak; the staged copy in step 5 gets the speed at 85 MB.
 - Blob sizes 128 and 2048 instead of 512: query time the same within noise.
 - Bidirectional search: would roughly halve settled nodes, but the reverse graph adds about 47 MB; on this formula the memory cost outweighs the time saved.
+
+## Board runs
+
+Runs measured on the scoring box after the team was registered. M is the box's cgroup peak in MiB; K and points as the board reports them.
+
+| Commit | Run ID | T (s) | M (MiB) | K | Points | What it measured |
+|---|---|---|---|---|---|---|
+| 8041c6b | run-e87fa4aef6e8 | 0.3766 | 79.6 | 16.62 | 61.04 | Steps 5 and 6 (staged copy, malloc threshold) |
+| b4606d2 | run-fa7637b07d93 | 0.3823 | 83.4 | 16.51 | 60.89 | Same Track D code |

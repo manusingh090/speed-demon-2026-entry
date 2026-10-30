@@ -27,7 +27,6 @@
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
-#include <sys/prctl.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -38,11 +37,15 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
 
-// Zero-filled anonymous memory; pages are charged only once touched.
+// Zero-filled anonymous memory; pages are charged only once touched. A region
+// that is written only sparsely opts out of transparent huge pages, which
+// would back each touched spot with a whole 2 MB page; dense tables keep them,
+// since they save TLB misses.
 template <class T>
-T* zeroed(size_t n) {
+T* zeroed(size_t n, bool dense = true) {
     void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
+    if (!dense) madvise(p, n * sizeof(T), MADV_NOHUGEPAGE);
     return static_cast<T*>(p);
 }
 
@@ -198,8 +201,8 @@ private:
     }
     std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS);  // 0 = free
     Slot* slots_ = zeroed<Slot>(SLOTS);
-    u32* overflow_ = zeroed<u32>(SLOTS);  // arena offset of a long name's tail
-    char* arena_ = zeroed<char>(64 << 20);
+    u32* overflow_ = zeroed<u32>(SLOTS, false);  // arena offset of a long name's tail
+    char* arena_ = zeroed<char>(64 << 20, false);
     std::atomic<u32> used_{0}, next_id_{0};
 };
 
@@ -321,9 +324,6 @@ void put_money(std::string& out, i64 cents) {
 }
 
 int main() {
-    // With transparent huge pages, a block written only in part can be backed
-    // by a whole 2 MB page; plain pages keep memory to what is written.
-    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
