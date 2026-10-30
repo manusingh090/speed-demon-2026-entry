@@ -15,6 +15,8 @@ param(
     [int]$Runs = 5
 )
 
+# `powershell -File` passes "a,b" as one string, so split it here.
+$Images = $Images | ForEach-Object { $_ -split "," } | Where-Object { $_ }
 $output = @{ a = "summary.txt"; b = "results.txt"; c = "aggregates.txt"; d = "distances.txt" }[$Track]
 $res = @{}
 $cmd = @{}
