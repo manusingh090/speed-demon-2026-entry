@@ -27,6 +27,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 20 | Bitmap terms numbered first; each thread collects a term's bits per 64 documents and ORs them in once | pending | | | |
 | 21 | Phrases checked by the scan at their anchor's occurrences, while the text is in cache; anchors keep doc lists for BOOL | pending | | | |
 | 22 | Per-thread last-document marks and counts as 16-bit offsets; write cursors rebuilt per bucket, so the counts go before the scatter | pending | | | |
+| 23 | Scan threads go on to lay out and scatter (one thread pool instead of two); `_exit` once the output is closed | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -70,7 +71,10 @@ The laptop is an AMD Ryzen 7 7840HS under WSL2 and Docker's `--cpus=12` is a CPU
 
 **Step 22.** The per-thread scan state was 32-bit: the last document each term was seen in and its document count, about 400 KB each per thread. Both fit in 16 bits (a thread covers fewer than 32,768 documents). The counts were also kept through the scatter as write cursors; the cursors are now rebuilt for each bucket from the term starts and segment lengths in an 8 KB array, so the counts are freed before the scatter. Peak 56 to 53 MB, same speed.
 
+**Step 23.** Two pieces of fixed cost. Freeing every structure on the way out (dozens of `munmap` calls) came just before the kernel tears the whole process down anyway; `_exit` after `fclose` saved about 4% of cycles in three paired `perf stat` rounds. And the scan threads no longer end and make way for a second pool of 12: the serial step between scan and scatter (gathering the phrase matches, sizing the list arrays) is the completion step of a barrier, and the same threads go on to lay out and scatter. Median 0.253 to 0.235 s over 9 alternating runs (step 22 against 23), same 53 MB.
+
 **Measured and dropped in this session:**
+- Each thread scattering the buckets in its own rotated order, so no two threads write the same term's stretch at once (testing for false sharing between neighbouring segments): the scatter took the same 16 to 20 ms, and memory rose to 67 MB because every bucket's stretch was touched early.
 - Keys built with one 16-byte SIMD load and a length mask, or with `bzhi`, and a two-word lookup for tokens up to 16 bytes: 4 to 9% more instructions and the same cycles. The four-word build compiles well already.
 - Forcing the per-token handler inline (GCC left it out of line): more instructions, no fewer cycles.
 - One 8-byte entry per term for the last document and the count, instead of two arrays: no change.

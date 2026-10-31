@@ -503,6 +503,31 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
         ix.bits = static_cast<u64*>(mmap(nullptr, std::max<size_t>(ndense * ix.words, 1) * 8, PROT_READ | PROT_WRITE,
                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     });
+    // Between the scan and the scatter, on one thread: the phrase matches per
+    // query (threads cover the documents in order) and the list arrays.
+    std::barrier scanned(nthreads, [&]() noexcept {
+        ix.found_start.assign(qs.size() + 1, 0);
+        for (auto& f : found)
+            for (auto [i, doc] : f) ++ix.found_start[i + 1];
+        std::partial_sum(ix.found_start.begin(), ix.found_start.end(), ix.found_start.begin());
+        ix.found.resize(ix.found_start.back());
+        std::vector<u32> fill(ix.found_start.begin(), ix.found_start.end() - 1);
+        for (auto& f : found)
+            for (auto [i, doc] : f) ix.found[fill[i]++] = doc;
+
+        ix.post.reset(new uint16_t[std::accumulate(totals.begin(), totals.end(), 0u)]);  // every slot is written below
+        ix.start.resize(space + 1);
+        ix.seglen.resize(size_t(space) * nthreads);
+    });
+    // Thread t lays out the lists of the term ids [lo, hi): it sums their
+    // postings, waits for every slice's sum, then sets each term's start and
+    // its segment lengths. Once all are laid out, the counts go, and each
+    // thread scatters its own scan output, bucket by bucket: a bucket's terms
+    // are consecutive ids, so its lists are one stretch of post, and the
+    // thread's write cursors there follow from the starts and lengths.
+    std::vector<u32> slice(nthreads + 1);
+    std::barrier summed(nthreads, [&]() noexcept { std::exclusive_scan(slice.begin(), slice.end(), slice.begin(), 0u); });
+    std::barrier laid(nthreads);
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
@@ -573,35 +598,7 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             for (u32 id = 0; id < ix.ndense; ++id) flush(id);
             if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
             totals[t] = std::accumulate(cnt.begin(), cnt.end(), 0u);
-        });
-    }
-    for (auto& th : pool) th.join();
-    pool.clear();
-
-    // The phrase matches, per query; threads cover the documents in order.
-    ix.found_start.assign(qs.size() + 1, 0);
-    for (auto& f : found)
-        for (auto [i, doc] : f) ++ix.found_start[i + 1];
-    std::partial_sum(ix.found_start.begin(), ix.found_start.end(), ix.found_start.begin());
-    ix.found.resize(ix.found_start.back());
-    std::vector<u32> fill(ix.found_start.begin(), ix.found_start.end() - 1);
-    for (auto& f : found)
-        for (auto [i, doc] : f) ix.found[fill[i]++] = doc;
-
-    ix.post.reset(new uint16_t[std::accumulate(totals.begin(), totals.end(), 0u)]);  // every slot is written below
-    ix.start.resize(space + 1);
-    ix.seglen.resize(size_t(space) * nthreads);
-    // Thread t lays out the lists of the term ids [lo, hi): it sums their
-    // postings, waits for every slice's sum, then sets each term's start and
-    // its segment lengths. Once all are laid out, the counts go, and each
-    // thread scatters its own scan output, bucket by bucket: a bucket's terms
-    // are consecutive ids, so its lists are one stretch of post, and the
-    // thread's write cursors there follow from the starts and lengths.
-    std::vector<u32> slice(nthreads + 1);
-    std::barrier summed(nthreads, [&]() noexcept { std::exclusive_scan(slice.begin(), slice.end(), slice.begin(), 0u); });
-    std::barrier laid(nthreads);
-    for (int t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&, t] {
+            scanned.arrive_and_wait();
             const u32 lo = u64(space) * t / nthreads, hi = u64(space) * (t + 1) / nthreads;
             for (int s = 0; s < nthreads; ++s)
                 slice[t] = std::accumulate(count[s].begin() + lo, count[s].begin() + hi, slice[t]);
@@ -947,6 +944,6 @@ int main() {
     FILE* f = fopen("/out/results.txt", "wb");
     if (!f) { perror("/out/results.txt"); return 1; }
     for (const std::string& c : chunks) fwrite(c.data(), 1, c.size(), f);
-    fclose(f);
-    return 0;
+    if (fclose(f)) { perror("/out/results.txt"); return 1; }
+    _exit(0);  // the kernel frees everything at once; destructors would unmap block by block
 }
