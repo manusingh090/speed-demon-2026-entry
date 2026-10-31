@@ -32,7 +32,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 10 | Count and fill passes in batches of 32 edges with every random line prefetched first; BFS and renumbering prefetch the nodes coming up | run-e72d02d00206 | 0.229 | 72 | 65.95 |
 | 11 | Search constants copied into the thread so the loop keeps them in registers; a queued node's offsets prefetched | run-23727a1a2adb | 0.228 | 73 | 65.96 |
 | 12 | Rewritten in Rust with a new build: one parse filing edges by tail range, each range's adjacency built in cache; in-edge check read off the reverse graph | run-18295702ad2c | 0.185 | 71 | 67.59 |
-| 13 | Numbers parsed with one 8-byte load each; Rust trimmed from 494 to 478 rustfmt lines | pending | | | |
+| 13 | Numbers parsed with one 8-byte load each; Rust trimmed from 494 to 478 rustfmt lines | run-96410d780f29 | 0.174 | 71 | 68.34 |
 
 ## What the profile said, step by step
 
