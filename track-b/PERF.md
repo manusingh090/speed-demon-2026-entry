@@ -28,6 +28,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 21 | Phrases checked by the scan at their anchor's occurrences, while the text is in cache; anchors keep doc lists for BOOL | run-c2b149a34d40 (with 23) | | | |
 | 22 | Per-thread last-document marks and counts as 16-bit offsets; write cursors rebuilt per bucket, so the counts go before the scatter | run-c2b149a34d40 (with 23) | | | |
 | 23 | Scan threads go on to lay out and scatter (one thread pool instead of two); `_exit` once the output is closed | run-c2b149a34d40 | 0.232 | 52.7 | 67.95 |
+| 24 | Rewritten from scratch in Rust, short: about 600 rustfmt lines against 968 | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -84,6 +85,8 @@ The laptop is an AMD Ryzen 7 7840HS under WSL2 and Docker's `--cpus=12` is a CPU
 - Prefetching only the key of each token's home slot, four tokens ahead: more cycles.
 - A 1/64 sample instead of 1/32: no clear change.
 - Terms that occur only in phrases kept no lists: only 5.5% of list postings at full scale (625,000 of 11.3M), not worth the code.
+
+**Step 24: a short Rust version.** On this track the code is 968 counted lines against a reference of 91, so S alone costs the C++ about a third of its K; a version at 60% of the size and the same speed and memory would score about 7% more. Written from scratch with the lessons of the C++ but none of its machinery: every phrase is anchored at its rarest sampled term (so the separate path for phrases without an anchor is gone), only BOOL terms are indexed, and the posting lists are built by one counting sort per thread. The first working version (correct on every file on its first build) ran 0.50 s at 91 MB; then, each change measured with `perf stat`: list OR as a merge instead of a sort (answers 230 to 140 ms), the malloc mmap threshold raised again before answering so large lists stop being fresh mappings, pre-sized list decoding and `write!` instead of `format!` (answers 98 to 25 ms per thread), tagged slots and terms renumbered by sampled frequency (9.9G to 8.7G cycles), 16-bit gap-coded scan output in 64 KB chunks and per-64-document pending bitmap words (91 to 72 MB), the 64-byte AVX2 tokenizer (8.8G to 7.5G cycles, 0.30 to 0.27 s), and one shared per-term table plus 16-bit per-thread counts (72 to 61 MB). Against step 23 on the laptop: 4 to 7% more cycles, 61 MB against 53 MB, 612 counted lines against 968, an estimated K about 2% higher; the board run decides.
 
 ## What the profile said, step by step
 
