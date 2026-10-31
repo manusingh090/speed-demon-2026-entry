@@ -204,12 +204,13 @@ struct Parser {
 
     // The log is in arrival order, so chunks are carved roughly hour by hour
     // and hours finish in the same order: the run of chunks at the front whose
-    // hours are all finished grows steadily. Hand it back once it reaches 256
-    // KB, in one madvise, instead of one call (and TLB shootdown) per chunk.
+    // hours are all finished grows steadily. Hand it back once it reaches 64
+    // KB, in one madvise, instead of one call (and TLB shootdown) per chunk;
+    // larger batches left about 1 MB more resident at the peak.
     void release(const std::atomic<bool>* finished) {
         Chunk* c = kept;
         while (c < next && finished[c->hour]) ++c;
-        if (c - kept >= 16 || (c == next && c > kept)) {
+        if (c - kept >= 4 || (c == next && c > kept)) {
             madvise(kept, (c - kept) * sizeof(Chunk), MADV_DONTNEED);
             kept = c;
         }
@@ -272,6 +273,9 @@ int main() {
     std::vector<u64> at(HOURS + 1);  // an hour's text size, then its offset
     char* text = nullptr;
     std::barrier sized(nt, [&]() noexcept {
+        // Every hour is finished: whatever chunks the last releases left go
+        // back now, before the output's pages start to count.
+        for (auto& ps : parsers) ps.release(finished.data());
         u64 total = 0;
         for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
         at[HOURS] = total;
@@ -287,6 +291,7 @@ int main() {
         for (int k; (k = claim_piece++) < pieces;) parsers[t].run(log + cut[k], log + cut[k + 1]);
         ranked.arrive_and_wait();
 
+        {  // the scratch goes before the text phase, where the output counts
         const u32 ne = names.size();
         std::vector<u32> start(ne + 1), errors(ne), latency;
         for (int h; (h = claim++) < HOURS;) {
@@ -323,6 +328,7 @@ int main() {
                 for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) size += width(x);
             }
             at[h] = size;
+        }
         }
         sized.arrive_and_wait();
 
