@@ -15,7 +15,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 8 | One lock-free endpoint table shared by all threads (no per-thread tables, no merge), names copied into one compact arena; branch-free selection for the percentiles; 13-bit record keys | run-3b736d2f0408 | 0.0279 | 21 | 81.08 |
 | 9 | Chunks handed back in 64 KB batches instead of 256 KB; every remaining chunk and each thread's sort scratch freed before the output's pages start to count | run-0fb87a6d8f1a | 0.0280 | 18.6 | 81.56 |
 | 10 | Each thread's sort scratch sized once for the largest hour (a growing buffer is remapped, which stalls every thread's page faults); endpoint names up to 64 bytes compared in two AVX2 steps | run-0ee3487c8434 | 0.0269 | 19.6 | 81.68 |
-| 11 | The sort scratch allocated without zeroing, so each thread is charged only for the pages its own largest hour uses; a number's width from its bit length and one compare instead of a recursion | pending | | | |
+| 11 | The sort scratch allocated without zeroing, so each thread is charged only for the pages its own largest hour uses; a number's width from its bit length and one compare instead of a recursion | run-ebcf5b81097e | 0.0260 | 18.8 | 82.16 |
 
 ## Local measurements
 
@@ -61,6 +61,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 10 on the board.** run-0ee3487c8434: 0.0269 s against 0.0280 s, but 19.6 MiB against 18.6 MiB, 319 counted lines; K 43.01, 81.68 points, a small gain. The memory came from sizing the scratch: a zero-filled vector of the largest hour's size touches every page of it, in all twelve threads at once, where a growing buffer only reached the size of each thread's own largest hour.
 
 **Step 10 to 11.** The scratch is now allocated without zeroing (`new u32[most]`, a fresh mapping whose pages count only once written), which keeps the no-remap gain and gives the memory back: peak 19.0 to 20.0 MB locally, median about 19.1 MB, against about 20.2 MB for step 10. The digit width of each printed number (six a line, about 660,000 calls) came from a recursion on x / 10; it is now `t = bit_length(x | 1) * 1233 >> 12` plus one compare against a table of powers of ten, checked against `len(str(x))` on 600,000 values including every power-of-ten boundary, zero and 2^32 - 1. 2% fewer instructions; four interleaved `perf stat -r 8` rounds were even on wall time (0.025 to 0.028 s against 0.026 to 0.038 s). Same hash on full, sample, tiny, the worked example, the seed-9 sample and an empty log, and 20 repeated full runs gave one hash.
+
+**Step 11 on the board.** run-ebcf5b81097e: 0.0260 s, 18.75 MiB, 329 counted lines, K 43.96, 82.16 points, the best Track A run so far: the memory step 10 had cost came back and the time gain held.
 
 ## Tried and kept out
 
