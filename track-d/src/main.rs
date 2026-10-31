@@ -41,9 +41,6 @@ impl<T> Raw<T> {
     fn of(v: &mut [T]) -> Self {
         Raw(v.as_mut_ptr())
     }
-    unsafe fn set(self, i: usize, x: T) {
-        *self.at(i) = x
-    }
     unsafe fn at(self, i: usize) -> *mut T {
         self.0.add(i)
     }
@@ -56,25 +53,41 @@ fn prefetch<T>(p: *const T) {
 fn map(path: &str) -> &'static [u8] {
     let file = std::fs::File::open(path).expect(path);
     let len = file.metadata().unwrap().len() as usize;
-    if len == 0 {
-        return &[];
+    // An anonymous page of zeros, then the file over its start (PROT_READ;
+    // MAP_PRIVATE | MAP_ANONYMOUS, then MAP_PRIVATE | MAP_FIXED), so an
+    // 8-byte read at any byte of the file stays inside the mapping.
+    unsafe {
+        let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
+        let ok = len == 0 || mmap(p, len, 1, 0x12, file.as_raw_fd(), 0) == p;
+        assert!(p as isize != -1 && ok, "mmap {path}");
+        std::slice::from_raw_parts(p as *const u8, len)
     }
-    // PROT_READ, MAP_PRIVATE; the mapping outlives the file handle.
-    let p = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
-    assert!(p as isize != -1, "mmap {path}");
-    unsafe { std::slice::from_raw_parts(p as *const u8, len) }
 }
 
 /// The number at text[*i..], leaving *i past the one byte that ends it.
+/// Digits have bit 0x10 set and the space and newline that end a number do
+/// not, so one 8-byte load finds the end of any number up to 7 digits, and
+/// its digits are combined in pairs, quads and halves; longer numbers (only
+/// heavy weights) take the byte loop.
 #[inline(always)]
 fn number(text: &[u8], i: &mut usize) -> u32 {
-    let mut v = 0u32;
-    while let d @ b'0'..=b'9' = unsafe { *text.get_unchecked(*i) } {
-        v = v * 10 + (d - b'0') as u32;
+    let w = u64::from_le_bytes(unsafe { *(text.as_ptr().add(*i) as *const [u8; 8]) });
+    let stop = !w & 0x1010_1010_1010_1010;
+    if stop == 0 {
+        let mut v = 0u32;
+        while let d @ b'0'..=b'9' = unsafe { *text.get_unchecked(*i) } {
+            v = v * 10 + (d - b'0') as u32;
+            *i += 1;
+        }
         *i += 1;
+        return v;
     }
-    *i += 1;
-    v
+    let len = stop.trailing_zeros() / 8; // digits before the separator
+    *i += len as usize + 1;
+    let mut v = (w << (64 - 8 * len)) & 0x0F0F_0F0F_0F0F_0F0F;
+    v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    ((v * 10000 + (v >> 32)) & 0xFFFF_FFFF) as u32
 }
 
 /// k line-aligned cuts of text[from..].
@@ -93,8 +106,9 @@ fn cuts(text: &[u8], from: usize, k: usize) -> Vec<usize> {
 
 /// Runs f(t) on nt threads and collects what each returns.
 fn on_threads<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    let f = &f;
     std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nt).map(|t| { let f = &f; s.spawn(move || f(t)) }).collect();
+        let hs: Vec<_> = (0..nt).map(|t| s.spawn(move || f(t))).collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
 }
@@ -175,11 +189,8 @@ impl Dist {
             self.used.push(i as u32);
             self.tab[i] = self.used.len() as u16;
             let s = (self.used.len() - 1) * PAGE;
-            if self.pool.len() < s + PAGE {
-                self.pool.resize(s + PAGE, INF);
-            } else {
-                self.pool[s..s + PAGE].fill(INF);
-            }
+            self.pool.resize(self.pool.len().max(s + PAGE), INF);
+            self.pool[s..s + PAGE].fill(INF);
         }
         let k = (self.tab[i] as usize - 1) * PAGE + v as usize % PAGE;
         unsafe { self.pool.get_unchecked_mut(k) }
@@ -243,6 +254,11 @@ fn main() {
         }
         out
     });
+    // Part p's edges start where part p - 1's end.
+    let mut base = vec![0u32; parts + 1];
+    for p in 0..parts {
+        base[p + 1] = base[p] + filed.iter().map(|f| f[p].0.len() as u32).sum::<u32>();
+    }
     let buckets: Vec<Mutex<Bucket>> = (0..parts * nt).map(|_| Mutex::default()).collect();
     for (t, f) in filed.into_iter().enumerate() {
         for (p, b) in f.into_iter().enumerate() {
@@ -250,13 +266,7 @@ fn main() {
         }
     }
 
-    // 2. Build each part's adjacency on its own. Part p's edges start where
-    // part p - 1's end.
-    let mut base = vec![0u32; parts + 1];
-    for p in 0..parts {
-        let edges: usize = (0..nt).map(|t| buckets[p * nt + t].lock().unwrap().0.len()).sum();
-        base[p + 1] = base[p] + edges as u32;
-    }
+    // 2. Build each part's adjacency on its own.
     let m = base[parts] as usize;
     let (mut first, mut link) = (vec![0u32; n + 1], vec![0u32; m]);
     first[n] = m as u32;
@@ -276,7 +286,7 @@ fn main() {
             mine.iter().for_each(|b| b.0.iter().for_each(|&r| cursor[(r >> 32) as usize] += 1));
             let mut at = base[p];
             for (k, c) in cursor.iter_mut().enumerate() {
-                unsafe { fr.set(lo + k, at) };
+                unsafe { *fr.at(lo + k) = at };
                 (at, *c) = (at + *c, at);
             }
             for (records, weights) in &mine {
@@ -287,7 +297,7 @@ fn main() {
                     if x >> hb == big {
                         heavy.push((*c, *h.next().unwrap()));
                     }
-                    unsafe { lr.set(*c as usize, x) };
+                    unsafe { *lr.at(*c as usize) = x };
                     *c += 1;
                 }
             }
@@ -364,7 +374,7 @@ fn main() {
         start[t + 1] = start[t] + chains[t].len() as u32;
     }
     let ir = Raw::of(&mut id_v);
-    on_threads(nt, |t| chains[t].iter().zip(start[t]..).for_each(|(&u, k)| unsafe { ir.set(u as usize, k) }));
+    on_threads(nt, |t| chains[t].iter().zip(start[t]..).for_each(|(&u, k)| unsafe { *ir.at(u as usize) = k }));
     let mut k = start[nt];
     for u in 0..n {
         if claimed[u].load(Relaxed) == 0 {
@@ -379,7 +389,7 @@ fn main() {
     let id = &id_v[..];
     let mut off = vec![0u32; n + 1];
     let or = Raw::of(&mut off);
-    on_threads(nt, |t| share(n, t, nt).for_each(|u| unsafe { or.set(id[u] as usize + 1, first[u + 1] - first[u]) }));
+    on_threads(nt, |t| share(n, t, nt).for_each(|u| unsafe { *or.at(id[u] as usize + 1) = first[u + 1] - first[u] }));
     for v in 0..n {
         off[v + 1] += off[v];
     }
@@ -402,7 +412,7 @@ fn main() {
                 if x >> hb == big {
                     out.push((j, heavy_weight(&heavy, e)));
                 }
-                unsafe { ar.set(j as usize, id[(x & hmask) as usize] | (x & !hmask)) };
+                unsafe { *ar.at(j as usize) = id[(x & hmask) as usize] | (x & !hmask) };
                 j += 1;
             }
         }
@@ -428,8 +438,6 @@ fn main() {
     }
     let mut radj = vec![0u32; m];
     let rar = Raw::of(&mut radj);
-    let rr = Raw::of(&mut roff);
-    let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
     let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
         let mut out = Vec::new();
         for u in share(n, t, nt) {
@@ -439,7 +447,7 @@ fn main() {
                 if x >> hb == big {
                     out.push((j, heavy_weight(&heavy2, e)));
                 }
-                unsafe { rar.set(j as usize, u as u32 | (x & !hmask)) };
+                unsafe { *rar.at(j as usize) = u as u32 | (x & !hmask) };
             }
         }
         out
@@ -469,7 +477,7 @@ fn main() {
             let Some(&i) = order.get(q) else { return };
             let ((s0, t0), (s, t)) = (queries[i], ends[i]);
             if s0 == t0 {
-                unsafe { ansr.set(i, 0) };
+                unsafe { *ansr.at(i) = 0 };
                 continue;
             }
             if roff[t as usize + 1] == roff[t as usize] {
@@ -482,34 +490,32 @@ fn main() {
             queue[1].push(0, t);
             while queue[0].len > 0 && queue[1].len > 0 && queue[0].top() + queue[1].top() < best {
                 let k = (queue[1].len < queue[0].len) as usize;
-                let (g_off, g_adj, g_heavy) = sides[k];
+                let (go, ga, gh) = sides[k];
                 let (a, b) = dist.split_at_mut(1);
-                let (mine, other) = if k == 0 { (&mut a[0], &b[0]) } else { (&mut b[0], &a[0]) };
+                let (mine, other) = if k == 0 { (a, b) } else { (b, a) };
                 let (d, u) = queue[k].pop();
-                if d > mine.get(u) {
+                if d > mine[0].get(u) {
                     continue;
                 }
-                let (lo, hi) = unsafe { (*g_off.get_unchecked(u as usize), *g_off.get_unchecked(u as usize + 1)) };
+                let lo = unsafe { *go.get_unchecked(u as usize) };
+                let hi = unsafe { *go.get_unchecked(u as usize + 1) };
                 for e in lo..hi {
-                    let x = unsafe { *g_adj.get_unchecked(e as usize) };
+                    let x = unsafe { *ga.get_unchecked(e as usize) };
                     let (v, w) = (x & hmask, x >> hb);
-                    let w = if w == big { heavy_weight(g_heavy, e) } else { w };
+                    let w = if w == big { heavy_weight(gh, e) } else { w };
                     let nd = d + w as u64;
                     if nd < best {
-                        let slot = mine.at(v);
+                        let slot = mine[0].at(v);
                         if nd < *slot {
                             *slot = nd;
                             queue[k].push(nd, v);
-                            prefetch(g_off.as_ptr().wrapping_add(v as usize));
-                            let o = other.get(v);
-                            if o != INF {
-                                best = best.min(nd + o);
-                            }
+                            prefetch(go.as_ptr().wrapping_add(v as usize));
+                            best = best.min(nd.saturating_add(other[0].get(v)));
                         }
                     }
                 }
             }
-            unsafe { ansr.set(i, best) };
+            unsafe { *ansr.at(i) = best };
             queue.iter_mut().for_each(RadixHeap::clear);
             dist.iter_mut().for_each(Dist::reset);
         }
