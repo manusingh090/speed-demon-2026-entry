@@ -13,7 +13,7 @@
 //! 3. Renumber for locality. Node ids are a random relabelling, so each thread
 //!    cuts the road network into compact blobs of 512 nodes grown by BFS, and
 //!    the graph is copied into that numbering, then reversed.
-//! 4. Bidirectional Dijkstra per query, with radix heaps and distances kept in
+//! 4. Bidirectional Dijkstra per query, with 4-ary heaps and distances kept in
 //!    pages handed out on first touch. A target with no in-edge is -1 at once.
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::ffi::c_void;
@@ -118,49 +118,40 @@ fn share(n: usize, t: usize, nt: usize) -> std::ops::Range<usize> {
     n * t / nt..n * (t + 1) / nt
 }
 
-/// A monotone priority queue: keys never drop below the last one popped, so
-/// a key only moves to a lower bucket, and only the lowest is ever split.
-struct RadixHeap {
-    b: Vec<Vec<(u64, u32)>>,
-    len: usize,
-    last: u64,
-}
+/// A 4-ary min-heap of (key, node): it only ever holds the live frontier, so
+/// it stays small, and four children share one cache line.
+#[derive(Default)]
+struct Heap(Vec<(u64, u32)>);
 
-impl RadixHeap {
-    fn new() -> Self {
-        RadixHeap { b: (0..65).map(|_| Vec::new()).collect(), len: 0, last: 0 }
-    }
-    fn slot(&self, k: u64) -> usize {
-        (64 - (k ^ self.last).leading_zeros()) as usize
-    }
+impl Heap {
     fn push(&mut self, k: u64, u: u32) {
-        let s = self.slot(k);
-        unsafe { self.b.get_unchecked_mut(s) }.push((k, u));
-        self.len += 1;
-    }
-    /// The smallest key (the heap must not be empty).
-    fn top(&mut self) -> u64 {
-        if self.b[0].is_empty() {
-            let i = (1..65).find(|&i| !self.b[i].is_empty()).unwrap();
-            let mut v = std::mem::take(&mut self.b[i]);
-            self.last = v.iter().map(|e| e.0).min().unwrap();
-            for &(k, u) in &v {
-                let s = self.slot(k);
-                self.b[s].push((k, u));
-            }
-            v.clear();
-            self.b[i] = v;
+        let h = &mut self.0;
+        let mut i = h.len();
+        h.push((k, u));
+        while i > 0 && h[(i - 1) / 4].0 > k {
+            h[i] = h[(i - 1) / 4];
+            i = (i - 1) / 4;
         }
-        self.last
+        h[i] = (k, u);
     }
+    /// The smallest entry (the heap must not be empty). The last entry sifts
+    /// down from the root, unchecked: every index read is below n.
     fn pop(&mut self) -> (u64, u32) {
-        self.top();
-        self.len -= 1;
-        self.b[0].pop().unwrap()
-    }
-    fn clear(&mut self) {
-        self.b.iter_mut().for_each(Vec::clear);
-        (self.len, self.last) = (0, 0);
+        let x = self.0.pop().unwrap();
+        let Some(&top) = self.0.first() else { return x };
+        let (h, n, mut i) = (self.0.as_mut_ptr(), self.0.len(), 0);
+        unsafe {
+            while 4 * i + 1 < n {
+                let c = 4 * i + 1;
+                let m = (c + 1..n.min(c + 4)).fold(c, |m, j| if (*h.add(j)).0 < (*h.add(m)).0 { j } else { m });
+                if (*h.add(m)).0 >= x.0 {
+                    break;
+                }
+                (*h.add(i), i) = (*h.add(m), m);
+            }
+            *h.add(i) = x;
+        }
+        top
     }
 }
 
@@ -335,7 +326,7 @@ fn main() {
                 }
             }
             while seed.is_none() && scan < n {
-                if first[scan + 1] > first[scan] && claim(scan as u32) {
+                if claim(scan as u32) {
                     seed = Some(scan as u32);
                 }
                 scan += 1;
@@ -367,7 +358,7 @@ fn main() {
         }
     });
 
-    // New ids: each thread's chain in turn, then the nodes no blob reached.
+    // New ids: each thread's chain in turn (every node is in one).
     let mut id_v = vec![0u32; n];
     let mut start = vec![0u32; nt + 1];
     for t in 0..nt {
@@ -375,12 +366,6 @@ fn main() {
     }
     let ir = Raw::of(&mut id_v);
     on_threads(nt, |t| chains[t].iter().zip(start[t]..).for_each(|(&u, k)| unsafe { *ir.at(u as usize) = k }));
-    let mut k = start[nt];
-    for u in 0..n {
-        if claimed[u].load(Relaxed) == 0 {
-            (id_v[u], k) = (k, k + 1);
-        }
-    }
     drop((claimed, chains));
 
     // The graph in the new numbering: degrees scattered, summed, then each
@@ -421,9 +406,9 @@ fn main() {
     .concat();
     heavy2.sort_unstable();
     // Queries in the new numbering (sorted later), then the old graph and the
-    // id map can go.
+    // id map can go, freed on a side thread while the reverse graph is built.
     let ends: Vec<(u32, u32)> = queries.iter().map(|&(s, t)| (id[s as usize], id[t as usize])).collect();
-    drop((heavy, first_v, link_v, id_v));
+    std::thread::spawn(move || drop((heavy, first_v, link_v, id_v)));
 
     // The reverse graph in the same format: in-degrees counted into
     // roff[v + 1], summed, then roff[v] used as v's cursor, which leaves it at
@@ -471,7 +456,7 @@ fn main() {
     // it can, so the best meeting seen is the answer.
     on_threads(nt, |_| {
         let mut dist = [Dist::new(n), Dist::new(n)];
-        let mut queue = [RadixHeap::new(), RadixHeap::new()];
+        let mut queue = [Heap::default(), Heap::default()];
         loop {
             let q = next.fetch_add(1, Relaxed);
             let Some(&i) = order.get(q) else { return };
@@ -488,8 +473,11 @@ fn main() {
             queue[0].push(0, s);
             *dist[1].at(t) = 0;
             queue[1].push(0, t);
-            while queue[0].len > 0 && queue[1].len > 0 && queue[0].top() + queue[1].top() < best {
-                let k = (queue[1].len < queue[0].len) as usize;
+            while let (Some(a), Some(b)) = (queue[0].0.first(), queue[1].0.first()) {
+                if a.0 + b.0 >= best {
+                    break;
+                }
+                let k = (queue[1].0.len() < queue[0].0.len()) as usize;
                 let (go, ga, gh) = sides[k];
                 let (a, b) = dist.split_at_mut(1);
                 let (mine, other) = if k == 0 { (a, b) } else { (b, a) };
@@ -516,7 +504,7 @@ fn main() {
                 }
             }
             unsafe { *ansr.at(i) = best };
-            queue.iter_mut().for_each(RadixHeap::clear);
+            queue.iter_mut().for_each(|q| q.0.clear());
             dist.iter_mut().for_each(Dist::reset);
         }
     });
