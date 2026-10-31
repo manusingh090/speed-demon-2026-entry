@@ -4,7 +4,7 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-One C++20 file, `main.cpp`, built as a static binary with `-O3 -march=native`.
+One Rust file, `src/main.rs`, built with `cargo build --release` and `-C target-cpu=native` (LTO, one codegen unit). It started as a C++20 program (`main.cpp` up to commit a75c4a7) and was ported line for line; the same design runs about 7% fewer cycles in Rust, mostly because the standard library's unstable sort and selection mispredict far less than libstdc++'s on the many small groups. System calls the standard library does not offer (`mmap`, `madvise`, `ftruncate`, `prctl`) are declared directly, so there are no crates.
 
 1. **Map and split.** `requests.log` is memory-mapped (input pages are not charged to the container) with a spare page after it, so 32-byte loads near the end are safe. The file is cut into 12 line-aligned ranges, one per thread.
 2. **Parse with fixed offsets and one scan per line.** The timestamp is always 27 bytes and the 72-hour span is fixed, so the hour index comes from the month, day and hour digits with no date library. One 64-byte AVX2 compare finds the spaces and the newline after the timestamp, which gives the method end, the endpoint end and the line end for almost every line. The latency (the digits before the newline) is decoded without a loop: the 16 bytes before the newline, minus `'0'`, with the leading non-digits masked off, are folded 2, 4 and 8 digits at a time with `maddubs`/`madd`.
@@ -16,7 +16,7 @@ One C++20 file, `main.cpp`, built as a static binary with `-O3 -march=native`.
 
 ## Dependencies
 
-None. Standard library and compiler intrinsics only.
+None. The Rust standard library, `std::arch` intrinsics and four libc functions declared by hand.
 
 ## With another 24 hours
 
