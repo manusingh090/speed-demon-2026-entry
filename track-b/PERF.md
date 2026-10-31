@@ -36,7 +36,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 29 | Scan output chunks carved from one region per thread instead of one mapping each, and handed back with `madvise` as the scatter reads them | run-4d450f87bdc1 | 0.232 | 49.7 | 69.62 |
 | 30 | Back to the code of step 28: step 29 bought no time on the box | run-ac88f12be57d | 0.244 | 49.0 | 69.21 |
 | 31 | Two loops per document: tokens and lookups fill an id buffer, then the per-token work runs over it; a phrase is checked by comparing the buffer's ids around its anchor, so the text is never read twice | run-628927ef944b | 0.232 | 49.5 | 69.92 |
-| 32 | The per-token loop reads its bounds and slices once per document; one persistent thread pool for every phase | pending | | | |
+| 32 | The per-token loop reads its bounds and slices once per document; one persistent thread pool for every phase | run-d0782cf19201 | 0.220 | 51.0 | 70.19 |
+| 33 | Term tables freed once the scan is done; answers written to the file chunk by chunk instead of joined into one string first | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -138,6 +139,10 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Step 31 on the board.** run-628927ef944b: 0.2320 s, 49.5 MiB, 573 counted lines (611 before), K 25.02 and 69.92 points, the best Track B run so far. The box gained less time than the laptop's cycle count promised; most of the gain is the shorter code.
 
 **Step 32.** The disassembly of the per-token loop still showed about 70 instructions, many of them loads of values that never change inside a document (the class bounds, vector pointers and lengths), each followed by a bounds check. `Units::put` stores through a raw pointer, so the compiler had to assume any captured value might have changed after each token. These are now read into locals once per document and the per-token indexing is unchecked (the id is clamped to the table size first): 8.46 billion instructions against 8.92, about 4% fewer cycles, 3 more lines. The phases also share one persistent pool of 12 threads (as Track D does since its step 15) instead of starting 12 new threads four times: each new thread's stack is a new mapping, and mappings wait behind the page faults in flight. 3 to 4% less wall time and 5% less CPU over 15 alternating runs. Same hashes on every dataset.
+
+**Step 32 on the board.** run-d0782cf19201: 0.2200 s against 0.2320, 51.0 MiB, 604 lines, K 25.34 and 70.19 points.
+
+**Step 33.** `memory.current` read after each phase showed no single spike: about 45.7 MB at the end of the scan, rising slowly to 49.8 MB at the final write. Two things were alive longer than needed. The term tables (2 MB of slots, 2.4 MB of keys) were kept to the end though nothing after the scan reads them, and the 50,000 answer lines were joined into one 1.5 MB string while their chunks were still alive. The tables are now dropped after the scan and the chunks go to the file one by one through a `BufWriter`. Peak 51 to 46 MB over 11 alternating runs, same time, same hashes.
 
 Measured and kept out this session:
 - A 256 KB table of the 8,192 most frequent short terms, looked up directly before the main table: branch misses doubled and the run was 30% slower, because a direct load breaks the 8-token prefetch pipeline.

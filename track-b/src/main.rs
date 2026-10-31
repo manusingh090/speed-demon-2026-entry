@@ -546,6 +546,7 @@ fn main() {
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
     });
+    drop(terms); // nothing after the scan reads the term tables
     // Each term's postings lie in one stretch, thread by thread: the segment
     // from thread t holds seg[i * THREADS + t] offsets from firsts[t]. The
     // stretches go bucket by bucket, so a bucket's scatter writes one region,
@@ -626,6 +627,10 @@ fn main() {
         }
         *chunk.lock().unwrap() = out;
     });
-    let out: String = chunks.into_iter().map(|c| c.into_inner().unwrap()).collect();
-    std::fs::write("/out/results.txt", out).expect("/out/results.txt");
+    // Chunk by chunk, so the answers are never held twice.
+    let mut out = std::io::BufWriter::new(std::fs::File::create("/out/results.txt").expect("/out/results.txt"));
+    for c in chunks {
+        std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
+    }
+    std::io::Write::flush(&mut out).unwrap();
 }
