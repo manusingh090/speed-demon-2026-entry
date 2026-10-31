@@ -494,7 +494,8 @@ fn main() {
         // Per term (and one id for every token that needs nothing): documents
         // in this share, and the last one's offset + 1.
         let (mut count, mut last, mut mine) = (vec![0u16; nkeep + 1], vec![0u16; nkeep + 1], vec![]);
-        let mut kept = vec![]; // the list terms new to the current document
+        // Per document: the list terms new to it, and where the phrase anchors are.
+        let (mut kept, mut anchors) = (vec![], vec![]);
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
         let first = firsts[t];
         // Each bitmap term's bits for the current 64 documents (one more word
@@ -518,26 +519,29 @@ fn main() {
             let (nkeep, a0, nbits, lists, off) = (nkeep, a0, nbits, lists, doc - first);
             let (last, pending) = (&mut last[..=nkeep], &mut pending[..=nbits]);
             kept.resize(toks.len(), 0);
-            let mut n = 0;
+            anchors.resize(toks.len(), 0);
+            let (mut n, mut na) = (0, 0);
             for (at, &id) in toks.iter().enumerate() {
                 let i = (id as usize).min(nkeep);
-                if i.wrapping_sub(a0) < nkeep - a0 {
-                    let k = i - a0;
-                    for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
-                        let span = spans[q as usize];
-                        let phrase = &ids[span.1 as usize..span.2 as usize];
-                        // Do the tokens around this one spell the phrase?
-                        if at.checked_sub(j as usize).and_then(|s| toks.get(s..s + phrase.len())) == Some(phrase) {
-                            mine.push((q, doc));
-                        }
-                    }
-                }
-                // i <= nkeep, n <= at, and the slices hold nkeep + 1, nbits + 1 and toks.len().
+                // i <= nkeep, n and na <= at, and the slices hold nkeep + 1, nbits + 1 and toks.len().
                 unsafe {
+                    *anchors.get_unchecked_mut(na) = at;
+                    na += (i.wrapping_sub(a0) < nkeep - a0) as usize;
                     let new = std::mem::replace(last.get_unchecked_mut(i), mark) != mark;
                     *pending.get_unchecked_mut(i.min(nbits)) |= (i < nbits) as u64 * bit;
                     *kept.get_unchecked_mut(n) = i as u32;
                     n += (new & (i.wrapping_sub(nbits) < lists - nbits)) as usize;
+                }
+            }
+            for &at in &anchors[..na] {
+                let k = (toks[at] as usize).min(nkeep) - a0;
+                for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
+                    let span = spans[q as usize];
+                    let phrase = &ids[span.1 as usize..span.2 as usize];
+                    // Do the tokens around this one spell the phrase?
+                    if at.checked_sub(j as usize).and_then(|s| toks.get(s..s + phrase.len())) == Some(phrase) {
+                        mine.push((q, doc));
+                    }
                 }
             }
             for &i in &kept[..n] {

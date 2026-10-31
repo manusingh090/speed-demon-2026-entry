@@ -38,8 +38,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 31 | Two loops per document: tokens and lookups fill an id buffer, then the per-token work runs over it; a phrase is checked by comparing the buffer's ids around its anchor, so the text is never read twice | run-628927ef944b | 0.232 | 49.5 | 69.92 |
 | 32 | The per-token loop reads its bounds and slices once per document; one persistent thread pool for every phase | run-d0782cf19201 | 0.220 | 51.0 | 70.19 |
 | 33 | Term tables freed once the scan is done; answers written to the file chunk by chunk instead of joined into one string first | run-4d3d15c8b624 | 0.218 | 46.5 | 70.65 |
-| 34 | The per-token loop only collects the list terms new to the document; their postings are written by a short second loop | pending (with 35) | | | |
-| 35 | Term hash from the key's first 16 bytes: two CRC32 instructions and one multiply | pending | | | |
+| 34 | The per-token loop only collects the list terms new to the document; their postings are written by a short second loop | run-dbb639f818e5 (with 35) | | | |
+| 35 | Term hash from the key's first 16 bytes: two CRC32 instructions and one multiply | run-dbb639f818e5 | 0.197 | 46.1 | 71.82 |
+| 36 | Anchor positions collected branch-free by the per-token loop; the phrase checks run after it | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -151,6 +152,10 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Step 34.** The posting write ran for every token, branch-free, with a keep flag deciding whether the unit counted; only about a third of the tokens make a posting. The per-token loop now stores each token's term into a small per-document buffer and advances only for a list term new to the document, and a second loop writes postings for just those. `Units::add` lost its keep flag. 7.77 billion instructions against 8.49, 5 to 11% fewer cycles.
 
 **Step 35.** The term hash mixed all 32 key bytes with two 64-bit multiplies (scalar on the box, which has no AVX-512). It only has to be the same for the same key, since the key comparison decides, and nearly every token fits in 16 bytes, so it is now two CRC32 steps over the first 16 bytes and one multiply to spread the bits. 1.6% fewer instructions, cycles within noise, one line shorter. A deeper prefetch (16 tokens instead of 8) measured the same.
+
+**Steps 34 and 35 on the board.** run-dbb639f818e5: 0.1970 s against 0.2185, 46.1 MiB, K 27.32 and 71.82 points. Here the box agreed with the cycle counts: 10% less time.
+
+**Step 36.** The per-token loop still kept its counter, buffer index and pointers on the stack. The rare phrase path inside it calls functions (`Vec::push`, a slice compare), and a call clobbers registers, so the compiler kept the loop's state in memory throughout. The loop now only records each anchor's position, branch-free like the kept terms, and the phrase checks run over those positions after it. 7.50 billion instructions against 7.64, 2 to 6% fewer cycles. Writing the token ids without capacity checks (room reserved once per 64-byte window) measured within noise and stayed out, as did the 16-byte term table tried again on top of step 35 (2.5% fewer cycles, same wall time, about 50 lines).
 
 Measured and kept out this session:
 - A 256 KB table of the 8,192 most frequent short terms, looked up directly before the main table: branch misses doubled and the run was 30% slower, because a direct load breaks the 8-token prefetch pipeline.
