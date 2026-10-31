@@ -19,6 +19,8 @@ use std::sync::Mutex;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
@@ -367,14 +369,20 @@ fn walk(text: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, u32, *const u
 /// Scan output for a bucket of terms, in 64 KB chunks so that only the last
 /// one is ever part empty. A unit is a term's index in the bucket (i / BUCKETS)
 /// above the gap since the bucket's previous document; a thread meets its
-/// documents in order, so the gaps are small.
+/// documents in order, so the gaps are small. Chunks are carved in turn from
+/// one region per thread (`arena` is the address of its cursor): a mapping
+/// per chunk took the address-space lock some 550 times while the other
+/// threads were faulting in the corpus.
 #[derive(Default)]
 struct Units {
-    chunks: Vec<Vec<u16>>,
-    at: usize, // the address of the next unit's place in the last chunk, up to end
+    chunks: Vec<(usize, usize)>, // (address, units) of each chunk
+    at: usize,                   // the address of the next unit's place in the last chunk, up to end
     end: usize,
     prev: u32,
+    arena: usize,
 }
+
+const CHUNK: usize = 1 << 15; // units
 
 impl Units {
     /// Writes x at the next place, but moves past it only if keep, so a token
@@ -391,9 +399,9 @@ impl Units {
     #[inline(never)]
     fn grow(&mut self) {
         self.finish();
-        let c = Vec::<u16>::with_capacity(1 << 15);
-        (self.at, self.end) = (c.as_ptr() as usize, c.as_ptr() as usize + 2 * c.capacity());
-        self.chunks.push(c);
+        let cursor = unsafe { &mut *(self.arena as *mut usize) };
+        (self.at, self.end, *cursor) = (*cursor, *cursor + 2 * CHUNK, *cursor + 2 * CHUNK);
+        self.chunks.push((self.at, 0));
     }
 
     fn add(&mut self, keep: bool, offset: u32, doc: u32) {
@@ -408,7 +416,7 @@ impl Units {
     /// Sets the last chunk's length to the units written.
     fn finish(&mut self) {
         if let Some(c) = self.chunks.last_mut() {
-            unsafe { c.set_len((self.at - c.as_ptr() as usize) / 2) };
+            c.1 = (self.at - c.0) / 2;
         }
     }
 }
@@ -509,11 +517,17 @@ fn main() {
 
     // The scan: phrase matches, bitmap bits, and list postings by bucket.
     let found = Mutex::new(vec![]); // (query, document) phrase matches
-    let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>)> = on_threads(|t| {
+    let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>, (usize, usize))> = on_threads(|t| {
         // Per term (and one id for every token that needs nothing): documents
         // in this share, and the last one's offset + 1.
         let (mut count, mut last, mut mine) = (vec![0u16; nkeep + 1], vec![0u16; nkeep + 1], vec![]);
-        let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
+        // A token adds at most two units and takes at least two bytes; each
+        // bucket may leave one chunk part full. Pages count only once written.
+        let bytes = 2 * (cut[t + 1] - cut[t]) + BUCKETS * 2 * CHUNK + 4096;
+        let mut arena = unsafe { mmap(std::ptr::null_mut(), bytes, 3, 0x4022, -1, 0) } as usize; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
+        let base = arena;
+        let at = &mut arena as *mut usize as usize;
+        let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units { arena: at, ..Default::default() }).collect();
         let first = firsts[t];
         // Each bitmap term's bits for the current 64 documents (one more word
         // takes the bits of every other term), ORed in when the block ends.
@@ -552,7 +566,7 @@ fn main() {
         buckets.iter_mut().for_each(Units::finish);
         assert!(n < 1 << DOC_BITS, "too many documents per thread");
         found.lock().unwrap().extend(mine);
-        (count, Mutex::new(buckets))
+        (count, Mutex::new(buckets), (base, bytes))
     });
     // Each term's postings lie in one stretch, thread by thread: the segment
     // from thread t holds seg[i * THREADS + t] offsets from firsts[t]. The
@@ -574,7 +588,10 @@ fn main() {
                 *c = start[i] + seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum::<u32>();
             }
             let (mut doc, mut term) = (0u32, NONE);
-            for x in units.chunks.into_iter().flatten() {
+            // Each chunk's pages go back once it is read (MADV_DONTNEED), so the
+            // scan output shrinks while the postings fill.
+            for &(a, n) in &units.chunks {
+            for &x in unsafe { std::slice::from_raw_parts(a as *const u16, n) } {
                 if term == NONE {
                     term = (x >> 4) as u32;
                     if x as u32 & GAP == GAP {
@@ -587,7 +604,10 @@ fn main() {
                 let c = &mut cursor[std::mem::replace(&mut term, NONE) as usize];
                 (post[*c as usize].store(doc as u16, Relaxed), *c += 1);
             }
+            unsafe { madvise(a as *mut u8, 2 * CHUNK, 4) };
+            }
         }
+        unsafe { munmap(scans[t].2 .0 as *mut u8, scans[t].2 .1) };
     });
     drop(scans);
     let post: Vec<u16> = unsafe { std::mem::transmute(post) };
