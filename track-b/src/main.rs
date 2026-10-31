@@ -103,11 +103,12 @@ unsafe fn key(p: *const u8, len: usize) -> __m256i {
     _mm256_and_si256(v, _mm256_loadu_si256(KEEP.as_ptr().add(32 - len).cast()))
 }
 
+/// From the key's first 16 bytes only: longer tokens are rare, and the key
+/// comparison tells apart any that collide.
 fn hash(k: __m256i) -> usize {
     let w: [u64; 4] = unsafe { std::mem::transmute(k) };
-    let h = (w[0] ^ w[2].rotate_left(29)).wrapping_mul(0x9E3779B97F4A7C15);
-    let h = h ^ (w[1] ^ w[3].rotate_left(29)).wrapping_mul(0xBF58476D1CE4E5B9);
-    (h ^ h >> 29) as usize
+    let c = unsafe { _mm_crc32_u64(_mm_crc32_u64(0, w[0]), w[1]) };
+    c.wrapping_mul(0x9E3779B97F4A7C15) as usize
 }
 
 fn same(a: __m256i, b: __m256i) -> bool {
@@ -357,14 +358,12 @@ struct Units {
 }
 
 impl Units {
-    /// Writes x at the next place, but moves past it only if keep, so a token
-    /// that adds nothing costs a store and no branch.
-    fn put(&mut self, x: u16, keep: bool) {
+    fn put(&mut self, x: u16) {
         if self.at == self.end {
             self.grow();
         }
         unsafe { *(self.at as *mut u16) = x };
-        self.at += 2 * keep as usize;
+        self.at += 2;
     }
 
     #[cold]
@@ -376,12 +375,12 @@ impl Units {
         self.chunks.push(c);
     }
 
-    fn add(&mut self, keep: bool, offset: u32, doc: u32) {
-        let gap = doc - self.prev;
-        self.put((offset << 4 | gap.min(GAP)) as u16, keep);
-        self.prev = if keep { doc } else { self.prev };
-        if keep & (gap >= GAP) {
-            self.put(gap as u16, true);
+    fn add(&mut self, offset: u32, doc: u32) {
+        let gap = std::mem::replace(&mut self.prev, doc);
+        let gap = doc - gap;
+        self.put((offset << 4 | gap.min(GAP)) as u16);
+        if gap >= GAP {
+            self.put(gap as u16);
         }
     }
 
@@ -495,6 +494,7 @@ fn main() {
         // Per term (and one id for every token that needs nothing): documents
         // in this share, and the last one's offset + 1.
         let (mut count, mut last, mut mine) = (vec![0u16; nkeep + 1], vec![0u16; nkeep + 1], vec![]);
+        let mut kept = vec![]; // the list terms new to the current document
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
         let first = firsts[t];
         // Each bitmap term's bits for the current 64 documents (one more word
@@ -516,7 +516,9 @@ fn main() {
             // Read once per document: Units::put stores through a raw pointer,
             // after which captured values would be loaded again for every token.
             let (nkeep, a0, nbits, lists, off) = (nkeep, a0, nbits, lists, doc - first);
-            let (last, count, pending, buckets) = (&mut last[..=nkeep], &mut count[..=nkeep], &mut pending[..=nbits], &mut buckets[..]);
+            let (last, pending) = (&mut last[..=nkeep], &mut pending[..=nbits]);
+            kept.resize(toks.len(), 0);
+            let mut n = 0;
             for (at, &id) in toks.iter().enumerate() {
                 let i = (id as usize).min(nkeep);
                 if i.wrapping_sub(a0) < nkeep - a0 {
@@ -530,14 +532,17 @@ fn main() {
                         }
                     }
                 }
-                // i <= nkeep, and the slices hold nkeep + 1 and nbits + 1.
+                // i <= nkeep, n <= at, and the slices hold nkeep + 1, nbits + 1 and toks.len().
                 unsafe {
                     let new = std::mem::replace(last.get_unchecked_mut(i), mark) != mark;
-                    let list = new & (i.wrapping_sub(nbits) < lists - nbits);
                     *pending.get_unchecked_mut(i.min(nbits)) |= (i < nbits) as u64 * bit;
-                    buckets.get_unchecked_mut(i % BUCKETS).add(list, (i / BUCKETS) as u32, off);
-                    *count.get_unchecked_mut(i) += list as u16;
+                    *kept.get_unchecked_mut(n) = i as u32;
+                    n += (new & (i.wrapping_sub(nbits) < lists - nbits)) as usize;
                 }
+            }
+            for &i in &kept[..n] {
+                buckets[i as usize % BUCKETS].add(i / BUCKETS as u32, off);
+                count[i as usize] += 1;
             }
         });
         flush(&mut pending, block);
