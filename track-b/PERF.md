@@ -40,7 +40,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 33 | Term tables freed once the scan is done; answers written to the file chunk by chunk instead of joined into one string first | run-4d3d15c8b624 | 0.218 | 46.5 | 70.65 |
 | 34 | The per-token loop only collects the list terms new to the document; their postings are written by a short second loop | run-dbb639f818e5 (with 35) | | | |
 | 35 | Term hash from the key's first 16 bytes: two CRC32 instructions and one multiply | run-dbb639f818e5 | 0.197 | 46.1 | 71.82 |
-| 36 | Anchor positions collected branch-free by the per-token loop; the phrase checks run after it | pending | | | |
+| 36 | Anchor positions collected branch-free by the per-token loop; the phrase checks run after it | run-4dc6a6ccf31d | 0.188 | 46.9 | 72.25 |
+| 37 | Term order from one unstable sort of packed (class, rarity, id) keys | pending (with 38) | | | |
+| 38 | AND and NOT of two lists totalling over 768 documents go through a bitmap of the term's list instead of a merge | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -156,6 +158,12 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Steps 34 and 35 on the board.** run-dbb639f818e5: 0.1970 s against 0.2185, 46.1 MiB, K 27.32 and 71.82 points. Here the box agreed with the cycle counts: 10% less time.
 
 **Step 36.** The per-token loop still kept its counter, buffer index and pointers on the stack. The rare phrase path inside it calls functions (`Vec::push`, a slice compare), and a call clobbers registers, so the compiler kept the loop's state in memory throughout. The loop now only records each anchor's position, branch-free like the kept terms, and the phrase checks run over those positions after it. 7.50 billion instructions against 7.64, 2 to 6% fewer cycles. Writing the token ids without capacity checks (room reserved once per 64-byte window) measured within noise and stayed out, as did the 16-byte term table tried again on top of step 35 (2.5% fewer cycles, same wall time, about 50 lines).
+
+**Step 36 on the board.** run-4dc6a6ccf31d: 0.1878 s against 0.1970, 46.9 MiB, K 27.86 and 72.25 points.
+
+**Step 37.** Phase timers on the serial stretch between the sample and the scan: summing the samples' counts 1 ms, anchors 0.5 ms, the term sort 3.4 to 4.8 ms, renumbering 2.7 ms. The sort was stable and computed each term's class inside every comparison. One unstable sort of u64 keys holding class, rarity and id: 1.7 to 2.3 ms. Inserting the query terms with each slot prefetched 16 terms ahead measured the same user cycles and stayed out.
+
+**Step 38.** Answering was 17% of all samples, and 40% of that was the branch-free AND/NOT merge: each step's two loads depend on the previous step's comparison, so it moves about one document per 7 to 8 cycles. When the two lists hold over 768 documents together (and neither is 16 times the other, where the binary search wins), the term's list is set into a zeroed 31 KB bitmap and the running list is filtered against it. 2.4% fewer instructions and about 5% fewer cycles over two interleaved rounds; 256 was no better than the merge, and 1,536 or a separate branch-free filter added nothing.
 
 Measured and kept out this session:
 - A 256 KB table of the 8,192 most frequent short terms, looked up directly before the main table: branch misses doubled and the run was 30% slower, because a direct load breaks the 8-token prefetch pipeline.

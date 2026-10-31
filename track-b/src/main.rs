@@ -237,8 +237,13 @@ fn has(bits: &[u64], d: u32) -> bool {
     bits[d as usize / 64] >> (d % 64) & 1 != 0
 }
 
+/// Above this many documents, a list meets another list as a bitmap: setting
+/// and testing bits in 31 KB beats a merge's unpredictable steps.
+const BIG: usize = 768;
+
 /// cur op term, strictly left to right; a list OR a bitmap becomes a bitmap.
-fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>) -> Docs<'a> {
+/// A bitmap has words words.
+fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
     use Docs::*;
     let bit = |d: u32| (d as usize / 64, 1u64 << (d % 64));
     match (cur, op, term) {
@@ -260,6 +265,11 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>) -> Docs<'a> {
                 x[w] = if op == b'O' { x[w] | m } else { x[w] & !m };
             }
             Bits(a)
+        }
+        (List(a), _, List(b)) if op != b'O' && a.len() + b.len() > BIG && a.len() * 16 >= b.len() => {
+            let mut bits = vec![0u64; words];
+            b.iter().for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
+            apply(List(a), op, Bits(Cow::Owned(bits)), words)
         }
         (List(a), b'O', List(b)) => {
             let (mut v, mut i, mut j) = (Vec::with_capacity(a.len() + b.len()), 0, 0);
@@ -471,8 +481,11 @@ fn main() {
         (false, true) => 3,
         (false, false) => 4,
     };
-    let mut order: Vec<usize> = (0..nterms).collect();
-    order.sort_by_key(|&i| (class(i), std::cmp::Reverse(df[i])));
+    // One sort of (class, rarity, id) packed in a u64: the key is computed
+    // once per term instead of twice per comparison.
+    let mut packed: Vec<u64> = (0..nterms).map(|i| (class(i) as u64) << 56 | ((u32::MAX - df[i]) as u64) << 24 | i as u64).collect();
+    packed.sort_unstable();
+    let order: Vec<usize> = packed.iter().map(|&k| k as usize & 0xFF_FFFF).collect();
     let [nbits, a0, lists, nkeep] = [0, 1, 2, 3].map(|c| order.partition_point(|&i| class(i) <= c));
     let mut new = vec![0; nterms];
     for (r, &i) in order.iter().enumerate() {
@@ -629,7 +642,7 @@ fn main() {
                 let cur = docs(tids[0]);
                 ops.iter().zip(&tids[1..]).fold(cur, |cur, (&op, &id)| match &cur {
                     Docs::List(v) if v.is_empty() && op != b'O' => cur, // nothing left to narrow
-                    _ => apply(cur, op, docs(id)),
+                    _ => apply(cur, op, docs(id), words),
                 })
             };
             line(&mut out, &set);
