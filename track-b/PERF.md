@@ -43,7 +43,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 36 | Anchor positions collected branch-free by the per-token loop; the phrase checks run after it | run-4dc6a6ccf31d | 0.188 | 46.9 | 72.25 |
 | 37 | Term order from one unstable sort of packed (class, rarity, id) keys | run-82fdc51f9741 (with 38) | | | |
 | 38 | AND and NOT of two lists totalling over 768 documents go through a bitmap of the term's list instead of a merge | run-82fdc51f9741 | 0.180 | 46.7 | 72.66 |
-| 39 | The frequency sample reads the first 1/64 of each thread's share instead of 1/32 | pending | | | |
+| 39 | The frequency sample reads the first 1/64 of each thread's share instead of 1/32 | run-b3fbbbcbb03a | 0.216 | 48.4 | 70.53 |
+| 40 | Count and position sum of a bitmap answer with AVX2, four words at a time; the sample back to 1/32 | pending (with 41) | | | |
+| 41 | OR of two lists totalling over 2,048 documents goes into a bitmap | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -169,6 +171,14 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Steps 37 and 38 on the board.** run-82fdc51f9741: 0.1801 s against 0.1878, 46.7 MiB, K 28.40 and 72.66 points.
 
 **Step 39.** The sample only decides which terms become bitmaps and which phrase term is the anchor; it never changes an answer. Half the sample (still about 4 MB of text, 570,000 tokens) gives the same classes to within a few terms near the threshold: 0.8% fewer instructions, about 1.5% fewer cycles, no new code.
+
+**Step 39 on the board.** run-b3fbbbcbb03a: 0.2159 s against 0.1801 for step 38, and 48.4 MiB against 46.7. More than the box's usual spread, and the memory rose with it, which points at different term classes from the smaller sample rather than noise. The sample went back to 1/32 in step 40.
+
+**Where the cycles really go.** Sampled profiles in this VM misattribute between threads (fixed-period sampling put the scatter at 25% of cycles; switching its stores off saved under 2%). Switching parts off and counting user cycles instead: answering the queries is 18% of cycles and 19% of instructions, and dropping it cuts 13% of the wall time. Within answering, writing the lines is 35% of the instructions (almost all of it the count and position sum of bitmap answers, seven popcounts per word over 3,907 words) and the set operations 40%. Counting each operation over the full run: list against list through a bitmap 8,803 calls and 24.7M documents, list OR list 15,295 calls and 17.2M, bitmap AND list 10,525 calls and 15.4M.
+
+**Step 40.** The bitmap sums now run four words at a time with AVX2: popcounts by nibble lookup (`vpshufb`) summed per word (`vpsadbw`), the six position masks applied per vector, and the word-index part as one multiply per vector. The scan for the ten smallest ids stops once it has them. 4.1% fewer instructions and about 3.5% fewer cycles here; on the box, which has no AVX-512, the old loop was scalar, so the gain there should be larger.
+
+**Step 41.** With bitmap answers now cheap to count, an OR of two lists totalling over 2,048 documents is set into a bitmap instead of merged (rejected at step 38, when counting a bitmap answer cost seven scalar popcounts per word). 3.5% fewer cycles in each of 5 interleaved rounds, and only a wider condition on an existing arm. A branch-free filter for list against bitmap removed a million branch misses but no cycles, and stayed out.
 
 Measured and kept out this session (from step 36 on):
 - OR of two long lists into a bitmap (over 1,024 or 4,096 documents): more cycles, since the bitmap results cost more to count and sum.

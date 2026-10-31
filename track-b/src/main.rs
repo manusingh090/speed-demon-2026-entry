@@ -266,7 +266,7 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
             }
             Bits(a)
         }
-        (List(a), _, List(b)) if op != b'O' && a.len() + b.len() > BIG && a.len() * 16 >= b.len() => {
+        (List(a), _, List(b)) if (op == b'O' && a.len() + b.len() > 2048) || (op != b'O' && a.len() + b.len() > BIG && a.len() * 16 >= b.len()) => {
             let mut bits = vec![0u64; words];
             b.iter().for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
             apply(List(a), op, Bits(Cow::Owned(bits)), words)
@@ -309,6 +309,37 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
     }
 }
 
+/// The number of set bits in b and the sum of their positions, four words at
+/// a time: popcounts by nibble lookup, and position bit k counted from the
+/// bits under mask SEL[k] (bit k of a position adds 2^k).
+unsafe fn bit_sums(b: &[u64]) -> (u64, u64) {
+    const SEL: [u64; 6] = [0xAAAA_AAAA_AAAA_AAAA, 0xCCCC_CCCC_CCCC_CCCC, 0xF0F0_F0F0_F0F0_F0F0, 0xFF00_FF00_FF00_FF00, 0xFFFF_0000_FFFF_0000, 0xFFFF_FFFF_0000_0000];
+    let nib = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+    let low = _mm256_set1_epi8(0x0F);
+    let pop = |v: __m256i| {
+        let n = _mm256_add_epi8(_mm256_shuffle_epi8(nib, _mm256_and_si256(v, low)), _mm256_shuffle_epi8(nib, _mm256_and_si256(_mm256_srli_epi16::<4>(v), low)));
+        _mm256_sad_epu8(n, _mm256_setzero_si256()) // per word
+    };
+    let (mut acc, mut at, mut word) = ([_mm256_setzero_si256(); 7], _mm256_setzero_si256(), _mm256_setr_epi64x(0, 1, 2, 3));
+    let quads = b.len() / 4;
+    for i in 0..quads {
+        let v = _mm256_loadu_si256(b.as_ptr().add(4 * i).cast());
+        let c = pop(v);
+        (acc[6], at) = (_mm256_add_epi64(acc[6], c), _mm256_add_epi64(at, _mm256_mul_epu32(c, word)));
+        for k in 0..6 {
+            acc[k] = _mm256_add_epi64(acc[k], pop(_mm256_and_si256(v, _mm256_set1_epi64x(SEL[k] as i64))));
+        }
+        word = _mm256_add_epi64(word, _mm256_set1_epi64x(4));
+    }
+    let total = |v: __m256i| -> u64 { std::mem::transmute::<_, [u64; 4]>(v).iter().sum() };
+    let (mut count, mut sum) = (total(acc[6]), 64 * total(at) + (0..6).map(|k| total(acc[k]) << k).sum::<u64>());
+    for (w, &x) in b.iter().enumerate().skip(4 * quads) {
+        let c = x.count_ones() as u64;
+        (count, sum) = (count + c, sum + 64 * w as u64 * c + (0..6).map(|k| ((x & SEL[k]).count_ones() as u64) << k).sum::<u64>());
+    }
+    (count, sum)
+}
+
 /// "count sum id1 ... id10" for a set of documents.
 fn line(out: &mut String, docs: &Docs) {
     let (mut count, mut sum, mut first) = (0u64, 0u64, Vec::with_capacity(10));
@@ -318,16 +349,15 @@ fn line(out: &mut String, docs: &Docs) {
             first.extend(v.iter().take(10));
         }
         Docs::Bits(b) => {
-            // Bit k of a position adds 2^k for each set bit whose position has it.
-            const SEL: [u64; 6] = [0xAAAA_AAAA_AAAA_AAAA, 0xCCCC_CCCC_CCCC_CCCC, 0xF0F0_F0F0_F0F0_F0F0, 0xFF00_FF00_FF00_FF00, 0xFFFF_0000_FFFF_0000, 0xFFFF_FFFF_0000_0000];
+            (count, sum) = unsafe { bit_sums(b) };
             for (w, &x) in b.iter().enumerate().filter(|(_, &x)| x != 0) {
-                let c = x.count_ones() as u64;
-                let within: u64 = (0..6).map(|k| ((x & SEL[k]).count_ones() as u64) << k).sum();
-                (count, sum) = (count + c, sum + c * 64 * w as u64 + within);
                 let mut m = x;
                 while m != 0 && first.len() < 10 {
                     first.push(w as u32 * 64 + m.trailing_zeros());
                     m &= m - 1;
+                }
+                if first.len() == 10 {
+                    break;
                 }
             }
         }
@@ -446,10 +476,10 @@ fn main() {
     let first_doc = |c: usize| text.get(c).map_or(ndocs as u32, |_| number(text, c));
     let firsts: Vec<u32> = cut[..THREADS].iter().map(|&c| first_doc(c)).collect();
 
-    // The sample: documents per term in the first 1/64 of each share.
+    // The sample: documents per term in the first 1/32 of each share.
     let samples = on_threads(|t| {
         let (mut df, mut last) = (vec![0u32; nterms + 1], vec![NONE; nterms + 1]);
-        let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 64];
+        let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 32];
         let n = walk(sample, firsts[t], &terms, |doc, toks| {
             for &id in toks {
                 if std::mem::replace(&mut last[id as usize], doc) != doc {
