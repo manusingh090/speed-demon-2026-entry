@@ -41,8 +41,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 34 | The per-token loop only collects the list terms new to the document; their postings are written by a short second loop | run-dbb639f818e5 (with 35) | | | |
 | 35 | Term hash from the key's first 16 bytes: two CRC32 instructions and one multiply | run-dbb639f818e5 | 0.197 | 46.1 | 71.82 |
 | 36 | Anchor positions collected branch-free by the per-token loop; the phrase checks run after it | run-4dc6a6ccf31d | 0.188 | 46.9 | 72.25 |
-| 37 | Term order from one unstable sort of packed (class, rarity, id) keys | pending (with 38) | | | |
-| 38 | AND and NOT of two lists totalling over 768 documents go through a bitmap of the term's list instead of a merge | pending | | | |
+| 37 | Term order from one unstable sort of packed (class, rarity, id) keys | run-82fdc51f9741 (with 38) | | | |
+| 38 | AND and NOT of two lists totalling over 768 documents go through a bitmap of the term's list instead of a merge | run-82fdc51f9741 | 0.180 | 46.7 | 72.66 |
+| 39 | The frequency sample reads the first 1/64 of each thread's share instead of 1/32 | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -164,6 +165,16 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Step 37.** Phase timers on the serial stretch between the sample and the scan: summing the samples' counts 1 ms, anchors 0.5 ms, the term sort 3.4 to 4.8 ms, renumbering 2.7 ms. The sort was stable and computed each term's class inside every comparison. One unstable sort of u64 keys holding class, rarity and id: 1.7 to 2.3 ms. Inserting the query terms with each slot prefetched 16 terms ahead measured the same user cycles and stayed out.
 
 **Step 38.** Answering was 17% of all samples, and 40% of that was the branch-free AND/NOT merge: each step's two loads depend on the previous step's comparison, so it moves about one document per 7 to 8 cycles. When the two lists hold over 768 documents together (and neither is 16 times the other, where the binary search wins), the term's list is set into a zeroed 31 KB bitmap and the running list is filtered against it. 2.4% fewer instructions and about 5% fewer cycles over two interleaved rounds; 256 was no better than the merge, and 1,536 or a separate branch-free filter added nothing.
+
+**Steps 37 and 38 on the board.** run-82fdc51f9741: 0.1801 s against 0.1878, 46.7 MiB, K 28.40 and 72.66 points.
+
+**Step 39.** The sample only decides which terms become bitmaps and which phrase term is the anchor; it never changes an answer. Half the sample (still about 4 MB of text, 570,000 tokens) gives the same classes to within a few terms near the threshold: 0.8% fewer instructions, about 1.5% fewer cycles, no new code.
+
+Measured and kept out this session (from step 36 on):
+- OR of two long lists into a bitmap (over 1,024 or 4,096 documents): more cycles, since the bitmap results cost more to count and sum.
+- A 1 MB slot table instead of 2 MB: longer probes, 3% more cycles.
+- A second prefetch stage for the term key (the slot of the token four back has arrived by then): same cycles. The tokenizer is limited by how many misses can be in flight, not by any one miss.
+- A per-document bitset of the list terms seen (7.5 KB, in L1) instead of the 150 KB last-document marks: 6% more instructions, same cycles.
 
 Measured and kept out this session:
 - A 256 KB table of the 8,192 most frequent short terms, looked up directly before the main table: branch misses doubled and the run was 30% slower, because a direct load breaks the 8-token prefetch pipeline.

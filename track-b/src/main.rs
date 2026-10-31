@@ -446,10 +446,10 @@ fn main() {
     let first_doc = |c: usize| text.get(c).map_or(ndocs as u32, |_| number(text, c));
     let firsts: Vec<u32> = cut[..THREADS].iter().map(|&c| first_doc(c)).collect();
 
-    // The sample: documents per term in the first 1/32 of each share.
+    // The sample: documents per term in the first 1/64 of each share.
     let samples = on_threads(|t| {
         let (mut df, mut last) = (vec![0u32; nterms + 1], vec![NONE; nterms + 1]);
-        let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 32];
+        let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 64];
         let n = walk(sample, firsts[t], &terms, |doc, toks| {
             for &id in toks {
                 if std::mem::replace(&mut last[id as usize], doc) != doc {
