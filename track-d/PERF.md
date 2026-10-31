@@ -31,7 +31,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 9 | Bidirectional Dijkstra over the packed forward graph and a packed reverse graph built in place; query ends mapped up front so the id map is freed first | run-9ea1a9d51d35 | 0.240 | 71 | 65.84 |
 | 10 | Count and fill passes in batches of 32 edges with every random line prefetched first; BFS and renumbering prefetch the nodes coming up | run-e72d02d00206 | 0.229 | 72 | 65.95 |
 | 11 | Search constants copied into the thread so the loop keeps them in registers; a queued node's offsets prefetched | run-23727a1a2adb | 0.228 | 73 | 65.96 |
-| 12 | Rewritten in Rust with a new build: one parse filing edges by tail range, each range's adjacency built in cache; in-edge check read off the reverse graph | pending | | | |
+| 12 | Rewritten in Rust with a new build: one parse filing edges by tail range, each range's adjacency built in cache; in-edge check read off the reverse graph | run-18295702ad2c | 0.185 | 71 | 67.59 |
 
 ## What the profile said, step by step
 
@@ -64,6 +64,8 @@ Also measured and kept out at this step: dense per-thread distance arrays (no fa
 **After step 11: what was measured and not kept.** Wall-clock phase timers (local, ms): count pass about 30 to 40, fill 35 to 45, blob ordering about 35, new ids 9, renumbering 18, reverse graph 15, searches 60 to 75. Per-thread timers on the search showed all twelve threads finishing within about 5 ms of each other, so there is no tail of large queries to rebalance. Three ideas for the build did not separate from noise and were dropped: parsing the text once and keeping (tail, word) pairs for the fill pass (225 vs 223 ms, 3 MB more), pre-faulting each thread's slice of the input file with `MADV_POPULATE_READ`, and pre-faulting each thread's slice of the cursor and link arrays with `MADV_POPULATE_WRITE` (fill pass perhaps 3 ms faster, inside the spread). The laptop's run-to-run spread is about 15% and the box's up to 25%, so steps worth 5% or less can no longer be told apart; the next step for D has to be a larger structural change.
 
 **Step 11 to 12: Rust, and a different build.** The C++ build parsed the text twice (count, then fill) with a random atomic add per edge each time, about 75 ms of the run. The Rust version parses once: each thread appends every edge to one of about 27 lists by its tail's node range (sequential writes, 27 streams per thread), then each range is built on its own inside a 256 KB counter array. Phase timers: parse plus build 58 to 80 ms against 93 to 133 ms for the C++ count and fill passes in the same session. The first Rust build was only 4% faster overall because its search ran slower (120 to 140 ms against 90 to 130): bounds checks in the hottest loop. With unchecked access in the search, distance pages and heap buckets, it runs 12 to 15% faster than the C++ (local median 242 ms against 287, `perf stat -r 8` 0.237 to 0.246 s against 0.270 to 0.274), same 73 MB peak. Trimmed under `rustfmt` defaults from 523 to 494 lines (502 with the Dockerfile, against 401 counted for the C++): about 3% off K for size against about 8% on for time. Same hash on full, sample, tiny, the worked example and seeds 7, 13 and 21.
+
+**Step 12 on the board.** run-18295702ad2c: 0.185 s against 0.226 s for the C++, 71 MiB, 505 counted lines against 401; K 21.0 to 22.49, points 66.16 to 67.59. The box gained more than the laptop predicted (18% against 12 to 15%).
 
 ## Tried and kept out
 
