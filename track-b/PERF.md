@@ -32,7 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | Back to the C++ of step 23 while the Rust version is worked on | run-880032be5ecf (step 24) | | | |
 | 26 | Rust again: queries stored flat, the sample's counts freed at once, rustfmt-friendly helpers; 557 lines, 55 MB | run-5231ce22564c | 0.241 | 58.0 | 68.86 |
 | 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | run-b6f929f84526 | 0.237 | 69.1 | 68.03 |
-| 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | pending | | | |
+| 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | run-174007cb966d | 0.235 | 48.8 | 69.62 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -117,6 +117,8 @@ A different laptop this time: Intel Core Ultra 9 185H (6 P-cores with hyperthrea
 
 **Step 28.** This laptop's Docker VM runs huge pages in `madvise` mode, which is why it never showed the rise. With the VM switched to `always` for the measurement (9 alternating runs, then set back): step 26 53 MB at 178 ms, step 27 56 MB at 156 ms, step 27 with `PR_SET_THP_DISABLE` 51 MB at 157 ms. So huge pages cost step 27 about 5 MB here and nothing in time; the box's 11 MiB is the same effect, larger. Same hash on full, sample, tiny, the worked example and the seed-5 sample.
 
+**Step 28 on the board.** run-b6f929f84526 to run-174007cb966d: 69.1 to 48.8 MiB at 0.237 to 0.235 s, K 22.94 to 24.68 and 68.03 to 69.62 points, against 23.83 and 68.86 for step 26. Step 26 itself never had huge pages off, so part of its 58 MiB was the same effect. On the box, step 27's speed work bought about 2.4% in time over step 26 (0.241 to 0.235 s), much less than the laptop's 10%; the K gain over step 26 is mostly memory (58.0 to 48.8 MiB).
+
 ## What the profile said, step by step
 
 **Step 1 to 2.** Instrumenting the query phase showed phrase queries took 80% of it (about 4.2 s of CPU over 12 threads). Intersection took 14 ms per thread; the rest was verification, which re-tokenized and hashed 63M tokens, more than the whole corpus holds, because long documents are over-represented among candidates. Verification now walks the candidate's text and compares tokens to the rarest phrase term byte by byte, then checks the neighbours in place.
@@ -161,6 +163,7 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | ccc3bc5 | run-880032be5ecf | 0.2526 | 65.6 | 22.44 | 67.55 | Step 24, the first short Rust version: slower and larger than the C++ on the box |
 | 0a8b262 | run-5231ce22564c | 0.2410 | 58.0 | 23.83 | 68.86 | Step 26, Rust with flat queries and 557 lines: the best Track B run so far |
 | 8d77fc0 | run-b6f929f84526 | 0.2372 | 69.1 | 22.94 | 68.03 | Step 27: 10% faster and 2 MB smaller on the laptop, but on the box only 1.6% faster and 11 MiB larger, so K fell |
+| 5d75239 | run-174007cb966d | 0.2352 | 48.8 | 24.68 | 69.62 | Step 28, huge pages off: 69.1 to 48.8 MiB, the best Track B run so far |
 
 ## Step 16: phrase anchors
 
