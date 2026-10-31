@@ -22,12 +22,12 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | Scan output buckets of 2,048 terms (37 write streams per thread instead of 148) | run-060e2570f6d3 | 0.279 | 59.5 | 65.94 |
 | 16 | Phrase anchors: the rarest term keeps its occurrences' file offsets, and a phrase is checked in place at each one | run-f9bbc8a6c0fa | 0.268 | 61.9 | 65.94 |
 | 17 | Terms dealt round-robin over the scan buckets, per-thread posting regions, bitmaps from zero pages, term table sized up front, output in chunk buffers | run-ddc4729fadbb | 0.277 | 59 | 65.78 |
-| 18 | Query file parsed on 12 threads into one lock-free term table; table from zero pages and renumbered in place; counting sort at the barrier | pending | | | |
-| 19 | Each term's postings in one stretch (12 segment lengths per term), laid out by all threads; doc lookup by page | pending | | | |
-| 20 | Bitmap terms numbered first; each thread collects a term's bits per 64 documents and ORs them in once | pending | | | |
-| 21 | Phrases checked by the scan at their anchor's occurrences, while the text is in cache; anchors keep doc lists for BOOL | pending | | | |
-| 22 | Per-thread last-document marks and counts as 16-bit offsets; write cursors rebuilt per bucket, so the counts go before the scatter | pending | | | |
-| 23 | Scan threads go on to lay out and scatter (one thread pool instead of two); `_exit` once the output is closed | pending | | | |
+| 18 | Query file parsed on 12 threads into one lock-free term table; table from zero pages and renumbered in place; counting sort at the barrier | run-c2b149a34d40 (with 23) | | | |
+| 19 | Each term's postings in one stretch (12 segment lengths per term), laid out by all threads; doc lookup by page | run-c2b149a34d40 (with 23) | | | |
+| 20 | Bitmap terms numbered first; each thread collects a term's bits per 64 documents and ORs them in once | run-c2b149a34d40 (with 23) | | | |
+| 21 | Phrases checked by the scan at their anchor's occurrences, while the text is in cache; anchors keep doc lists for BOOL | run-c2b149a34d40 (with 23) | | | |
+| 22 | Per-thread last-document marks and counts as 16-bit offsets; write cursors rebuilt per bucket, so the counts go before the scatter | run-c2b149a34d40 (with 23) | | | |
+| 23 | Scan threads go on to lay out and scatter (one thread pool instead of two); `_exit` once the output is closed | run-c2b149a34d40 | 0.232 | 52.7 | 67.95 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -125,6 +125,7 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | b4606d2 | run-e6924d8063c9 | 0.2918 | 69.6 | 19.82 | 64.85 | Step 13: transparent huge pages off; the box now matches the laptop |
 | c451b56 | run-83b833e14e8a | 0.2895 | 70.2 | 19.86 | 64.9 | Same Track B code |
 | 5a6463e | run-03115bd4e2c1 | 0.2887 | 70.2 | 19.89 | 64.93 | Same Track B code |
+| 3086948 | run-c2b149a34d40 | 0.2318 | 52.7 | 22.85 | 67.95 | Steps 18 to 23 together (Track B code of 6b4b312): T 0.277 to 0.232 s, M 59 to 52.7 MiB, the box agreeing with the laptop |
 
 ## Step 16: phrase anchors
 
