@@ -88,14 +88,25 @@ u32 match32(const char* p, char c) {
 
 u64 match64(const char* p, char c) { return match32(p, c) | u64(match32(p + 32, c)) << 32; }
 
-// The value of the 1 to 8 decimal digits in [s, e): the eight bytes ending at
-// e, reduced to digit values, with the bytes before s masked to leading zeros
-// (the first byte is the lowest), are folded in pairs, quads and halves.
-u64 digits(const char* s, const char* e) {
-    u64 v = load8(e - 8) & 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - (e - s));
+// The value of the last n (1 to 8) of the eight digit bytes in v (the first
+// byte is the lowest): reduced to digit values, the bytes before them masked
+// to leading zeros, then folded in pairs, quads and halves.
+u64 fold(u64 v, size_t n) {
+    v &= 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - n);
     v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
     v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
     return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
+}
+
+// The value of the 1 to 8 decimal digits in [s, e).
+u64 digits(const char* s, const char* e) { return fold(load8(e - 8), e - s); }
+
+// An amount's value in cents, from its digits [s, e) with the dot third from
+// the end: at most 7 digits (99999.99), so the eight bytes ending at e, with
+// the dot's byte dropped, are one number.
+u64 money(const char* s, const char* e) {
+    u64 w = load8(e - 8);
+    return fold((w & 0xFFFFFFFFFF) << 8 | (w & 0xFFFF000000000000), e - s - 1);
 }
 
 // The commas and LFs outside quotes, in order, from a record start onwards,
@@ -210,9 +221,9 @@ struct NamesSeen {
     void prefetch(u32 c, u32 name) { _mm_prefetch(reinterpret_cast<const char*>(&word(c, name)), _MM_HINT_T0); }
 
     void mark(u32 c, u32 name) {
-        u64 bit = u64(1) << name % 64;
-        if (!(word(c, name).load(std::memory_order_relaxed) & bit))
-            word(c, name).fetch_or(bit, std::memory_order_relaxed);
+        // No test first: the read would fetch the line shared, then the OR
+        // would have to fetch it again exclusive.
+        word(c, name).fetch_or(u64(1) << name % 64, std::memory_order_relaxed);
     }
 
     u64 count(u32 c) const {
@@ -275,7 +286,7 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         const char* amount = f4 + 1;
         const char* amount_end = eol - (eol[-1] == '\r');
         bool negative = *amount == '-';
-        i64 cents = digits(amount + negative, amount_end - 3) * 100 + digits(amount_end - 2, amount_end);
+        i64 cents = money(amount + negative, amount_end);
         if (negative) cents = -cents;
 
         // Region ids are below 10^7 (fit u32); one past the table means none.
