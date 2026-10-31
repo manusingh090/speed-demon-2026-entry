@@ -31,9 +31,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <immintrin.h>
-#include <memory>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -58,10 +56,20 @@ inline u32 eq32(const char* p, char c) {
 }
 
 // The number of decimal digits in x.
-inline u32 width(u32 x) {
-    static constexpr u32 TEN[10] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
-    u32 w = (32 - __builtin_clz(x | 1)) * 1233 >> 12;  // floor(log10) or one more
-    return w + ((x | 1) >= TEN[w]);
+inline u32 width(u32 x) { return x < 10 ? 1 : 1 + width(x / 10); }
+
+// The value of the len (1 to 10) digits ending just before end, with no loop:
+// the 16 bytes before end, minus '0' and with the bytes ahead of the number
+// zeroed, are combined 2, 4 and then 8 digits at a time. (A digit loop here
+// cost about 5% more instructions in all.)
+inline u32 decode(const char* end, u32 len) {
+    __m128i v = _mm_subs_epu8(_mm_loadu_si128((const __m128i*)(end - 16)), _mm_set1_epi8('0'));
+    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
+    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));  // pairs (10, 1)
+    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));  // pairs (100, 1)
+    v = _mm_madd_epi16(_mm_packus_epi32(v, v), _mm_set1_epi32(0x00012710));
+    return u32(_mm_cvtsi128_si32(v)) * u64(100000000) + u32(_mm_extract_epi32(v, 1));
 }
 
 // The first c at or after s; one is known to follow.
@@ -70,27 +78,14 @@ inline const char* next_byte(const char* s, char c) {
         if (u32 m = eq32(s, c)) return s + __builtin_ctz(m);
 }
 
-// The value of the len (1 to 10) digits ending just before end, with no loop:
-// the 16 bytes before end, minus '0' and with the bytes ahead of the number
-// zeroed, are combined 2, 4 and then 8 digits at a time.
-inline u32 decode(const char* end, u32 len) {
-    __m128i v = _mm_subs_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(end - 16)), _mm_set1_epi8('0'));
-    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
-    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));  // pairs (10, 1)
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));  // pairs (100, 1)
-    v = _mm_packus_epi32(v, v);
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00012710));  // pairs (10000, 1)
-    return u32(u64(u32(_mm_cvtsi128_si32(v))) * 100000000 + u32(_mm_extract_epi32(v, 1)));
-}
-
 // Endpoint names to dense ids in first-seen order. Open addressing on a CRC of
 // the name's first and last eight bytes (masked when the name is shorter; the
 // rest of the line keeps both loads in bounds). Names point into the log.
 struct Interner {
     static constexpr u32 SLOTS = 1 << 12;  // ids fit 11 bits; a seed has 1,842
     std::vector<std::string_view> names;
-    std::vector<uint16_t> slot = std::vector<uint16_t>(SLOTS);  // id + 1, 0 if free
+    // id + 1 per slot, 0 if free.
+    std::vector<uint16_t> slot = std::vector<uint16_t>(SLOTS);
 
     u32 operator()(std::string_view s) {
         u64 a, b = 0;
@@ -100,7 +95,7 @@ struct Interner {
         for (u32 i = _mm_crc32_u64(_mm_crc32_u64(s.size(), a), b);; ++i) {
             uint16_t& id = slot[i % SLOTS];
             if (id == 0) {
-                if (names.size() == SLOTS / 2) { fputs("too many endpoints\n", stderr); _exit(1); }
+                if (names.size() == SLOTS / 2) _exit(2);  // ids are 11 bits
                 names.push_back(s);
                 id = names.size();
             }
@@ -112,12 +107,10 @@ struct Interner {
     // rest of the line and the spare page follow), so a name of up to 32
     // bytes is compared in one step instead of a memcmp call per line.
     static bool same(std::string_view x, std::string_view s) {
-        if (x.size() != s.size()) return false;
-        if (s.size() > 32) return memcmp(x.data(), s.data(), s.size()) == 0;
-        __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x.data()));
-        __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s.data()));
-        u32 differ = ~u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)));
-        return (differ & (~0u >> (32 - s.size()))) == 0;
+        if (x.size() != s.size() || s.size() > 32) return x == s;
+        auto v = [](auto p) { return _mm256_loadu_si256((const __m256i*)p); };
+        u32 eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v(x.data()), v(s.data())));
+        return (~eq & (~0u >> (32 - s.size()))) == 0;
     }
 };
 
@@ -135,14 +128,16 @@ struct Chunk {
 struct Parser {
     Interner local;
     Chunk* last[HOURS] = {};
-    std::vector<std::pair<u32, u32>> wide[HOURS];  // (latency, key) of the long ones
-    std::vector<u32> rank;                        // local id -> global rank
-    Chunk *region = nullptr, *next = nullptr, *kept = nullptr;  // kept: first chunk not yet released
+    // (latency, key) of the long ones.
+    std::vector<std::pair<u32, u32>> wide[HOURS];
+    std::vector<u32> rank;  // local id -> global rank
+    // next: where the next chunk is carved; kept: first one not yet released.
+    Chunk *next = nullptr, *kept = nullptr;
 
     void run(const char* p, const char* end) {
         // A line is at least 40 bytes; each hour may leave one chunk part full.
         size_t bytes = ((end - p) / 40 / Chunk::CAP + 1 + HOURS) * sizeof(Chunk);
-        region = next = kept = static_cast<Chunk*>(mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        next = kept = (Chunk*)mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         while (p < end) {
             // YYYY-MM-DDTHH: month's last digit at 6, day at 8-9, hour at 11-12.
             int day = (p[8] - '0') * 10 + (p[9] - '0'), hour = (p[11] - '0') * 10 + (p[12] - '0');
@@ -199,12 +194,12 @@ int main() {
     const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     int in = open("/data/requests.log", O_RDONLY);
     int out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (in < 0 || out < 0) { perror("open"); return 1; }
+    if (in < 0 || out < 0) return perror("open"), 1;
 
     // Map the log over one spare zero page, so the 64-byte scans stay in bounds.
     size_t size = lseek(in, 0, SEEK_END);
-    auto* log = static_cast<char*>(mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (size && mmap(log, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED) { perror("mmap"); return 1; }
+    auto* log = (char*)mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (size && mmap(log, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED) return perror("mmap"), 1;
     std::vector<size_t> cut(nt + 1, size);
     cut[0] = 0;
     for (int t = 1; t < nt; ++t)
@@ -243,10 +238,9 @@ int main() {
         for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
         at[HOURS] = total;
         if (total == 0) return;
-        void* p = MAP_FAILED;
-        if (ftruncate(out, total) == 0) p = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
-        if (p == MAP_FAILED) { perror("output"); _exit(1); }
-        text = static_cast<char*>(p);
+        if (ftruncate(out, total) != 0) _exit(1);
+        text = (char*)mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
+        if (text == MAP_FAILED) _exit(1);
     });
 
     std::vector<std::thread> pool;
@@ -262,8 +256,7 @@ int main() {
             std::fill(start.begin(), start.end(), 0);
             std::fill(errors.begin(), errors.end(), 0);
             for (auto& ps : parsers) ps.each(h, [&](u32 e, u32 err, u32) { ++start[e + 1], errors[e] += err != 0; });
-            u32 groups = 0;
-            for (u32 e = 0; e < ne; ++e) groups += start[e + 1] != 0, start[e + 1] += start[e];
+            for (u32 e = 0; e < ne; ++e) start[e + 1] += start[e];
             latency.resize(start[ne]);
             std::vector<u32> cursor(start.begin(), start.end() - 1);
             for (auto& ps : parsers) ps.each(h, [&](u32 e, u32, u32 l) { latency[cursor[e]++] = l; });
@@ -273,8 +266,6 @@ int main() {
                 releasing.clear();
             }
 
-            auto& out_lines = lines[h];
-            out_lines.reserve(groups);
             u64 size = 0;
             for (u32 e = 0; e < ne; ++e) {
                 u32 n = start[e + 1] - start[e];
@@ -284,14 +275,9 @@ int main() {
                 // each later selection only needs the front part.
                 u32* a = latency.data() + start[e];
                 u32 r99 = (99 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r50 = (50 * n + 99) / 100 - 1;
-                if (n <= 64) {
-                    std::sort(a, a + n);
-                } else {
-                    std::nth_element(a, a + r99, a + n);
-                    std::nth_element(a, a + r95, a + r99);
-                    std::nth_element(a, a + r50, a + r95);
-                }
-                const Line& l = out_lines.emplace_back(e, n, a[r50], a[r95], a[r99], errors[e]);
+                if (n <= 64) std::sort(a, a + n);  // most groups; cheaper than three selections
+                else for (auto [r, lim] : {std::pair{r99, n}, {r95, r99}, {r50, r95}}) std::nth_element(a, a + r, a + lim);
+                const Line& l = lines[h].emplace_back(e, n, a[r50], a[r95], a[r99], errors[e]);
                 // Label, name, six numbers each after a space, newline.
                 size += 21 + names[e].size() + 7;
                 for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) size += width(x);
