@@ -33,6 +33,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <memory>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -57,7 +58,11 @@ inline u32 eq32(const char* p, char c) {
 }
 
 // The number of decimal digits in x.
-inline u32 width(u32 x) { return x < 10 ? 1 : 1 + width(x / 10); }
+inline u32 width(u32 x) {
+    static constexpr u32 p10[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
+    u32 t = (32 - __builtin_clz(x | 1)) * 1233 >> 12;  // about bit length x log10(2)
+    return t + ((x | 1) >= p10[t]);
+}
 
 // The value of the len (1 to 10) digits ending just before end, with no loop:
 // the 16 bytes before end, minus '0' and with the bytes ahead of the number
@@ -300,7 +305,8 @@ int main() {
         const u32 ne = names.size();
         // Sized once: a buffer that grows is remapped, which stalls every
         // thread's page faults.
-        std::vector<u32> start(ne + 1), errors(ne), latency(most);
+        std::vector<u32> start(ne + 1), errors(ne);
+        std::unique_ptr<u32[]> latency(new u32[most]);  // not zeroed: only pages used count
         for (int h; (h = claim++) < HOURS;) {
             // Counting sort of the hour's latencies by endpoint rank: count into
             // start[e + 1], prefix, then place each latency at its group's cursor.
@@ -324,7 +330,7 @@ int main() {
                 // leaves only larger values after its rank, so each higher rank
                 // is selected among those: half the group for p95, a twentieth
                 // for p99. (An equal rank is already in place.)
-                u32* a = latency.data() + start[e];
+                u32* a = latency.get() + start[e];
                 u32 r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
                 for (u32 from = 0; u32 r : {r50, r95, r99})
                     if (r >= from) select(a + from, n - from, r - from), from = r + 1;
