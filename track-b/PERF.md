@@ -19,6 +19,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | malloc mmap threshold pinned, so freed scan state really goes back | run-5c032275f3b6 | 0.301 | 175 | 60.5 |
 | 13 | Transparent huge pages off (the box backed partly written blocks with whole 2 MB pages) | run-e6924d8063c9 | 0.292 | 69.6 | 64.8 |
 | 14 | Scan output as 16-bit units: term offset in its bucket and a 7-bit doc gap, with an escape for larger gaps | run-443f9c5c3311 | 0.290 | 59 | 65.56 |
+| 15 | Scan output buckets of 2,048 terms (37 write streams per thread instead of 148) | run-060e2570f6d3 | 0.279 | 59.5 | 65.94 |
+| 16 | Rust rewrite: phrases checked during the scan at their anchor, postings only for BOOL terms, parallel query parse, per-thread posting regions | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -82,3 +84,25 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | b4606d2 | run-e6924d8063c9 | 0.2918 | 69.6 | 19.82 | 64.85 | Step 13: transparent huge pages off; the box now matches the laptop |
 | c451b56 | run-83b833e14e8a | 0.2895 | 70.2 | 19.86 | 64.9 | Same Track B code |
 | 5a6463e | run-03115bd4e2c1 | 0.2887 | 70.2 | 19.89 | 64.93 | Same Track B code |
+
+## Step 16: Rust rewrite, phrases answered by the scan
+
+A phase profile of step 15 (timestamps and cgroup `memory.current`/`memory.peak` between phases, laptop, full data) showed where the remaining time sat outside the corpus scan: parsing the queries single-threaded (30 to 40 ms), the serial work at the sample barrier (20 to 26 ms), turning counts into cursors (9 ms), and phrase verification, about 57 ms per thread in the query phase: about 210,000 candidate documents were rescanned for 19,000 phrases, close to rereading the corpus.
+
+What changed, each measured on its own before the next:
+
+- **Phrase anchors.** Every phrase's rarest term (in the sample) is its anchor. On the full data all 18,006 anchors have df at most 1,071 and occur 835,000 times in all. First version (C++): store each anchor occurrence's file offset and check the phrase in place at query time. Phrase work per thread fell from about 57 ms to about 14 ms. Second version (Rust): check the phrases *during the scan*, at each anchor occurrence, while the text is in L1, and keep only the (query, document) matches, about 30,000 pairs. The occurrence buffer (7 MB), the offset arrays (3.5 MB), the per-document text offsets (1 MB) and the candidate-intersection fallback all went.
+- **Postings only for BOOL terms.** With phrases answered by the scan, terms that appear only in phrases need no postings, and those that are not anchors need not be in the lookup table (their bytes are compared directly). About 1.4 million fewer postings.
+- **Parallel query parse.** Twelve threads parse the queries; the term table's slots are split into 64 ranges, each filled by one thread in slot order. The parse itself is about 1 ms per thread; the rest of what the laptop shows is first-touch page faults, which are unusually expensive inside its WSL2 VM.
+- **Per-thread posting regions.** Each thread's lists take one contiguous region, so the scatter writes only pages its own scan output is giving back; the cross-thread cursor pass went with it.
+- **Round-robin buckets.** The peak was 8 MB above the end of the scan, during the scatter of bucket 0: ids were numbered by frequency, so bucket 0 held the hottest lists, and their postings touched its whole region before its scan output was freed. List terms are now dealt round-robin over the buckets by frequency rank. Peak 61 to 54 MB, same speed.
+- **Plain ORs** for bitmap words inside a thread's document range; the locked OR is kept for the two words a neighbouring thread can share.
+
+Laptop, alternating runs, cgroup peak, every run with the published hash; also the same output as step 15 byte for byte on sample, tiny, the worked example and a seed-5 sample:
+
+| Version | Median (ms) | Peak (MB) |
+|---|---|---|
+| Step 15 (C++) | 290 | 60 |
+| Step 16 (Rust) | 282 | 52 |
+
+Tried and kept out: BOOL evaluated on a bitmap only (no sorted lists): 70 fewer lines but 12% slower, because every query cleared and scanned a 31 KB bitmap.

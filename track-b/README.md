@@ -2,20 +2,28 @@
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
 
+Rust, no dependencies (`src/main.rs`). Steps 1 to 15 in PERF.md were C++; the Rust rewrite (step 16) keeps their scan and changes what the scan is asked to do.
+
 ## Approach
 
-The queries are readable before the corpus, so the program reads `queries.txt` first and builds a hash table of every term the queries mention. Tokens that are not in that table are never indexed.
+**Queries first.** `queries.txt` is parsed on 12 threads. Every term then gets an id in one open-addressing table whose slots are split into 64 ranges; each range is filled by one thread, in slot order, so no locks are needed and the probes walk the table almost sequentially. Tokens that are not query terms are never indexed.
 
-`docs.txt` is memory mapped (over a spare zero page, so wide loads near the end are safe) and split into 12 byte ranges on line boundaries. Each thread first samples the start of its range. At the barrier, terms seen in more than 1/32 of the sampled documents become bitmaps, and all terms are renumbered by sampled frequency, most frequent first, so the scan's per-term state for the common terms shares a few cache lines.
+**Sample, then decide.** `docs.txt` is memory-mapped (over a spare zero page, so wide loads near the end are safe) and cut into 12 line-aligned ranges. Each thread counts terms over the first 1/32 of its range. From those counts:
 
-The full scan finds token bounds from one AVX2 character-class mask per 64-byte window, loads each token as 64-bit words (lowercased with one OR, since tokens are only letters and digits), hashes it and prefetches its slot in the term table, and looks it up 8 tokens later so the cache misses overlap. Bitmap terms set a bit. Every other (term, document) pair is filed under a bucket of 512 consecutive term ids, in 1 MB blocks mapped straight from the kernel. Each entry is three bytes: the term's offset in its bucket (9 bits) and the document's offset in the thread's range (15 bits). The scatter then fills the posting lists bucket by bucket, unmapping each block as it is read, so the scan output and the posting lists are never both fully resident (malloc would have kept the freed blocks). Nothing is sorted: per-thread counts give each thread its own segment of every list, and a segment stores 16-bit offsets from the thread's first document, so a posting takes two bytes. When a query uses a list term, its segments are decoded into a scratch array.
+- each phrase's rarest term becomes its **anchor**;
+- only terms used by BOOL queries get postings; terms in more than 1/32 of documents become bitmaps, the rest lists;
+- terms are renumbered: list terms by frequency, dealt round-robin over the 2,048-id buckets of the scan output (so every bucket holds a similar share of postings), then anchors, then terms that appear only in phrases and are never looked up.
 
-BOOL queries run strictly left to right. The running result is a sorted list until a bitmap term starts the query or is OR-ed in; from then on it is a bitmap, and count, sum and the ten smallest ids come from popcounts. List against list gallops when one side is at least 16 times smaller, and merges otherwise. PHRASE queries intersect their distinct terms rarest first, then look for the rarest term in each candidate with a 32-byte AVX2 scan for its first letter, and check the neighbouring tokens in place. Queries run on 12 threads into fixed-size slots and are written with one call.
+**One scan answers every phrase.** Token bounds come from one AVX2 class mask per 64-byte window; each token is loaded as 64-bit words, lowercased with one OR, hashed, and its table slot prefetched, then looked up 8 tokens later so the cache misses overlap. When the token is an anchor, the phrases it anchors are checked right there, comparing the neighbouring tokens byte by byte while the text is in cache, and only the matches (query, document) are kept. Bitmap terms set a bit (atomically only in the two words a thread can share with a neighbour). Every other (term, document) pair is written as one 16-bit unit (term offset in its bucket, gap since the bucket's previous document) into kernel-mapped 64 KB blocks.
+
+**Scatter.** Each thread drains its buckets into its own region of the posting array (16-bit offsets from the thread's first document), unmapping each block as it is read, so the scan output and the lists are never both fully resident.
+
+**Queries.** Phrase answers are the scan's matches. BOOL queries run strictly left to right on sorted lists, galloping from the smaller side, and switch to a bitmap once a bitmap term starts the query or is OR-ed in; count, sum and the ten smallest ids then come from popcounts. Queries are answered 64 at a time on 12 threads and written with one call.
 
 ## Dependencies
 
-None. C++20 standard library and POSIX `mmap` only.
+None. The Rust standard library, plus `mmap`, `munmap`, `prctl` and `mallopt` declared from the C library the standard library already links.
 
 ## With another 24 hours
 
-The scan is still most of the run, and it is now bound by memory accesses (the term table and the per-term state), not by tokenizing: a faster tokenizer on its own cut 35% of tokenizing time single-threaded but almost nothing end to end. Peak memory is now the scan output (36 MB) plus the bitmaps (12 MB) and per-thread scan state; going further toward the 44 MB cap would need a scan output smaller than three bytes per posting. Lines could be trimmed.
+The scan is still most of the run and is bound by memory accesses (the term table and per-term state), not by tokenizing. The next things to try are a small direct-mapped cache for the few hundred most frequent short tokens, and a smaller scan output for the hottest buckets.
