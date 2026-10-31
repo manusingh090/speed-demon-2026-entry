@@ -2,10 +2,11 @@
 //
 // The queries are readable up front, so we read them first and index only the
 // terms they mention. One parallel pass over the memory-mapped corpus builds
-// doc-level posting lists for those terms (sorted, deduplicated). BOOL queries
-// are then evaluated left to right on sorted arrays, galloping when one side is
-// much smaller. PHRASE queries intersect their terms' postings, rarest first,
-// and re-tokenize only the surviving candidates to check adjacency.
+// doc-level postings for those terms (bitmaps for common terms, sorted lists
+// for the rest) and checks each phrase wherever its rarest term occurs. BOOL
+// queries are then evaluated left to right, galloping when one side is much
+// smaller. The few phrases without a rare term intersect their terms'
+// postings, rarest first, and search only the surviving candidates.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -91,38 +92,47 @@ inline bool same(const Key& a, const Key& b) {
 // top 32 hash bits and id + 1, so most misses never touch the key array.
 class TermTable {
 public:
-    // Room for n keys at load 1/2 or less, so probe chains stay short.
-    explicit TermTable(size_t n) : slots_(std::bit_ceil(2 * n)), mask_(slots_.size() - 1) {}
-    u32 size() const { return keys_.size(); }
+    // Room for fewer than n keys. The caller's bound counts term occurrences,
+    // about twice the distinct terms, so the load stays low.
+    // calloc takes large blocks straight from the kernel: zero pages, no memset.
+    explicit TermTable(size_t n)
+        : slots_(static_cast<u64*>(calloc(std::bit_ceil(n), 8))), keys_(new Key[n]), lens_(new uint8_t[n]),
+          mask_(std::bit_ceil(n) - 1) {}
+    ~TermTable() { free(slots_); }
+    u32 size() const { return size_; }
     const uint8_t* bytes(u32 id) const { return reinterpret_cast<const uint8_t*>(keys_[id].w); }
     size_t length(u32 id) const { return lens_[id]; }
 
+    // Safe from several threads at once: an empty slot is claimed with a CAS and
+    // marked BUSY until its key is stored, so every key gets exactly one id.
     u32 insert(const Key& k) {
-        u64 h = hash_key(k);
+        constexpr u32 BUSY = NONE;
+        const u64 h = hash_key(k), tag = h & 0xFFFFFFFF00000000ull;
         for (size_t i = h & mask_;; i = (i + 1) & mask_) {
-            u64 s = slots_[i];
-            if (s == 0) {
-                keys_.push_back(k);
-                lens_.push_back(strnlen(reinterpret_cast<const char*>(k.w), MAX_TERM));
-                slots_[i] = (h & 0xFFFFFFFF00000000ull) | keys_.size();
-                return keys_.size() - 1;
+            std::atomic_ref<u64> slot(slots_[i]);
+            u64 s = slot.load(std::memory_order_acquire);
+            if (s == 0 && slot.compare_exchange_strong(s, tag | BUSY, std::memory_order_acquire)) {
+                const u32 id = size_.fetch_add(1, std::memory_order_relaxed);
+                keys_[id] = k;
+                lens_[id] = strnlen(reinterpret_cast<const char*>(k.w), MAX_TERM);
+                slot.store(tag | (id + 1), std::memory_order_release);
+                return id;
             }
-            if ((s >> 32) == (h >> 32) && same(keys_[(u32)s - 1], k)) return (u32)s - 1;
+            if ((s & 0xFFFFFFFF00000000ull) != tag) continue;  // after a lost CAS, s is the winner's
+            while (u32(s) == BUSY) s = slot.load(std::memory_order_acquire);
+            if (same(keys_[u32(s) - 1], k)) return u32(s) - 1;
         }
     }
 
-    // Old id i becomes new_id[i], under `space` (unused ids hold empty keys);
-    // the table shrinks to fit.
+    // Old id i becomes new_id[i], under `space`; the slots are rewritten in place.
     void renumber(const std::vector<u32>& new_id, size_t space) {
-        std::vector<Key> keys(space);
-        std::vector<uint8_t> lens(space);
-        const size_t n = keys_.size();
-        for (u32 i = 0; i < n; ++i) keys[new_id[i]] = keys_[i], lens[new_id[i]] = lens_[i];
+        std::unique_ptr<Key[]> keys(new Key[space]);
+        std::unique_ptr<uint8_t[]> lens(new uint8_t[space]);
+        for (u32 i = 0; i < size_; ++i) keys[new_id[i]] = keys_[i], lens[new_id[i]] = lens_[i];
         keys_.swap(keys);
         lens_.swap(lens);
-        slots_ = std::vector<u64>(std::bit_ceil(2 * n));  // a new, smaller buffer
-        mask_ = slots_.size() - 1;
-        for (u32 i = 0; i < n; ++i) place(new_id[i]);
+        for (size_t i = 0; i <= mask_; ++i)
+            if (u64 s = slots_[i]) slots_[i] = (s & 0xFFFFFFFF00000000ull) | (new_id[u32(s) - 1] + 1);
     }
 
     void prefetch(u64 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & mask_]), _MM_HINT_T0); }
@@ -137,17 +147,11 @@ public:
     }
 
 private:
-    void place(u32 id) {
-        u64 h = hash_key(keys_[id]);
-        size_t i = h & mask_;
-        while (slots_[i]) i = (i + 1) & mask_;
-        slots_[i] = (h & 0xFFFFFFFF00000000ull) | (id + 1);
-    }
-
-    std::vector<u64> slots_;
-    std::vector<Key> keys_;
-    std::vector<uint8_t> lens_;
-    size_t mask_ = 0;
+    u64* slots_;
+    std::unique_ptr<Key[]> keys_;
+    std::unique_ptr<uint8_t[]> lens_;
+    size_t mask_;
+    std::atomic<u32> size_{0};
 };
 
 // Bit i is set when byte i of the 64 at p is a token byte, [A-Za-z0-9]: after
@@ -217,6 +221,7 @@ inline void for_each_token(const uint8_t* q, const uint8_t* e, const TermTable& 
 
 // One query, as views into the flat arrays below.
 struct Query {
+    size_t index;
     bool phrase;
     std::span<const u32> terms;  // term ids
     std::span<const char> ops;   // BOOL only: 'A', 'O' or 'N' between terms
@@ -232,7 +237,7 @@ struct Queries {
     size_t size() const { return phrase.size(); }
     Query operator[](size_t i) const {
         size_t b = first[i], n = first[i + 1] - b;
-        return {phrase[i], {terms.data() + b, n}, {ops.data() + b, n - 1}};
+        return {i, phrase[i], {terms.data() + b, n}, {ops.data() + b, n - 1}};
     }
 };
 
@@ -242,10 +247,8 @@ Key make_key(const uint8_t* p, size_t len) {
     return k;
 }
 
-Queries parse_queries(const File& f, TermTable& terms) {
-    Queries qs;
-    const uint8_t* p = f.data;
-    const uint8_t* end = f.data + f.size;
+// Parses the query lines in [p, end).
+void parse_lines(const uint8_t* p, const uint8_t* end, TermTable& terms, Queries& qs) {
     while (p < end) {
         const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
         if (!nl) nl = end;
@@ -267,6 +270,31 @@ Queries parse_queries(const File& f, TermTable& terms) {
         qs.first.push_back(qs.terms.size());
         p = nl + 1;
     }
+}
+
+// Threads parse line-aligned parts of the file into one shared term table,
+// then the parts are joined in file order.
+Queries parse_queries(const File& f, TermTable& terms, int nthreads) {
+    std::vector<Queries> part(nthreads);
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nthreads; ++t) {
+        pool.emplace_back([&, t] {
+            auto line_start = [&](size_t c) {
+                while (c > 0 && c < f.size && f.data[c - 1] != '\n') ++c;
+                return f.data + c;
+            };
+            parse_lines(line_start(f.size * t / nthreads), line_start(f.size * (t + 1) / nthreads), terms, part[t]);
+        });
+    }
+    for (auto& th : pool) th.join();
+    Queries qs = std::move(part[0]);
+    for (int t = 1; t < nthreads; ++t) {
+        const u32 base = qs.terms.size();
+        qs.terms.insert(qs.terms.end(), part[t].terms.begin(), part[t].terms.end());
+        qs.ops.insert(qs.ops.end(), part[t].ops.begin(), part[t].ops.end());
+        qs.phrase.insert(qs.phrase.end(), part[t].phrase.begin(), part[t].phrase.end());
+        for (size_t i = 1; i < part[t].first.size(); ++i) qs.first.push_back(base + part[t].first[i]);
+    }
     return qs;
 }
 
@@ -276,27 +304,59 @@ Queries parse_queries(const File& f, TermTable& terms) {
 struct Index {
     u32 docs = 0;
     size_t words = 0;             // u64 words per bitmap
-    std::vector<u32> dense;       // per term: its bitmap number, or NONE for a list
-    u64* bits = nullptr;          // the bitmaps, `words` each
+    u32 ndense = 0;               // terms [0, ndense) are bitmaps
+    u32 list_base = 0;            // list terms start here, at a bucket boundary
+    u64* bits = nullptr;          // the bitmaps, `words` each, in term order
     std::vector<u32> df;          // per term: number of documents containing it
-    // A list term's documents are stored per thread: thread t's segment,
-    // post[seg[t][id], seg[t][id + 1]), holds doc - first[t] as 16 bits (a
-    // thread covers far fewer than 65,536 documents), two bytes a posting.
+    // A list term's documents are post[start[id], start[id + 1]), one segment
+    // per thread in thread order: thread t's seglen[id * threads + t] postings
+    // hold doc - first[t] as 16 bits (a thread covers far fewer than 65,536
+    // documents), two bytes a posting.
     int threads = 0;
-    std::vector<u32> first;                 // per thread: its first doc id
-    std::vector<std::vector<u32>> seg;      // per thread: term + 1 offsets into post
+    std::vector<u32> first;            // per thread: its first doc id
+    std::vector<u32> start;            // per term: offset into post
+    std::vector<uint16_t> seglen;      // per term and thread: segment length
     std::unique_ptr<uint16_t[]> post;  // doc offsets, ascending within each segment
     std::vector<u32> text;             // per doc: file offset of its text
-    // Phrase anchors (the rarest term of a phrase, when it is rare) keep the
-    // file offset of every occurrence instead of a doc list, so a phrase is
-    // checked only where its anchor stands.
+    // A phrase's anchor is its rarest term, when that is rare: the scan checks
+    // the phrase wherever the anchor occurs, while the text is in cache, and
+    // keeps the matching documents (ascending, possibly repeated).
     u32 anchors = NONE;                // the first anchor's term id; anchors come last
-    std::vector<u32> at_start;         // per anchor, offset into at; at_start[n] is the total
-    std::vector<u32> at;               // occurrence offsets, ascending per anchor
-
-    u32 anchor(u32 id) const { return id >= anchors ? id - anchors : NONE; }
-    u32 doc_of(u32 offset) const { return std::upper_bound(text.begin(), text.end(), offset) - text.begin() - 1; }
+    std::vector<bool> anchored;        // per query: a phrase checked by the scan
+    std::vector<u32> found_start;      // per query: offset into found
+    std::vector<u32> found;            // documents matching each anchored phrase
 };
+
+// Is the token text [p, p + len) the term `id`? Compared byte by byte, so
+// phrase checks never hash.
+bool is_term(const TermTable& terms, const uint8_t* p, size_t len, u32 id) {
+    if (len != terms.length(id)) return false;
+    const uint8_t* k = terms.bytes(id);
+    for (size_t i = 0; i < len; ++i)
+        if (LOWER.t[p[i]] != k[i]) return false;
+    return true;
+}
+
+// With phrase[j] at text [s, t), do the j tokens before it and the tokens
+// after it spell the rest of the phrase? The document's TAB and LF bound
+// the search (the id before the TAB is never reached).
+bool around(const TermTable& terms, const uint8_t* s, const uint8_t* t, std::span<const u32> phrase, size_t j) {
+    for (size_t i = j; i-- > 0;) {
+        for (; !LOWER.t[s[-1]]; --s)
+            if (s[-1] == '\t') return false;
+        const uint8_t* end = s;
+        while (LOWER.t[s[-1]]) --s;
+        if (!is_term(terms, s, end - s, phrase[i])) return false;
+    }
+    for (size_t i = j + 1; i < phrase.size(); ++i) {
+        for (; !LOWER.t[*t]; ++t)
+            if (*t == '\n') return false;
+        const uint8_t* start = t;
+        while (LOWER.t[*t]) ++t;
+        if (!is_term(terms, start, t - start, phrase[i])) return false;
+    }
+    return true;
+}
 
 // An append-only list of 16-bit units kept in blocks mapped straight from the
 // kernel (pages count only once written). drain() unmaps each block as soon as
@@ -377,8 +437,10 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
         cut[t] = c;
     }
     std::vector<std::vector<BlockList>> seen(nthreads);
-    std::vector<std::vector<u32>> count(nthreads), acount(nthreads);
-    std::vector<std::vector<std::pair<u32, u32>>> hits(nthreads);  // (anchor, offset)
+    std::vector<std::vector<u32>> count(nthreads);
+    std::vector<u32> by_anchor_start;                     // per anchor: offset into by_anchor
+    std::vector<std::pair<u32, u32>> by_anchor;           // (query, anchor position)
+    std::vector<std::vector<std::pair<u32, u32>>> found(nthreads);  // (query, doc) matches
     std::vector<u32> sampled(nthreads), totals(nthreads);
     // After the sample: pick the phrase anchors (a phrase's rarest term in the
     // sample, if it is in under 1/200 of the documents) and number them last,
@@ -395,31 +457,48 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
         for (auto& c : count)
             for (u32 id = 0; id < nterms; ++id) df[id] += c[id];
         std::vector<bool> anchor(nterms);
+        std::vector<u32> where(qs.size(), NONE);  // per phrase: its anchor's position
         for (size_t i = 0; i < qs.size(); ++i) {
             if (!qs.phrase[i]) continue;
             Query q = qs[i];
-            u32 a = *std::min_element(q.terms.begin(), q.terms.end(), [&](u32 x, u32 y) { return df[x] < df[y]; });
-            if (df[a] * 200 <= docs && !anchor[a]) anchor[a] = true, ++nanchors;
+            auto a = std::min_element(q.terms.begin(), q.terms.end(), [&](u32 x, u32 y) { return df[x] < df[y]; });
+            if (df[*a] * 200 > docs) continue;
+            where[i] = a - q.terms.begin();
+            if (!anchor[*a]) anchor[*a] = true, ++nanchors;
         }
-        // Sort keys: anchors last, then most frequent first, then old id.
-        std::vector<u64> order(nterms);
-        for (u32 id = 0; id < nterms; ++id)
-            order[id] = u64(anchor[id]) << 63 | (UINT32_MAX - std::min<u64>(df[id], UINT32_MAX)) << 24 | id;
-        std::sort(order.begin(), order.end());
-        const u32 lists = nterms - nanchors;
-        nbuckets = std::max(1u, (lists + (1u << BUCKET_BITS) - 1) >> BUCKET_BITS);
-        ix.anchors = nbuckets << BUCKET_BITS;
+        // Most frequent first, then old id, anchors last: a counting sort, since
+        // a sampled df is at most the sampled documents.
+        auto rank_key = [&](u32 id) { return anchor[id] ? docs + 1 : docs - df[id]; };
+        std::vector<u32> start(docs + 3), order(nterms);
+        for (u32 id = 0; id < nterms; ++id) ++start[rank_key(id) + 1];
+        std::partial_sum(start.begin(), start.end(), start.begin());
+        for (u32 id = 0; id < nterms; ++id) order[start[rank_key(id)]++] = id;
+        const u32 lists = nterms - nanchors, bucket = 1u << BUCKET_BITS;
+        u32& ndense = ix.ndense;
+        while (ndense < lists && df[order[ndense]] * 32 > docs) ++ndense;
+        ix.list_base = (ndense + bucket - 1) & ~(bucket - 1);
+        const u32 dealt = std::max(1u, (lists - ndense + bucket - 1) >> BUCKET_BITS);  // buckets of non-anchors
+        ix.anchors = ix.list_base + (dealt << BUCKET_BITS);
         space = ix.anchors + nanchors;
-        ix.dense.assign(space, NONE);
+        nbuckets = dealt + ((nanchors + bucket - 1) >> BUCKET_BITS);  // anchors keep lists too, for BOOL
         std::vector<u32> new_id(nterms);
-        u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
-            const u32 id = order[rank] & 0xFFFFFF;
-            new_id[id] = rank < lists ? (rank % nbuckets) << BUCKET_BITS | rank / nbuckets : ix.anchors + rank - lists;
-            if (rank < lists && df[id] * 32 > docs) ix.dense[new_id[id]] = ndense++;
+            const u32 r = rank - ndense;
+            new_id[order[rank]] = rank < ndense  ? rank
+                                  : rank < lists ? ix.list_base + ((r % dealt) << BUCKET_BITS | r / dealt)
+                                                 : ix.anchors + rank - lists;
         }
         terms.renumber(new_id, space);
         for (u32& id : qs.terms) id = new_id[id];
+        // Per anchor, its phrases (query, anchor position), for the scan.
+        ix.anchored.resize(qs.size());
+        by_anchor_start.assign(nanchors + 2, 0);
+        for (size_t i = 0; i < qs.size(); ++i)
+            if (where[i] != NONE) ix.anchored[i] = true, ++by_anchor_start[qs[i].terms[where[i]] - ix.anchors + 2];
+        std::partial_sum(by_anchor_start.begin(), by_anchor_start.end(), by_anchor_start.begin());
+        by_anchor.resize(by_anchor_start.back());
+        for (size_t i = 0; i < qs.size(); ++i)
+            if (where[i] != NONE) by_anchor[by_anchor_start[qs[i].terms[where[i]] - ix.anchors + 1]++] = {u32(i), where[i]};
         // Straight from the kernel: zero pages, touched only as the scan sets bits.
         ix.bits = static_cast<u64*>(mmap(nullptr, std::max<size_t>(ndense * ix.words, 1) * 8, PROT_READ | PROT_WRITE,
                                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
@@ -434,49 +513,64 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             cnt.assign(nterms, 0);
             std::vector<u32> last_doc(nterms, NONE);
 
-            // Calls term(id, doc) once per distinct known term of each document
-            // in [begin, stop), except that anchors call hit(anchor, offset) at
-            // every occurrence. Returns the document count.
-            auto walk = [&](const uint8_t* stop, auto&& term, auto&& hit) {
+            // Calls f(id, start, doc) for every token of each document in
+            // [begin, stop). Returns the document count.
+            auto walk = [&](const uint8_t* stop, auto&& f) {
                 u32 doc = first;
                 for (const uint8_t* p = begin; p < stop; ++doc) {
                     const uint8_t* nl = static_cast<const uint8_t*>(memchr(p, '\n', end - p));
                     const uint8_t* tx = static_cast<const uint8_t*>(memchr(p, '\t', nl - p)) + 1;
                     ix.text[doc] = tx - base;
-                    for_each_token(tx, nl, terms, [&](u32 id, const uint8_t* s) {
-                        if (id == NONE) return;
-                        if (ix.anchor(id) != NONE) hit(ix.anchor(id), u32(s - base));
-                        else if (last_doc[id] != doc) last_doc[id] = doc, term(id, doc);
-                    });
+                    for_each_token(tx, nl, terms, [&](u32 id, const uint8_t* s) { f(id, s, doc); });
                     p = nl + 1;
                 }
                 return doc - first;
             };
 
-            sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, u32) { ++cnt[id]; }, [](u32, u32) {});
+            sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, const uint8_t*, u32 doc) {
+                if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, ++cnt[id];
+            });
             sync.arrive_and_wait();
-            cnt.assign(space + 1, 0);  // term id + 1: list postings
+            cnt.assign(space, 0);  // list postings per term
             last_doc.assign(space, NONE);
-            acount[t].assign(nanchors, 0);
             auto& out = seen[t];
             out.resize(nbuckets);
             std::vector<uint16_t> prev(nbuckets);  // per bucket: offset of its last doc
-            const u32 docs = walk(end, [&](u32 id, u32 doc) {
-                if (u32 d = ix.dense[id]; d != NONE) {
-                    // Neighbouring threads can share a boundary word.
-                    std::atomic_ref<u64>(ix.bits[d * ix.words + doc / 64])
-                        .fetch_or(1ull << (doc % 64), std::memory_order_relaxed);
-                } else {
-                    u32 b = id >> BUCKET_BITS, off = doc - first, gap = off - prev[b];
-                    prev[b] = off;
-                    out[b].push((id & ((1u << BUCKET_BITS) - 1)) << GAP_BITS | std::min(gap, GAP));
-                    if (gap >= GAP) out[b].push(gap);
-                    ++cnt[id + 1];
+            // A bitmap term collects its bits for the current 64 documents here
+            // and ORs them into its bitmap when it moves on (atomically, since
+            // neighbouring threads can share a boundary word).
+            struct Pending {
+                u64 bits = 0;
+                u32 word = 0;
+            };
+            std::vector<Pending> pend(ix.ndense);
+            auto flush = [&](u32 id) {
+                if (pend[id].bits)
+                    std::atomic_ref<u64>(ix.bits[id * ix.words + pend[id].word])
+                        .fetch_or(std::exchange(pend[id].bits, 0), std::memory_order_relaxed);
+            };
+            const u32 docs = walk(end, [&](u32 id, const uint8_t* s, u32 doc) {
+                if (id < ix.ndense) {
+                    if (pend[id].word != doc / 64) flush(id), pend[id].word = doc / 64;
+                    pend[id].bits |= 1ull << (doc % 64);
+                    return;
                 }
-            }, [&](u32 a, u32 offset) {
-                hits[t].push_back({a, offset});
-                ++acount[t][a];
+                if (id == NONE) return;
+                if (id >= ix.anchors) {
+                    const u32 a = id - ix.anchors;
+                    for (u32 k = by_anchor_start[a]; k < by_anchor_start[a + 1]; ++k)
+                        if (auto [i, j] = by_anchor[k]; around(terms, s, s + terms.length(id), qs[i].terms, j))
+                            found[t].push_back({i, doc});
+                }
+                if (last_doc[id] == doc) return;
+                last_doc[id] = doc;
+                u32 b = (id - ix.list_base) >> BUCKET_BITS, off = doc - first, gap = off - prev[b];
+                prev[b] = off;
+                out[b].push((id & ((1u << BUCKET_BITS) - 1)) << GAP_BITS | std::min(gap, GAP));
+                if (gap >= GAP) out[b].push(gap);
+                ++cnt[id];
             });
+            for (u32 id = 0; id < ix.ndense; ++id) flush(id);
             if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
             totals[t] = std::accumulate(cnt.begin(), cnt.end(), 0u);
         });
@@ -484,54 +578,67 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
     for (auto& th : pool) th.join();
     pool.clear();
 
+    // The phrase matches, per query; threads cover the documents in order.
+    ix.found_start.assign(qs.size() + 1, 0);
+    for (auto& f : found)
+        for (auto [i, doc] : f) ++ix.found_start[i + 1];
+    std::partial_sum(ix.found_start.begin(), ix.found_start.end(), ix.found_start.begin());
+    ix.found.resize(ix.found_start.back());
+    std::vector<u32> fill(ix.found_start.begin(), ix.found_start.end() - 1);
+    for (auto& f : found)
+        for (auto [i, doc] : f) ix.found[fill[i]++] = doc;
+
     ix.post.reset(new uint16_t[std::accumulate(totals.begin(), totals.end(), 0u)]);  // every slot is written below
-    ix.at_start.resize(nanchors + 1);
-    u32 nat = 0;
-    for (u32 a = 0; a < nanchors; ++a) {
-        ix.at_start[a] = nat;
-        for (int t = 0; t < nthreads; ++t) {
-            u32 c = acount[t][a];
-            acount[t][a] = nat;
-            nat += c;
-        }
-    }
-    ix.at_start[nanchors] = nat;
-    ix.at.resize(nat);
-    // Each thread's lists take their own region of post, in thread order, so a
-    // thread writes only pages its own scan output is giving back. Its counts
-    // become write cursors there, and end as the segment bounds the queries use.
+    ix.start.resize(space + 1);
+    ix.seglen.resize(size_t(space) * nthreads);
+    // Thread t lays out the lists of the term ids [lo, hi): it sums their
+    // postings, waits for every slice's sum, then sets each term's start, its
+    // segment lengths and every thread's write cursor there (count[s][id]).
+    // Once all are laid out, each thread scatters its own scan output, bucket
+    // by bucket; a bucket's terms are consecutive ids, so its lists are one
+    // stretch of post.
+    std::vector<u32> slice(nthreads + 1);
+    std::barrier summed(nthreads, [&]() noexcept { std::exclusive_scan(slice.begin(), slice.end(), slice.begin(), 0u); });
+    std::barrier laid(nthreads);
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
-            for (auto [a, offset] : hits[t]) ix.at[acount[t][a]++] = offset;
-            std::vector<std::pair<u32, u32>>().swap(hits[t]);
-            u32 pos = std::accumulate(totals.begin(), totals.begin() + t, 0u);
-            for (u32& c : count[t]) pos += std::exchange(c, pos);
+            const u32 lo = u64(space) * t / nthreads, hi = u64(space) * (t + 1) / nthreads;
+            for (int s = 0; s < nthreads; ++s)
+                slice[t] = std::accumulate(count[s].begin() + lo, count[s].begin() + hi, slice[t]);
+            summed.arrive_and_wait();
+            u32 pos = slice[t];
+            for (u32 id = lo; id < hi; ++id) {
+                ix.start[id] = pos;
+                for (int s = 0; s < nthreads; ++s) {
+                    ix.seglen[size_t(id) * nthreads + s] = count[s][id];
+                    pos += std::exchange(count[s][id], pos);
+                }
+            }
+            if (t == nthreads - 1) ix.start[space] = pos;
+            laid.arrive_and_wait();
             for (u32 b = 0; b < nbuckets; ++b) {
                 u32 doc = 0, id = 0;
                 bool wide = false;  // the next unit is a whole gap
                 seen[t][b].drain([&](uint16_t x) {
                     if (!wide) {
-                        id = b << BUCKET_BITS | x >> GAP_BITS;
+                        id = ix.list_base + (b << BUCKET_BITS | x >> GAP_BITS);
                         if ((x & GAP) == GAP) { wide = true; return; }
                         doc += x & GAP;
                     } else {
                         doc += x, wide = false;
                     }
-                    ix.post[count[t][id + 1]++] = doc;
+                    ix.post[count[t][id]++] = doc;
                 });
             }
         });
     }
     for (auto& th : pool) th.join();
-    ix.seg = std::move(count);
+    std::vector<std::vector<u32>>().swap(count);
 
     // Documents per term, to order a phrase's terms (a bitmap counts as all).
-    ix.df.assign(space, 0);
-    for (auto& s : ix.seg)
-        for (u32 id = 0; id < space; ++id) ix.df[id] += s[id + 1] - s[id];
+    ix.df.resize(space);
     for (u32 id = 0; id < space; ++id) {
-        if (u32 a = ix.anchor(id); a != NONE) ix.df[id] = ix.at_start[a + 1] - ix.at_start[a];  // occurrences
-        if (ix.dense[id] != NONE) ix.df[id] = ix.docs;
+        ix.df[id] = id < ix.ndense ? ix.docs : ix.start[id + 1] - ix.start[id];
     }
     return ix;
 }
@@ -639,16 +746,12 @@ private:
     // A bitmap term's bitmap, or a list term's documents decoded into list_
     // (valid until the next call).
     Postings postings(u32 id) {
-        if (u32 d = ix_.dense[id]; d != NONE) return {nullptr, ix_.df[id], &ix_.bits[d * ix_.words], ix_.words};
+        if (id < ix_.ndense) return {nullptr, ix_.df[id], &ix_.bits[id * ix_.words], ix_.words};
         list_.resize(ix_.df[id]);
         u32 n = 0;
-        if (u32 a = ix_.anchor(id); a != NONE) {
-            for (u32 k = ix_.at_start[a]; k < ix_.at_start[a + 1]; ++k)
-                if (u32 doc = ix_.doc_of(ix_.at[k]); n == 0 || list_[n - 1] != doc) list_[n++] = doc;
-            return {list_.data(), n, nullptr, ix_.words};
-        }
-        for (int t = 0; t < ix_.threads; ++t)
-            for (u32 i = ix_.seg[t][id]; i < ix_.seg[t][id + 1]; ++i) list_[n++] = ix_.first[t] + ix_.post[i];
+        const uint16_t* len = &ix_.seglen[size_t(id) * ix_.threads];
+        for (u32 t = 0, i = ix_.start[id]; t < u32(ix_.threads); ++t)
+            for (const u32 e = i + len[t], first = ix_.first[t]; i < e; ++i) list_[n++] = first + ix_.post[i];
         return {list_.data(), n, nullptr, ix_.words};
     }
 
@@ -700,18 +803,10 @@ private:
 
     void phrase(const Query& q) {
         dense_ = false;
-        // With an anchor, check the phrase around each of its occurrences.
-        size_t j = q.terms.size();
-        for (size_t i = 0; i < q.terms.size(); ++i)
-            if (ix_.anchor(q.terms[i]) != NONE && (j == q.terms.size() || ix_.df[q.terms[i]] < ix_.df[q.terms[j]])) j = i;
-        if (j < q.terms.size()) {
-            cur_.clear();
-            const u32 a = ix_.anchor(q.terms[j]), len = terms_.length(q.terms[j]);
-            for (u32 k = ix_.at_start[a]; k < ix_.at_start[a + 1]; ++k) {
-                const uint8_t* s = docs_.data + ix_.at[k];
-                if (around(s, s + len, q.terms, j))
-                    if (u32 doc = ix_.doc_of(ix_.at[k]); cur_.empty() || cur_.back() != doc) cur_.push_back(doc);
-            }
+        cur_.clear();
+        if (ix_.anchored[q.index]) {  // checked by the scan
+            for (u32 k = ix_.found_start[q.index]; k < ix_.found_start[q.index + 1]; ++k)
+                if (cur_.empty() || cur_.back() != ix_.found[k]) cur_.push_back(ix_.found[k]);
             return;
         }
         // Otherwise candidates hold every phrase term; intersect rarest first.
@@ -727,7 +822,7 @@ private:
         }
         // Keep the candidates whose text contains the phrase. Only the rarest
         // term is searched for; its neighbours are checked where it occurs.
-        j = std::find(q.terms.begin(), q.terms.end(), order_[0]) - q.terms.begin();
+        const size_t j = std::find(q.terms.begin(), q.terms.end(), order_[0]) - q.terms.begin();
         size_t kept = 0;
         for (u32 doc : cur_) {
             const uint8_t* b = docs_.data + ix_.text[doc];
@@ -735,16 +830,6 @@ private:
             if (contains(b, e, q.terms, j)) cur_[kept++] = doc;
         }
         cur_.resize(kept);
-    }
-
-    // Is the token text [p, p + len) the term `id`? Compared byte by byte, so
-    // phrase checks never hash.
-    bool is_term(const uint8_t* p, size_t len, u32 id) const {
-        if (len != terms_.length(id)) return false;
-        const uint8_t* k = terms_.bytes(id);
-        for (size_t i = 0; i < len; ++i)
-            if (LOWER.t[p[i]] != k[i]) return false;
-        return true;
     }
 
     // Finds phrase[j] in [b, e) with a 32-byte scan for its first letter in either
@@ -767,31 +852,10 @@ private:
                 if (s > b && LOWER.t[s[-1]]) continue;
                 const uint8_t* t = s;
                 while (t < e && LOWER.t[*t]) ++t;
-                if (is_term(s, t - s, anchor) && around(s, t, phrase, j)) return true;
+                if (is_term(terms_, s, t - s, anchor) && around(terms_, s, t, phrase, j)) return true;
             }
         }
         return false;
-    }
-
-    // With phrase[j] at text [s, t), do the j tokens before it and the tokens
-    // after it spell the rest of the phrase? The document's TAB and LF bound
-    // the search (the id before the TAB is never reached).
-    bool around(const uint8_t* s, const uint8_t* t, std::span<const u32> phrase, size_t j) const {
-        for (size_t i = j; i-- > 0;) {
-            for (; !LOWER.t[s[-1]]; --s)
-                if (s[-1] == '\t') return false;
-            const uint8_t* end = s;
-            while (LOWER.t[s[-1]]) --s;
-            if (!is_term(s, end - s, phrase[i])) return false;
-        }
-        for (size_t i = j + 1; i < phrase.size(); ++i) {
-            for (; !LOWER.t[*t]; ++t)
-                if (*t == '\n') return false;
-            const uint8_t* start = t;
-            while (LOWER.t[*t]) ++t;
-            if (!is_term(start, t - start, phrase[i])) return false;
-        }
-        return true;
     }
 
     int format(char* out) const {
@@ -851,9 +915,12 @@ int main() {
     File qf = map_file("/data/queries.txt");
     File df = map_file("/data/docs.txt");
 
-    // Every term ends at a space or a LF, so their count bounds the terms.
-    TermTable terms(std::count(qf.data, qf.data + qf.size, ' ') + std::count(qf.data, qf.data + qf.size, '\n') + 1);
-    Queries queries = parse_queries(qf, terms);
+    // Every term follows a space or a quote, and every quote-led term follows
+    // a space before its quote; a space before an operator starts no term.
+    size_t occurrences = 1;
+    for (size_t i = 0; i + 1 < qf.size; ++i) occurrences += qf.data[i] == ' ' && (qf.data[i + 1] < 'A' || qf.data[i + 1] > 'Z');
+    TermTable terms(occurrences);
+    Queries queries = parse_queries(qf, terms, nthreads);
     Index ix = build_index(df, terms, queries, nthreads);
 
     // Answer queries in parallel, CHUNK at a time; each chunk's lines go to its

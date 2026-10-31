@@ -21,7 +21,11 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | Scan output as 16-bit units: term offset in its bucket and a 7-bit doc gap, with an escape for larger gaps | run-443f9c5c3311 | 0.290 | 59 | 65.56 |
 | 15 | Scan output buckets of 2,048 terms (37 write streams per thread instead of 148) | run-060e2570f6d3 | 0.279 | 59.5 | 65.94 |
 | 16 | Phrase anchors: the rarest term keeps its occurrences' file offsets, and a phrase is checked in place at each one | run-f9bbc8a6c0fa | 0.268 | 61.9 | 65.94 |
-| 17 | Terms dealt round-robin over the scan buckets, per-thread posting regions, bitmaps from zero pages, term table sized up front, output in chunk buffers | pending | | | |
+| 17 | Terms dealt round-robin over the scan buckets, per-thread posting regions, bitmaps from zero pages, term table sized up front, output in chunk buffers | run-ddc4729fadbb | 0.277 | 59 | 65.78 |
+| 18 | Query file parsed on 12 threads into one lock-free term table; table from zero pages and renumbered in place; counting sort at the barrier | pending | | | |
+| 19 | Each term's postings in one stretch (12 segment lengths per term), laid out by all threads; doc lookup by page | pending | | | |
+| 20 | Bitmap terms numbered first; each thread collects a term's bits per 64 documents and ORs them in once | pending | | | |
+| 21 | Phrases checked by the scan at their anchor's occurrences, while the text is in cache; anchors keep doc lists for BOOL | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -45,6 +49,31 @@ Laptop, 16 threads with turbo, full seed-1 data in a Docker volume, `--cpus=12`,
 | 12 | 0.33, same as 11 | 71 | glibc had kept freed per-thread arrays resident (found on Track D) |
 | 14 | 0.323 vs 0.339 (9 alternating runs) | 61 vs 71 | scan output 36 to about 24 MB |
 | 15 | Scan output buckets of 2,048 terms instead of 512 (37 write streams per thread instead of 148), gap field 5 bits | run-060e2570f6d3 | 0.279 | 59 | 65.94 |
+| 17 to 19 | 0.232 vs 0.271 (9 alternating runs) | 61 vs 59 | parse 26 to 12 ms, queries 47 to 34 ms per thread |
+| 20 | 3 to 5% fewer cycles than 19 (`perf stat`, 3 x 12 runs each) | 61 | no locked OR per (term, doc) |
+| 21 | 0.230 vs 0.302 median, 0.197 vs 0.238 best (11 alternating runs against step 17) | 56 vs 59 | phrase work per thread about 15 ms to almost none |
+
+## Second session (Oct 31): serial work, query layout, phrases in the scan
+
+The laptop is an AMD Ryzen 7 7840HS under WSL2 and Docker's `--cpus=12` is a CPU quota over 16 logical CPUs, while the box pins 12 threads to 6 Intel P-cores at a fixed 2.5 GHz, so wall time here is noisy (a 30% spread between runs) and serial code runs relatively faster here than there. Decisions in this session used `perf stat -r 12` cycle counts, three alternating rounds per variant, as well as wall time. Every step gave the published hash on full, the same output as step 17 on sample, tiny, the worked example and a seed-5 sample, and the reference's output on a hand-made edge set (tokens of 15 to 70 bytes around the 16 and 32 byte key limits, upper and title case, UTF-8 inside words, repeated runs, empty and token-free documents).
+
+**Where the time went at step 17** (phase timestamps, laptop): parsing the queries 26 to 40 ms on one thread, the sample 7 to 11, the barrier 10 to 15, the scan 140 to 180, the scatter 16 to 24 and the queries 44 to 55 ms per thread. `perf stat` showed 8.1 of 12 CPUs busy on average, so about a third of the wall time was serial or waiting.
+
+**Step 18.** The query file is split on line boundaries and parsed by 12 threads into one term table. An empty slot is claimed with a compare-and-swap that marks it busy until its key and id are stored; a thread that finds a busy slot with its own tag waits for the key before comparing, so every term still gets exactly one id. The table is sized from the exact number of term occurrences (spaces not followed by an operator) instead of every space and LF, comes from `calloc` (zero pages, no 4 MB memset), and is renumbered in place at the barrier (each slot's id rewritten) instead of rehashed. The barrier's sort of 75,000 terms is now a counting sort by sampled df. Parse 26 to 12 ms; the rest is page faults on the fresh table and the serial start of 12 threads.
+
+**Step 19.** Cycle counts inside the query phase put decoding list postings at about 20 cycles per posting: a term's postings sat in 12 per-thread regions, so one decode touched 12 segment bounds and 12 separate stretches of the posting array. A term's segments now lie back to back in one stretch, with the 12 segment lengths as 16-bit numbers next to each other. All threads lay the lists out together after the scan (each sums its slice of the terms, then sets the starts and every thread's write cursors for that slice), then each scatters its own scan output. Decoding fell to about 10 cycles per posting. The same counts showed BOOL queries on an anchor term spending about 500 cycles per document in the binary search from a file offset to its document; a per-page table of first documents made that a short walk (step 21 later removed it).
+
+**Step 20.** Bitmap terms are numbered first, so the scan tells them apart by comparing the id, and each thread keeps a pending 64-bit word per bitmap term for the current 64 documents. Repeats within a document cost nothing and the shared bitmap gets one atomic OR per (term, 64 documents) instead of one per (term, document).
+
+**Step 21.** Anchored phrases cost about 15 ms per thread at query time: about 70,000 anchor occurrences per thread, each a random read into the 254 MB corpus. They are now checked by the scan at every occurrence of their anchor, while the text is in L1, and each match is kept as a (query, document) pair; the query phase only reads them back. The anchors become ordinary list terms in buckets of their own, for BOOL queries that use them, so the occurrence offsets (3.3 MB), their per-thread buffers (6.7 MB at the end of the scan) and the offset-to-document lookup are gone. Peak 61 to 56 MB; queries about 35 to 24 ms per thread.
+
+**Measured and dropped in this session:**
+- Keys built with one 16-byte SIMD load and a length mask, or with `bzhi`, and a two-word lookup for tokens up to 16 bytes: 4 to 9% more instructions and the same cycles. The four-word build compiles well already.
+- Forcing the per-token handler inline (GCC left it out of line): more instructions, no fewer cycles.
+- One 8-byte entry per term for the last document and the count, instead of two arrays: no change.
+- A second prefetch stage (read the slot four tokens after prefetching it, then prefetch the key and the term's scan state): 7% more cycles.
+- The term table and keys on 2 MB pages (`MADV_HUGEPAGE`): no change, so the lookups are not TLB bound.
+- Terms that occur only in phrases kept no lists: only 5.5% of list postings at full scale (625,000 of 11.3M), not worth the code.
 
 ## What the profile said, step by step
 
