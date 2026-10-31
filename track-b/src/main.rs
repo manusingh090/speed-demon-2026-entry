@@ -20,6 +20,7 @@ use std::sync::Mutex;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn prctl(option: i32, ...) -> i32;
 }
 
 const THREADS: usize = 12;
@@ -415,6 +416,8 @@ impl Units {
 
 fn main() {
     unsafe { mallopt(-3, 1 << 16) }; // M_MMAP_THRESHOLD: freed buffers go back to the kernel
+    // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
+    unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let qtext = map("/data/queries.txt");
     let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
     let mut terms = Terms { slot: slots, keys: Vec::with_capacity(qtext.len() / 16) };

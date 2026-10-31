@@ -32,6 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | Back to the C++ of step 23 while the Rust version is worked on | run-880032be5ecf (step 24) | | | |
 | 26 | Rust again: queries stored flat, the sample's counts freed at once, rustfmt-friendly helpers; 557 lines, 55 MB | run-5231ce22564c | 0.241 | 58.0 | 68.86 |
 | 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | run-b6f929f84526 | 0.237 | 69.1 | 68.03 |
+| 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -113,6 +114,8 @@ A different laptop this time: Intel Core Ultra 9 185H (6 P-cores with hyperthrea
 **Step 27 against step 26** (15 alternating runs): 162 against 180 ms median, 157 against 172 ms best, 51 against 53 MB. rustfmt counts 601 code lines against 557: the `#[inline(always)]` closure arguments make rustfmt put every argument of those two calls on its own line. Trims that do not change what the program does won some of that back (636 to 601): class bounds and anchor starts by `partition_point` instead of counting loops, the scan buckets as plain addresses so they derive `Default` and `Send`, and the posting array as relaxed atomics instead of a raw-pointer wrapper. Estimated K: time 1.054, memory 1.008, code 0.989, about 5% higher. Same hash on full, sample, tiny, the worked example, a seed-5 sample and a seed-21 tiny set through `check.py`, and on 25 repeated full runs.
 
 **Step 27 on the board.** run-b6f929f84526 (commit 8d77fc0, the same code as 4ef6f6b): 0.237 s against 0.241 s, but 69.1 MiB against 58.0 MiB and 609 counted lines against 565, so K fell from 23.83 to 22.94 and the points from 68.86 to 68.03. The laptop's 10% did not show on the box, where the run is 1.6% faster. The memory moved the other way from the laptop's 53 to 51 MB. Neither Rust version turns transparent huge pages off, as the C++ did at step 13 (175 to 69.6 MiB on the box), so the likely cause is the new layout's regions being backed by whole 2 MB pages on the box: every thread now writes every bucket's region of one shared posting array at once, where step 26 wrote per-thread arrays. That is not measured yet.
+
+**Step 28.** This laptop's Docker VM runs huge pages in `madvise` mode, which is why it never showed the rise. With the VM switched to `always` for the measurement (9 alternating runs, then set back): step 26 53 MB at 178 ms, step 27 56 MB at 156 ms, step 27 with `PR_SET_THP_DISABLE` 51 MB at 157 ms. So huge pages cost step 27 about 5 MB here and nothing in time; the box's 11 MiB is the same effect, larger. Same hash on full, sample, tiny, the worked example and the seed-5 sample.
 
 ## What the profile said, step by step
 
