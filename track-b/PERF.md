@@ -35,7 +35,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | run-174007cb966d | 0.235 | 48.8 | 69.62 |
 | 29 | Scan output chunks carved from one region per thread instead of one mapping each, and handed back with `madvise` as the scatter reads them | run-4d450f87bdc1 | 0.232 | 49.7 | 69.62 |
 | 30 | Back to the code of step 28: step 29 bought no time on the box | run-ac88f12be57d | 0.244 | 49.0 | 69.21 |
-| 31 | Two loops per document: tokens and lookups fill an id buffer, then the per-token work runs over it; a phrase is checked by comparing the buffer's ids around its anchor, so the text is never read twice | pending | | | |
+| 31 | Two loops per document: tokens and lookups fill an id buffer, then the per-token work runs over it; a phrase is checked by comparing the buffer's ids around its anchor, so the text is never read twice | run-628927ef944b | 0.232 | 49.5 | 69.92 |
+| 32 | The per-token loop reads its bounds and slices once per document; one persistent thread pool for every phase | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -134,9 +135,15 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 
 **Step 31.** The loop is now split per document: tokens and lookups append ids to a small buffer that stays in L1, then a second loop does the per-token work over it. A phrase is checked by comparing the ids before and after its anchor in the buffer, so `around()` and its second pass over the text bytes are gone. The block check for bitmap words and the document's mark move out of the per-token loop, and a bitmap term's bit is set without the "new to this document" test (OR is idempotent). 8.92 billion instructions against 9.63, 4 to 7% fewer cycles, 36 fewer source lines, and the same hash on full, sample, tiny, the worked example, the edge cases and the seed-5 sample. A token of over 32 bytes now still counts as a token between two others, which matters for phrases.
 
+**Step 31 on the board.** run-628927ef944b: 0.2320 s, 49.5 MiB, 573 counted lines (611 before), K 25.02 and 69.92 points, the best Track B run so far. The box gained less time than the laptop's cycle count promised; most of the gain is the shorter code.
+
+**Step 32.** The disassembly of the per-token loop still showed about 70 instructions, many of them loads of values that never change inside a document (the class bounds, vector pointers and lengths), each followed by a bounds check. `Units::put` stores through a raw pointer, so the compiler had to assume any captured value might have changed after each token. These are now read into locals once per document and the per-token indexing is unchecked (the id is clamped to the table size first): 8.46 billion instructions against 8.92, about 4% fewer cycles, 3 more lines. The phases also share one persistent pool of 12 threads (as Track D does since its step 15) instead of starting 12 new threads four times: each new thread's stack is a new mapping, and mappings wait behind the page faults in flight. 3 to 4% less wall time and 5% less CPU over 15 alternating runs. Same hashes on every dataset.
+
 Measured and kept out this session:
 - A 256 KB table of the 8,192 most frequent short terms, looked up directly before the main table: branch misses doubled and the run was 30% slower, because a direct load breaks the 8-token prefetch pipeline.
 - One table of 16-byte entries (key and id together, CRC32 hash) for the terms of up to 12 bytes (99.8% of tokens): 14% fewer branches and 20% fewer cache misses, but only 3 to 6% fewer cycles for about 50 more lines; held back for now.
+- Long list against long list (over 1,024 or 4,096 documents) through a full-size bitmap instead of a merge, and a branch-free filter for list against bitmap: no fewer cycles.
+- Transparent huge pages for the term tables: the run has only about 8.8M L1 TLB misses, almost all caught by the second-level TLB.
 - Keys and hashes computed for all query terms first, then inserted with the slot prefetched 16 terms ahead, and idle threads pre-faulting the corpus during the query parse: no faster, 12 MB more.
 
 ## What the profile said, step by step

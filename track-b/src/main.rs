@@ -15,7 +15,7 @@ use std::borrow::Cow;
 use std::fmt::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::Mutex;
+use std::sync::{Barrier, Mutex, Once, OnceLock};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -42,13 +42,35 @@ fn map(path: &str) -> &'static [u8] {
     }
 }
 
-/// Runs f(t) on every thread and collects what each returns.
+type Job = &'static (dyn Fn(usize) + Sync);
+static POOL: OnceLock<(Mutex<Option<Job>>, Barrier)> = OnceLock::new();
+static STARTED: Once = Once::new();
+
+/// Runs f(t) on every thread and collects what each returns. The threads are
+/// started once and reused by every phase: a new thread's stack is a new
+/// mapping, which waits behind every page fault in flight.
 fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    let f = &f;
-    std::thread::scope(|s| {
-        let hs: Vec<_> = (0..THREADS).map(|t| s.spawn(move || f(t))).collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+    let (job, gate) = POOL.get_or_init(|| (Mutex::new(None), Barrier::new(THREADS)));
+    STARTED.call_once(|| {
+        for t in 1..THREADS {
+            std::thread::spawn(move || loop {
+                let (job, gate) = POOL.get().unwrap();
+                gate.wait();
+                let f = job.lock().unwrap().unwrap();
+                f(t);
+                gate.wait();
+            });
+        }
+    });
+    let out: Vec<Mutex<Option<R>>> = (0..THREADS).map(|_| Mutex::new(None)).collect();
+    let run = |t: usize| *out[t].lock().unwrap() = Some(f(t));
+    let run: &(dyn Fn(usize) + Sync) = &run;
+    // Safe while `run` outlives the phase, and the second wait ensures that.
+    *job.lock().unwrap() = Some(unsafe { std::mem::transmute::<_, Job>(run) });
+    gate.wait();
+    run(0);
+    gate.wait();
+    out.into_iter().map(|r| r.into_inner().unwrap().unwrap()).collect()
 }
 
 /// The decimal number at text[i..].
@@ -491,6 +513,10 @@ fn main() {
                 flush(&mut pending, w);
             }
             let (mark, bit) = ((doc - first + 1) as u16, 1u64 << (doc % 64));
+            // Read once per document: Units::put stores through a raw pointer,
+            // after which captured values would be loaded again for every token.
+            let (nkeep, a0, nbits, lists, off) = (nkeep, a0, nbits, lists, doc - first);
+            let (last, count, pending, buckets) = (&mut last[..=nkeep], &mut count[..=nkeep], &mut pending[..=nbits], &mut buckets[..]);
             for (at, &id) in toks.iter().enumerate() {
                 let i = (id as usize).min(nkeep);
                 if i.wrapping_sub(a0) < nkeep - a0 {
@@ -504,11 +530,14 @@ fn main() {
                         }
                     }
                 }
-                let new = std::mem::replace(&mut last[i], mark) != mark;
-                let list = new & (i.wrapping_sub(nbits) < lists - nbits);
-                pending[i.min(nbits)] |= (i < nbits) as u64 * bit;
-                buckets[i % BUCKETS].add(list, (i / BUCKETS) as u32, doc - first);
-                count[i] += list as u16;
+                // i <= nkeep, and the slices hold nkeep + 1 and nbits + 1.
+                unsafe {
+                    let new = std::mem::replace(last.get_unchecked_mut(i), mark) != mark;
+                    let list = new & (i.wrapping_sub(nbits) < lists - nbits);
+                    *pending.get_unchecked_mut(i.min(nbits)) |= (i < nbits) as u64 * bit;
+                    buckets.get_unchecked_mut(i % BUCKETS).add(list, (i / BUCKETS) as u32, off);
+                    *count.get_unchecked_mut(i) += list as u16;
+                }
             }
         });
         flush(&mut pending, block);
