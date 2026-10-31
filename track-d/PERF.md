@@ -75,6 +75,8 @@ Also measured and kept out at this step: dense per-thread distance arrays (no fa
 
 **Step 14 on the board.** run-71cc7da0e392: memory moved as measured, 66.9 MiB against 72.2 MiB for step 13 (run-a37efeaff341), and the box counted 475 lines against 486. Time did not: 0.196 s against 0.174 s, so K fell from 23.30 to 22.33. The same push ran Track A's unchanged code at 0.0334 s against its usual 0.0301 s, 11% slower, so the box was slow for this whole run, and D's 13% sits inside that. The laptop's interleaved rounds put the step at about 5% faster; the next board run of the same code is the check.
 
+**Step 14 again.** run-f857e2a4c4e2 (same Track D code, commit 2de9bb9): 0.183 s, 66.9 MiB, K 23.14, 68.22 points. The box was still slow: Track A's unchanged code measured 0.0344 s in the same run, 14% over its best, while D was 5% over step 13's best. Measured against what the box did to unchanged code, step 14 is faster and lighter; its K stays just under step 13's best run (23.30) because that run had a faster box. Kept.
+
 ## Tried and kept out
 
 - Level-synchronous parallel BFS (step 2): good order, too many barriers.
