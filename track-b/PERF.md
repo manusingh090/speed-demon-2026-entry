@@ -34,7 +34,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | run-b6f929f84526 | 0.237 | 69.1 | 68.03 |
 | 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | run-174007cb966d | 0.235 | 48.8 | 69.62 |
 | 29 | Scan output chunks carved from one region per thread instead of one mapping each, and handed back with `madvise` as the scatter reads them | run-4d450f87bdc1 | 0.232 | 49.7 | 69.62 |
-| 30 | Back to the code of step 28: step 29 bought no time on the box | pending | | | |
+| 30 | Back to the code of step 28: step 29 bought no time on the box | run-ac88f12be57d | 0.244 | 49.0 | 69.21 |
+| 31 | Two loops per document: tokens and lookups fill an id buffer, then the per-token work runs over it; a phrase is checked by comparing the buffer's ids around its anchor, so the text is never read twice | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -124,6 +125,19 @@ A different laptop this time: Intel Core Ultra 9 185H (6 P-cores with hyperthrea
 **Step 28 to 29.** `perf` on the laptop put the scan at 70% of all CPU and kernel time at 18% (25,600 page faults). Each 64 KB chunk of scan output was its own `Vec`, and at exactly the 64 KB mapping threshold set by `mallopt` that made each one an `mmap`, about 550 in the scan, each taking the address-space lock while the other threads were faulting in the corpus (the same pattern that cost Tracks A and D time today). Chunks are now carved in turn from one `MAP_NORESERVE` region per thread (sized for the worst case: a token adds at most two units and takes at least two bytes, plus one part-full chunk per bucket), and only written pages count. Freeing the whole region after the scatter took the peak from 50 to 68 MB, because the old chunks had gone back one by one while the postings filled; each chunk is now handed back with `MADV_DONTNEED` as soon as the scatter has read it, which keeps 50 MB. A persistent thread pool instead of a scope per phase was also measured and made no difference here. 11 alternating runs: median 230 against 242 ms, best 185 against 206 ms, 50 MB both; `perf stat -r 8` (three rounds) 0.197 to 0.205 s against 0.210 to 0.213 s for the arena alone. Same hash on full, sample, tiny, the worked example, the edge-case set and the seed-5 sample, and 15 repeated full runs gave one hash. rustfmt counts 620 lines against 603.
 
 **Step 29 on the board, and step 30.** run-4d450f87bdc1: 0.2317 s against 0.2312 s for step 28's code, 49.7 MiB, 628 counted lines, K 24.68 against 24.84. The laptop's 5% did not appear on the box: the contention it removed is the Docker VM's, whose page faults are far costlier than on the bare-metal box. With no time to show for 17 more lines, the code went back to step 28 (step 30).
+
+## Fourth session (Nov 1): where the scan's cycles go
+
+The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faults, 0.23 s of system time per run), so laptop wall time overstates anything that touches fresh memory. From here changes are judged by user-mode cycles and instructions (`perf stat -r 8`, two interleaved rounds), which carry over to the bare-metal box.
+
+**What the scan costs.** A variant whose per-token handler did nothing (tokens and lookups only, no postings, phrases or bitmaps) ran 3.2 billion instructions against 9.6 billion for the whole program. Switching off only the phrase checks saved 1.0 billion, only the posting writes 1.6 billion. An instruction-level profile showed the handler's time spread over stack loads and stores: the fused loop kept the tokenizer's prefetch ring, the phrase state, 32 output streams and the bitmap words live at once, more than the registers hold.
+
+**Step 31.** The loop is now split per document: tokens and lookups append ids to a small buffer that stays in L1, then a second loop does the per-token work over it. A phrase is checked by comparing the ids before and after its anchor in the buffer, so `around()` and its second pass over the text bytes are gone. The block check for bitmap words and the document's mark move out of the per-token loop, and a bitmap term's bit is set without the "new to this document" test (OR is idempotent). 8.92 billion instructions against 9.63, 4 to 7% fewer cycles, 36 fewer source lines, and the same hash on full, sample, tiny, the worked example, the edge cases and the seed-5 sample. A token of over 32 bytes now still counts as a token between two others, which matters for phrases.
+
+Measured and kept out this session:
+- A 256 KB table of the 8,192 most frequent short terms, looked up directly before the main table: branch misses doubled and the run was 30% slower, because a direct load breaks the 8-token prefetch pipeline.
+- One table of 16-byte entries (key and id together, CRC32 hash) for the terms of up to 12 bytes (99.8% of tokens): 14% fewer branches and 20% fewer cache misses, but only 3 to 6% fewer cycles for about 50 more lines; held back for now.
+- Keys and hashes computed for all query terms first, then inserted with the slot prefetched 16 terms ahead, and idle threads pre-faulting the corpus during the query parse: no faster, 12 MB more.
 
 ## What the profile said, step by step
 
