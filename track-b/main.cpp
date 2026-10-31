@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <barrier>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,12 +17,14 @@
 #include <malloc.h>
 #include <immintrin.h>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 #include <vector>
 
@@ -88,14 +91,13 @@ inline bool same(const Key& a, const Key& b) {
 // top 32 hash bits and id + 1, so most misses never touch the key array.
 class TermTable {
 public:
-    TermTable() { rehash(1 << 16); }
+    // Room for n keys at load 1/2 or less, so probe chains stay short.
+    explicit TermTable(size_t n) : slots_(std::bit_ceil(2 * n)), mask_(slots_.size() - 1) {}
     u32 size() const { return keys_.size(); }
     const uint8_t* bytes(u32 id) const { return reinterpret_cast<const uint8_t*>(keys_[id].w); }
     size_t length(u32 id) const { return lens_[id]; }
 
     u32 insert(const Key& k) {
-        // Keep the load at or under 1/2 so probe chains stay short.
-        if ((keys_.size() + 1) * 2 > slots_.size()) rehash(slots_.size() * 2);
         u64 h = hash_key(k);
         for (size_t i = h & mask_;; i = (i + 1) & mask_) {
             u64 s = slots_[i];
@@ -109,14 +111,18 @@ public:
         }
     }
 
-    // Old id i becomes new_id[i]; keys move with their ids.
-    void renumber(const std::vector<u32>& new_id) {
-        std::vector<Key> keys(keys_.size());
-        std::vector<uint8_t> lens(lens_.size());
-        for (u32 i = 0; i < keys_.size(); ++i) keys[new_id[i]] = keys_[i], lens[new_id[i]] = lens_[i];
+    // Old id i becomes new_id[i], under `space` (unused ids hold empty keys);
+    // the table shrinks to fit.
+    void renumber(const std::vector<u32>& new_id, size_t space) {
+        std::vector<Key> keys(space);
+        std::vector<uint8_t> lens(space);
+        const size_t n = keys_.size();
+        for (u32 i = 0; i < n; ++i) keys[new_id[i]] = keys_[i], lens[new_id[i]] = lens_[i];
         keys_.swap(keys);
         lens_.swap(lens);
-        rehash(slots_.size());
+        slots_ = std::vector<u64>(std::bit_ceil(2 * n));  // a new, smaller buffer
+        mask_ = slots_.size() - 1;
+        for (u32 i = 0; i < n; ++i) place(new_id[i]);
     }
 
     void prefetch(u64 h) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[h & mask_]), _MM_HINT_T0); }
@@ -131,15 +137,11 @@ public:
     }
 
 private:
-    void rehash(size_t cap) {
-        slots_.assign(cap, 0);
-        mask_ = cap - 1;
-        for (u32 id = 0; id < keys_.size(); ++id) {
-            u64 h = hash_key(keys_[id]);
-            size_t i = h & mask_;
-            while (slots_[i]) i = (i + 1) & mask_;
-            slots_[i] = (h & 0xFFFFFFFF00000000ull) | (id + 1);
-        }
+    void place(u32 id) {
+        u64 h = hash_key(keys_[id]);
+        size_t i = h & mask_;
+        while (slots_[i]) i = (i + 1) & mask_;
+        slots_[i] = (h & 0xFFFFFFFF00000000ull) | (id + 1);
     }
 
     std::vector<u64> slots_;
@@ -275,15 +277,14 @@ struct Index {
     u32 docs = 0;
     size_t words = 0;             // u64 words per bitmap
     std::vector<u32> dense;       // per term: its bitmap number, or NONE for a list
-    std::vector<u64> bits;        // the bitmaps, `words` each
+    u64* bits = nullptr;          // the bitmaps, `words` each
     std::vector<u32> df;          // per term: number of documents containing it
-    // A list term's documents are stored per thread, in thread order: thread t's
-    // segment holds doc - first[t] as 16 bits (a thread covers far fewer than
-    // 65,536 documents), so each posting takes two bytes.
+    // A list term's documents are stored per thread: thread t's segment,
+    // post[seg[t][id], seg[t][id + 1]), holds doc - first[t] as 16 bits (a
+    // thread covers far fewer than 65,536 documents), two bytes a posting.
     int threads = 0;
-    std::vector<u32> first;            // per thread: its first doc id
-    std::vector<u32> start;            // per term, offset into post; start[n] is the total
-    std::vector<std::vector<u32>> seg_end;  // per thread, per term: where its segment ends
+    std::vector<u32> first;                 // per thread: its first doc id
+    std::vector<std::vector<u32>> seg;      // per thread: term + 1 offsets into post
     std::unique_ptr<uint16_t[]> post;  // doc offsets, ascending within each segment
     std::vector<u32> text;             // per doc: file offset of its text
     // Phrase anchors (the rarest term of a phrase, when it is rare) keep the
@@ -363,9 +364,7 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
     ix.first.resize(nthreads);
     ix.text.resize(ix.docs);
     ix.words = (ix.docs + 63) / 64;
-    ix.dense.assign(nterms, NONE);
-    u32 nanchors = 0;
-    const u32 nbuckets = (nterms >> BUCKET_BITS) + 1;
+    u32 nanchors = 0, space = nterms, nbuckets = 1;
 
     // Each thread takes a byte range snapped to line starts. It first samples
     // the start of its range so the dense terms can be picked, then scans it all:
@@ -380,22 +379,21 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
     std::vector<std::vector<BlockList>> seen(nthreads);
     std::vector<std::vector<u32>> count(nthreads), acount(nthreads);
     std::vector<std::vector<std::pair<u32, u32>>> hits(nthreads);  // (anchor, offset)
-    std::vector<u32> sampled(nthreads);
+    std::vector<u32> sampled(nthreads), totals(nthreads);
     // After the sample: pick the phrase anchors (a phrase's rarest term in the
     // sample, if it is in under 1/200 of the documents) and number them last,
-    // so the scan tells them apart by id alone. Renumber the rest by sampled
-    // frequency, most frequent first (the scan's per-term state for common
-    // terms then shares a few cache lines), and make the terms over 1/32 of
-    // the sample bitmaps.
+    // so the scan tells them apart by id alone. Deal the other terms out by
+    // sampled frequency, most frequent first, round-robin over the buckets of
+    // the scan output: every bucket then holds a similar share of the postings
+    // (so the scatter never holds one large bucket twice over), and the
+    // per-term state of common terms still shares a few cache lines at each
+    // bucket's start. Terms over 1/32 of the sample become bitmaps.
     std::barrier sync(nthreads, [&]() noexcept {
         u64 docs = 0;
         for (u32 s : sampled) docs += s;
         std::vector<u64> df(nterms);
-        std::vector<u32> order(nterms), new_id(nterms);
-        for (u32 id = 0; id < nterms; ++id) {
-            for (int t = 0; t < nthreads; ++t) df[id] += count[t][id];
-            order[id] = id;
-        }
+        for (auto& c : count)
+            for (u32 id = 0; id < nterms; ++id) df[id] += c[id];
         std::vector<bool> anchor(nterms);
         for (size_t i = 0; i < qs.size(); ++i) {
             if (!qs.phrase[i]) continue;
@@ -403,17 +401,28 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             u32 a = *std::min_element(q.terms.begin(), q.terms.end(), [&](u32 x, u32 y) { return df[x] < df[y]; });
             if (df[a] * 200 <= docs && !anchor[a]) anchor[a] = true, ++nanchors;
         }
-        std::stable_sort(order.begin(), order.end(),
-                         [&](u32 a, u32 b) { return anchor[a] != anchor[b] ? anchor[b] : df[a] > df[b]; });
-        ix.anchors = nterms - nanchors;
+        // Sort keys: anchors last, then most frequent first, then old id.
+        std::vector<u64> order(nterms);
+        for (u32 id = 0; id < nterms; ++id)
+            order[id] = u64(anchor[id]) << 63 | (UINT32_MAX - std::min<u64>(df[id], UINT32_MAX)) << 24 | id;
+        std::sort(order.begin(), order.end());
+        const u32 lists = nterms - nanchors;
+        nbuckets = std::max(1u, (lists + (1u << BUCKET_BITS) - 1) >> BUCKET_BITS);
+        ix.anchors = nbuckets << BUCKET_BITS;
+        space = ix.anchors + nanchors;
+        ix.dense.assign(space, NONE);
+        std::vector<u32> new_id(nterms);
         u32 ndense = 0;
         for (u32 rank = 0; rank < nterms; ++rank) {
-            new_id[order[rank]] = rank;
-            if (rank < ix.anchors && df[order[rank]] * 32 > docs) ix.dense[rank] = ndense++;
+            const u32 id = order[rank] & 0xFFFFFF;
+            new_id[id] = rank < lists ? (rank % nbuckets) << BUCKET_BITS | rank / nbuckets : ix.anchors + rank - lists;
+            if (rank < lists && df[id] * 32 > docs) ix.dense[new_id[id]] = ndense++;
         }
-        terms.renumber(new_id);
+        terms.renumber(new_id, space);
         for (u32& id : qs.terms) id = new_id[id];
-        ix.bits.assign(ndense * ix.words, 0);
+        // Straight from the kernel: zero pages, touched only as the scan sets bits.
+        ix.bits = static_cast<u64*>(mmap(nullptr, std::max<size_t>(ndense * ix.words, 1) * 8, PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     });
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
@@ -446,8 +455,8 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
 
             sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, u32) { ++cnt[id]; }, [](u32, u32) {});
             sync.arrive_and_wait();
-            std::fill(cnt.begin(), cnt.end(), 0);
-            std::fill(last_doc.begin(), last_doc.end(), NONE);
+            cnt.assign(space + 1, 0);  // term id + 1: list postings
+            last_doc.assign(space, NONE);
             acount[t].assign(nanchors, 0);
             auto& out = seen[t];
             out.resize(nbuckets);
@@ -462,32 +471,20 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
                     prev[b] = off;
                     out[b].push((id & ((1u << BUCKET_BITS) - 1)) << GAP_BITS | std::min(gap, GAP));
                     if (gap >= GAP) out[b].push(gap);
-                    ++cnt[id];
+                    ++cnt[id + 1];
                 }
             }, [&](u32 a, u32 offset) {
                 hits[t].push_back({a, offset});
                 ++acount[t][a];
             });
             if (docs >> DOC_BITS) { fputs("too many documents per thread\n", stderr); _exit(1); }
+            totals[t] = std::accumulate(cnt.begin(), cnt.end(), 0u);
         });
     }
     for (auto& th : pool) th.join();
     pool.clear();
 
-    // Turn the per-thread counts into write cursors. Threads cover ascending doc
-    // ranges, so laying them out in thread order keeps every list sorted.
-    ix.start.resize(nterms + 1);
-    u32 total = 0;
-    for (u32 id = 0; id < nterms; ++id) {
-        ix.start[id] = total;
-        for (int t = 0; t < nthreads; ++t) {
-            u32 c = count[t][id];
-            count[t][id] = total;
-            total += c;
-        }
-    }
-    ix.start[nterms] = total;
-    ix.post.reset(new uint16_t[total]);  // not zeroed: every slot is written below
+    ix.post.reset(new uint16_t[std::accumulate(totals.begin(), totals.end(), 0u)]);  // every slot is written below
     ix.at_start.resize(nanchors + 1);
     u32 nat = 0;
     for (u32 a = 0; a < nanchors; ++a) {
@@ -500,13 +497,15 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
     }
     ix.at_start[nanchors] = nat;
     ix.at.resize(nat);
-    // Each thread drains its own lists bucket by bucket into its own segment of
-    // every term, so the threads never share a cursor. The cursors end at the
-    // segment ends, which the queries use to decode the lists.
+    // Each thread's lists take their own region of post, in thread order, so a
+    // thread writes only pages its own scan output is giving back. Its counts
+    // become write cursors there, and end as the segment bounds the queries use.
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&, t] {
             for (auto [a, offset] : hits[t]) ix.at[acount[t][a]++] = offset;
             std::vector<std::pair<u32, u32>>().swap(hits[t]);
+            u32 pos = std::accumulate(totals.begin(), totals.begin() + t, 0u);
+            for (u32& c : count[t]) pos += std::exchange(c, pos);
             for (u32 b = 0; b < nbuckets; ++b) {
                 u32 doc = 0, id = 0;
                 bool wide = false;  // the next unit is a whole gap
@@ -518,21 +517,21 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
                     } else {
                         doc += x, wide = false;
                     }
-                    ix.post[count[t][id]++] = doc;
+                    ix.post[count[t][id + 1]++] = doc;
                 });
             }
         });
     }
     for (auto& th : pool) th.join();
-    ix.seg_end = std::move(count);
+    ix.seg = std::move(count);
 
-    ix.df.resize(nterms);
-    for (u32 id = 0; id < nterms; ++id) {
-        ix.df[id] = ix.start[id + 1] - ix.start[id];
+    // Documents per term, to order a phrase's terms (a bitmap counts as all).
+    ix.df.assign(space, 0);
+    for (auto& s : ix.seg)
+        for (u32 id = 0; id < space; ++id) ix.df[id] += s[id + 1] - s[id];
+    for (u32 id = 0; id < space; ++id) {
         if (u32 a = ix.anchor(id); a != NONE) ix.df[id] = ix.at_start[a + 1] - ix.at_start[a];  // occurrences
-        if (ix.dense[id] != NONE)
-            for (size_t w = 0; w < ix.words; ++w)
-                ix.df[id] += __builtin_popcountll(ix.bits[ix.dense[id] * ix.words + w]);
+        if (ix.dense[id] != NONE) ix.df[id] = ix.docs;
     }
     return ix;
 }
@@ -642,14 +641,14 @@ private:
     Postings postings(u32 id) {
         if (u32 d = ix_.dense[id]; d != NONE) return {nullptr, ix_.df[id], &ix_.bits[d * ix_.words], ix_.words};
         list_.resize(ix_.df[id]);
-        u32 i = ix_.start[id], n = 0;
+        u32 n = 0;
         if (u32 a = ix_.anchor(id); a != NONE) {
             for (u32 k = ix_.at_start[a]; k < ix_.at_start[a + 1]; ++k)
                 if (u32 doc = ix_.doc_of(ix_.at[k]); n == 0 || list_[n - 1] != doc) list_[n++] = doc;
             return {list_.data(), n, nullptr, ix_.words};
         }
         for (int t = 0; t < ix_.threads; ++t)
-            for (u32 e = ix_.seg_end[t][id]; i < e; ++i) list_[n++] = ix_.first[t] + ix_.post[i];
+            for (u32 i = ix_.seg[t][id]; i < ix_.seg[t][id + 1]; ++i) list_[n++] = ix_.first[t] + ix_.post[i];
         return {list_.data(), n, nullptr, ix_.words};
     }
 
@@ -852,34 +851,32 @@ int main() {
     File qf = map_file("/data/queries.txt");
     File df = map_file("/data/docs.txt");
 
-    TermTable terms;
+    // Every term ends at a space or a LF, so their count bounds the terms.
+    TermTable terms(std::count(qf.data, qf.data + qf.size, ' ') + std::count(qf.data, qf.data + qf.size, '\n') + 1);
     Queries queries = parse_queries(qf, terms);
     Index ix = build_index(df, terms, queries, nthreads);
 
-    // Answer queries in parallel; each result goes to its own fixed-size slot
-    // (the longest line is 6 + 12 + 10 * 7 digits and spaces, well under 128).
-    constexpr int SLOT = 128;
-    const size_t nq = queries.size();
-    std::vector<char> slots(nq * SLOT);
-    std::vector<uint8_t> lens(nq);
+    // Answer queries in parallel, CHUNK at a time; each chunk's lines go to its
+    // own buffer (a line is at most 6 + 12 + 10 * 7 digits and spaces).
+    constexpr size_t CHUNK = 64;
+    const size_t nq = queries.size(), nchunks = (nq + CHUNK - 1) / CHUNK;
+    std::vector<std::string> chunks(nchunks);
     std::atomic<size_t> next{0};
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t) {
         pool.emplace_back([&] {
             Solver solver(ix, terms, df);
-            for (size_t i; (i = next.fetch_add(16)) < nq;)
-                for (size_t j = i; j < std::min(nq, i + 16); ++j)
-                    lens[j] = solver.answer(queries[j], &slots[j * SLOT]);
+            char line[128];
+            for (size_t c; (c = next++) < nchunks;)
+                for (size_t j = c * CHUNK; j < std::min(nq, (c + 1) * CHUNK); ++j)
+                    chunks[c].append(line, solver.answer(queries[j], line));
         });
     }
     for (auto& th : pool) th.join();
 
-    std::string out;
-    out.reserve(nq * 32);
-    for (size_t i = 0; i < nq; ++i) out.append(&slots[i * SLOT], lens[i]);
     FILE* f = fopen("/out/results.txt", "wb");
     if (!f) { perror("/out/results.txt"); return 1; }
-    fwrite(out.data(), 1, out.size(), f);
+    for (const std::string& c : chunks) fwrite(c.data(), 1, c.size(), f);
     fclose(f);
     return 0;
 }

@@ -19,6 +19,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | malloc mmap threshold pinned, so freed scan state really goes back | run-5c032275f3b6 | 0.301 | 175 | 60.5 |
 | 13 | Transparent huge pages off (the box backed partly written blocks with whole 2 MB pages) | run-e6924d8063c9 | 0.292 | 69.6 | 64.8 |
 | 14 | Scan output as 16-bit units: term offset in its bucket and a 7-bit doc gap, with an escape for larger gaps | run-443f9c5c3311 | 0.290 | 59 | 65.56 |
+| 15 | Scan output buckets of 2,048 terms (37 write streams per thread instead of 148) | run-060e2570f6d3 | 0.279 | 59.5 | 65.94 |
+| 16 | Phrase anchors: the rarest term keeps its occurrences' file offsets, and a phrase is checked in place at each one | run-f9bbc8a6c0fa | 0.268 | 61.9 | 65.94 |
+| 17 | Terms dealt round-robin over the scan buckets, per-thread posting regions, bitmaps from zero pages, term table sized up front, output in chunk buffers | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -83,3 +86,17 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | b4606d2 | run-e6924d8063c9 | 0.2918 | 69.6 | 19.82 | 64.85 | Step 13: transparent huge pages off; the box now matches the laptop |
 | c451b56 | run-83b833e14e8a | 0.2895 | 70.2 | 19.86 | 64.9 | Same Track B code |
 | 5a6463e | run-03115bd4e2c1 | 0.2887 | 70.2 | 19.89 | 64.93 | Same Track B code |
+
+## Step 16: phrase anchors
+
+A phase profile of step 15 (timestamps between phases, laptop, full data) put phrase verification at about 57 ms per thread in the query phase: about 210,000 candidate documents were rescanned for 19,000 phrases, close to rereading the corpus. Every phrase's rarest term in the sample is now its anchor when it is in under 1/200 of documents (on the full data all 18,006 anchors have df at most 1,071 and occur 835,000 times in all). Anchors are numbered after every other term, so the scan recognises one by its id alone, and it records the file offset of each occurrence (3.5 MB in all) instead of a document list. A phrase is checked only at its anchor's occurrences, walking the neighbouring tokens back and forward up to the document's TAB and LF; the document id comes from a binary search of the documents' text offsets. Phrase work per thread fell from about 57 ms to about 14 ms. A first version looked up each token's anchor number in a per-term array and made the scan slower; numbering the anchors last removed that lookup. On the box: 0.279 to 0.268 s, but 2.5 MB and 73 lines more, so the points stayed level (65.94).
+
+## Step 17: memory back down, serial work out
+
+Cgroup `memory.peak` read between phases showed where step 16's peak came from:
+
+- The scatter of bucket 0. Ids were numbered by frequency, so bucket 0 held the hottest lists, and its postings touched its whole region of the lists before its scan output was freed: about 8 MB above the end of the scan. Terms are now dealt round-robin over the buckets by frequency rank, so every bucket carries a similar share.
+- The answers: fixed 128-byte slots for 50,000 queries (6.4 MB) plus a copy (1.5 MB), alive at the very end. Each chunk of 64 queries now writes into its own buffer.
+- The term table kept its parse-time capacity (`vector::assign` to a smaller size keeps the buffer); it is now reallocated when the terms are renumbered.
+
+Serial work went too: the bitmaps come from zero pages (`mmap`) instead of a 12 MB memset at the barrier, the renumbering sorts packed 64-bit keys, the term table is sized from the query file so parsing never rehashes, and each thread's lists take their own region of the posting array, so each thread turns its own counts into cursors and the 9 ms serial cursor pass is gone. Laptop: peak 64 to 59 MB, same speed; same output on full, sample, tiny, the worked example and a seed-5 sample.
