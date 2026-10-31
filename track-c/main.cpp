@@ -38,18 +38,25 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
 
-// Zero-filled anonymous memory; pages are charged only once touched. A table
-// that every thread writes all over is populated up front instead: faulting
+// Zero-filled anonymous memory; pages are charged only once touched.
+template <class T>
+T* zeroed(size_t n) {
+    void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
+    return static_cast<T*>(p);
+}
+
+// A table that every thread writes all over is populated up front: faulting
 // it in page by page from twelve threads at once made the threads queue on
 // the kernel's page-table locks (about 12% of all cycles), and each page was
 // faulted twice, once on its first read (the shared zero page) and again on
-// its first write.
+// its first write. Thread t of n populates its share of the n pieces in one
+// call, so the work is spread too. (Without MADV_POPULATE_WRITE the pages
+// are simply faulted in later.)
 template <class T>
-T* zeroed(size_t n, bool populate = false) {
-    void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | (populate ? MAP_POPULATE : 0), -1, 0);
-    if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
-    return static_cast<T*>(p);
+void populate_share(T* p, size_t n, int t, int nthreads) {
+    const size_t pages = (n * sizeof(T) + 4095) / 4096, from = pages * t / nthreads, to = pages * (t + 1) / nthreads;
+    if (to > from) madvise(reinterpret_cast<char*>(p) + from * 4096, (to - from) * 4096, MADV_POPULATE_WRITE);
 }
 
 // Map a file over a spare zero page, so 64-byte loads past its end are safe.
@@ -130,83 +137,60 @@ private:
 
 // Names, interned by their raw bytes between the quotes. Escaping is one to
 // one, so equal raw bytes mean equal values (and the empty name is one value
-// whether quoted or not). Probing runs over an array of 16-bit hash tags small
-// enough to stay in L2; each tag guards a half-cache-line slot holding the id,
-// the length and the first 24 bytes of the name (the rest of a longer name
-// goes to an arena). So a lookup touches one slot line, and that line can be
-// prefetched as soon as the tag is found. A thread claims an empty slot by
-// swapping its tag from 0 to BUSY, fills the slot and then publishes the tag;
-// readers wait out BUSY. After its first sight a name is only ever read.
+// whether quoted or not). A name's 16-byte key is its bytes, zero padded,
+// which is exact for names of up to 16 bytes (no name holds a zero byte). A
+// longer name keeps its first 8 bytes and a 63-bit hash of the rest, flagged
+// by the top bit, which no ASCII byte sets: two names would have to share
+// their first 8 bytes and that hash to be confused. The empty name is the key
+// {0, top bit}. A key's slot in the open-addressed table is the name's id. A
+// slot is claimed with a 16-byte compare-and-swap and read with one aligned
+// 16-byte load, so a reader always sees it empty or whole.
 class NameTable {
 public:
-    static constexpr u32 SLOTS = 1 << 17, IDS = 1 << 17, HEAD = 24;  // pool: 100,000
+    static constexpr u32 BITS = 17, SLOTS = 1 << BITS;  // the pool holds 100,000 names
+    static constexpr u64 FLAG = u64(1) << 63;
 
-    struct Probe {
-        u32 slot;
-        u16 tag;
-    };
-
-    // Hash the name and find the first slot that holds its tag or is free.
-    Probe probe(const char* s, u32 len) const {
+    static __m128i key(const char* s, u32 len) {
+        static constexpr char KEEP[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+        __m128i head = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+        head = _mm_and_si128(head, _mm_loadu_si128(reinterpret_cast<const __m128i*>(KEEP + 16 - std::min(len, 16u))));
+        if (len == 0) return _mm_set_epi64x(FLAG, 0);
+        if (len <= 16) return head;
         u64 h = len;
-        for (u32 i = 0; i < len; i += 8) {
+        for (u32 i = 8; i < len; i += 8) {
             u64 w = load8(s + i);
             if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
             h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+            h ^= h >> 32;
         }
-        Probe p{u32(h >> 20) % SLOTS, u16(1 + (h >> 48) % (BUSY - 1))};
-        for (u16 t; (t = tags_[p.slot].load(std::memory_order_relaxed)) && t != p.tag && t != BUSY;)
-            p.slot = (p.slot + 1) % SLOTS;
-        _mm_prefetch(reinterpret_cast<const char*>(&slots_[p.slot]), _MM_HINT_T0);
-        return p;
+        return _mm_set_epi64x(h | FLAG, _mm_cvtsi128_si64(head));
     }
 
-    u32 id(const char* s, u32 len, Probe p) {
-        for (u32 i = p.slot;; i = (i + 1) % SLOTS) {
-            u16 t = tags_[i].load(std::memory_order_acquire);
-            if (t == 0 && tags_[i].compare_exchange_strong(t, BUSY, std::memory_order_acquire)) {
-                Slot& slot = slots_[i];
-                slot.id = next_id_++;
-                slot.len = len;
-                if (slot.id >= IDS) { fputs("too many names\n", stderr); _exit(1); }
-                memcpy(slot.head, s, std::min(len, HEAD));
-                if (len > HEAD) {
-                    overflow_[i] = used_.fetch_add(len - HEAD);
-                    memcpy(arena_ + overflow_[i], s + HEAD, len - HEAD);
-                }
-                tags_[i].store(p.tag, std::memory_order_release);
-                return slot.id;
+    static u32 home(__m128i k) {
+        u64 h = u64(_mm_cvtsi128_si64(k)) * 0x9E3779B97F4A7C15ull ^ u64(_mm_extract_epi64(k, 1)) * 0xBF58476D1CE4E5B9ull;
+        return h >> (64 - BITS);
+    }
+
+    void prefetch(__m128i k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[home(k)]), _MM_HINT_T0); }
+
+    u32 id(__m128i k) {
+        for (u32 i = home(k);; i = (i + 1) % SLOTS) {
+            __m128i s = _mm_load_si128(&slots_[i]);
+            if (_mm_testz_si128(s, s)) {
+                unsigned __int128 want;
+                memcpy(&want, &k, 16);
+                if (__sync_bool_compare_and_swap(reinterpret_cast<unsigned __int128*>(&slots_[i]), 0, want)) return i;
+                s = _mm_load_si128(&slots_[i]);  // another thread took it first
             }
-            while (t == BUSY) t = tags_[i].load(std::memory_order_acquire);
-            const Slot& slot = slots_[i];
-            if (t == p.tag && slot.len == len && same_head(slot, s, len) &&
-                (len <= HEAD || memcmp(arena_ + overflow_[i], s + HEAD, len - HEAD) == 0))
-                return slot.id;
+            if (_mm_movemask_epi8(_mm_cmpeq_epi8(s, k)) == 0xFFFF) return i;
         }
     }
+
+    // Each of n threads populates its share up front (see zeroed).
+    void populate(int t, int n) const { populate_share(slots_, SLOTS, t, n); }
 
 private:
-    static constexpr u16 BUSY = 0xFFFF;
-    struct alignas(32) Slot {
-        u32 id, len;
-        char head[HEAD];
-    };
-
-    // The slot's stored head equals the name's first min(len, HEAD) bytes. One
-    // 32-byte compare: the whole slot against the 32 bytes from 8 before the
-    // name (always inside the record), keeping the bits for the head bytes.
-    static bool same_head(const Slot& slot, const char* s, u32 len) {
-        __m256i a = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slot));
-        __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s - 8));
-        u32 equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
-        u32 want = ((u64(1) << std::min(len, HEAD)) - 1) << 8;
-        return (equal & want) == want;
-    }
-    std::atomic<u16>* tags_ = zeroed<std::atomic<u16>>(SLOTS, true);  // 0 = free
-    Slot* slots_ = zeroed<Slot>(SLOTS, true);
-    u32* overflow_ = zeroed<u32>(SLOTS);  // arena offset of a long name's tail
-    char* arena_ = zeroed<char>(64 << 20);
-    std::atomic<u32> used_{0}, next_id_{0};
+    __m128i* slots_ = zeroed<__m128i>(SLOTS);  // all zero = free
 };
 
 // One country's running aggregates (per thread, summed at the end).
@@ -218,8 +202,8 @@ struct Totals {
 // Which names each country has: one bitset over name ids per country, shared
 // by all threads. Most marks are first sightings, so they are atomic ORs.
 struct NamesSeen {
-    static constexpr u32 WORDS = NameTable::IDS / 64;
-    std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS, true);
+    static constexpr u32 WORDS = NameTable::SLOTS / 64;
+    std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS);
 
     std::atomic<u64>& word(u32 c, u32 name) { return bits[c * WORDS + name / 64]; }
 
@@ -251,9 +235,8 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
                    size_t regions, NameTable& names, NamesSeen& seen, Totals* totals) {
     constexpr u64 LAG = 16;
     struct Pending {
-        const char* name;
-        u32 len, region, id, name_bytes, note_bytes;
-        NameTable::Probe probe;
+        __m128i name;
+        u32 region, id, name_bytes, note_bytes;
         i64 cents;
     } pending[LAG];
     struct Mark {
@@ -274,7 +257,7 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
             t.amount_max = std::max(t.amount_max, old.cents);
             t.name_bytes += old.name_bytes;
             t.note_bytes += old.note_bytes;
-            marks[k] = {c, names.id(old.name, old.len, old.probe)};
+            marks[k] = {c, names.id(old.name)};
             seen.prefetch(c, marks[k].id);
         }
     };
@@ -302,9 +285,9 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         bool quoted = name_quotes != 0;
         advance();
         Pending& next = pending[n++ % LAG];
-        next = {f1 + 1 + quoted, u32(f2 - f1 - 1 - 2 * quoted), r, u32(id),
-                text_length(f1 + 1, f2, name_quotes), text_length(f2 + 1, f3, q3 - q2), {}, cents};
-        next.probe = names.probe(next.name, next.len);
+        next = {NameTable::key(f1 + 1 + quoted, u32(f2 - f1 - 1 - 2 * quoted)), r, u32(id),
+                text_length(f1 + 1, f2, name_quotes), text_length(f2 + 1, f3, q3 - q2), cents};
+        names.prefetch(next.name);
         p = eol + 1;
     }
     for (last = n; n < last + 2 * LAG; ++n) advance();
@@ -345,7 +328,7 @@ int main() {
     // the last line holds the largest id.
     const char* last = static_cast<const char*>(memrchr(regions, '\n', rsize - 1)) + 1;
     const size_t nregions = atoll(last) + 1;
-    u8* country_of = zeroed<u8>(nregions, true);  // 0 = no such region
+    u8* country_of = zeroed<u8>(nregions);  // 0 = no such region
     std::vector<size_t> rcut = split(regions, strchr(regions, '\n') - regions + 1, rsize, nthreads, "\n");
     std::vector<std::atomic<u8>> present(1 << 15);
     std::array<u8, 1 << 15> index_of{};
@@ -374,9 +357,12 @@ int main() {
         pool.emplace_back([&, t] {
             const char* from = regions + rcut[t];
             const char* to = regions + rcut[t + 1];
+            populate_share(country_of, nregions, t, nthreads);
+            names.populate(t, nthreads);
             for (const char* p = from; p < to; p = strchr(p, '\n') + 1)
                 present[code(strchr(p, ',') + 1)].store(1, std::memory_order_relaxed);
             sync.arrive_and_wait();
+            populate_share(seen.bits, (codes.size() + 1) * NamesSeen::WORDS, t, nthreads);
             for (const char* p = from; p < to; p = strchr(p, '\n') + 1) {
                 const char* comma = strchr(p, ',');
                 country_of[digits(p, comma)] = index_of[code(comma + 1)];
