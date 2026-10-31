@@ -115,7 +115,7 @@ struct Names {
     static constexpr u32 SLOTS = 1 << 12, ARENA = SLOTS * 128;  // a seed has 1,842
     std::atomic<u64> slot[SLOTS];  // length << 32 | arena offset, 0 if free
     std::atomic<u32> used{0};
-    char arena[ARENA + 32];  // 32 spare bytes keep the last compare in bounds
+    char arena[ARENA + 64];  // 64 spare bytes keep the last compare in bounds
 
     std::string_view name(u64 v) const { return {arena + u32(v), size_t(v >> 32)}; }
 
@@ -137,14 +137,13 @@ struct Names {
         _exit(2);  // more names than slots
     }
 
-    // 32 bytes can always be read from either name (the rest of the line and
+    // 64 bytes can always be read from either name (the rest of the line and
     // the spare page follow one, the arena's spare bytes the other), so a name
-    // of up to 32 bytes is compared in one step instead of a memcmp call.
+    // of up to 64 bytes (94% of lines) is compared in two steps, not memcmp.
     static bool same(std::string_view x, std::string_view s) {
-        if (x.size() != s.size() || s.size() > 32) return x == s;
-        auto v = [](auto p) { return _mm256_loadu_si256((const __m256i*)p); };
-        u32 eq = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v(x.data()), v(s.data())));
-        return (~eq & (~0u >> (32 - s.size()))) == 0;
+        if (x.size() != s.size() || s.size() > 64) return x == s;
+        auto eq = [&](int i) { return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(x.data() + i)), _mm256_loadu_si256((const __m256i*)(s.data() + i))))); };
+        return (~(eq(0) | u64(eq(32)) << 32) & (~u64(0) >> (64 - s.size()))) == 0;
     }
 };
 static Names endpoints;  // zero pages until written
@@ -252,7 +251,13 @@ int main() {
     std::vector<Parser> parsers(nt);
     std::vector<std::string_view> names;
     std::vector<u32> rank(Names::SLOTS);  // endpoint id -> rank
+    u32 most = 0;  // records in the largest hour
     std::barrier ranked(nt, [&]() noexcept {
+        for (int h = 0; h < HOURS; ++h) {
+            u32 n = 0;
+            for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32, u32, u32) { ++n; });
+            most = std::max(most, n);
+        }
         std::vector<std::pair<std::string_view, u32>> by_name;
         for (u32 id = 0; id < Names::SLOTS; ++id)
             if (u64 v = endpoints.slot[id]) by_name.push_back({endpoints.name(v), id});
@@ -293,7 +298,9 @@ int main() {
 
         {  // the scratch goes before the text phase, where the output counts
         const u32 ne = names.size();
-        std::vector<u32> start(ne + 1), errors(ne), latency;
+        // Sized once: a buffer that grows is remapped, which stalls every
+        // thread's page faults.
+        std::vector<u32> start(ne + 1), errors(ne), latency(most);
         for (int h; (h = claim++) < HOURS;) {
             // Counting sort of the hour's latencies by endpoint rank: count into
             // start[e + 1], prefix, then place each latency at its group's cursor.
@@ -301,7 +308,6 @@ int main() {
             std::fill(errors.begin(), errors.end(), 0);
             for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32 e, u32 err, u32) { ++start[e + 1], errors[e] += err != 0; });
             for (u32 e = 0; e < ne; ++e) start[e + 1] += start[e];
-            latency.resize(start[ne]);
             std::vector<u32> cursor(start.begin(), start.end() - 1);
             for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32 e, u32, u32 l) { latency[cursor[e]++] = l; });
             finished[h] = true;
