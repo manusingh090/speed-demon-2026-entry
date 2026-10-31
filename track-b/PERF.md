@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | Each term's postings in one stretch (12 segment lengths per term), laid out by all threads; doc lookup by page | pending | | | |
 | 20 | Bitmap terms numbered first; each thread collects a term's bits per 64 documents and ORs them in once | pending | | | |
 | 21 | Phrases checked by the scan at their anchor's occurrences, while the text is in cache; anchors keep doc lists for BOOL | pending | | | |
+| 22 | Per-thread last-document marks and counts as 16-bit offsets; write cursors rebuilt per bucket, so the counts go before the scatter | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -67,12 +68,17 @@ The laptop is an AMD Ryzen 7 7840HS under WSL2 and Docker's `--cpus=12` is a CPU
 
 **Step 21.** Anchored phrases cost about 15 ms per thread at query time: about 70,000 anchor occurrences per thread, each a random read into the 254 MB corpus. They are now checked by the scan at every occurrence of their anchor, while the text is in L1, and each match is kept as a (query, document) pair; the query phase only reads them back. The anchors become ordinary list terms in buckets of their own, for BOOL queries that use them, so the occurrence offsets (3.3 MB), their per-thread buffers (6.7 MB at the end of the scan) and the offset-to-document lookup are gone. Peak 61 to 56 MB; queries about 35 to 24 ms per thread.
 
+**Step 22.** The per-thread scan state was 32-bit: the last document each term was seen in and its document count, about 400 KB each per thread. Both fit in 16 bits (a thread covers fewer than 32,768 documents). The counts were also kept through the scatter as write cursors; the cursors are now rebuilt for each bucket from the term starts and segment lengths in an 8 KB array, so the counts are freed before the scatter. Peak 56 to 53 MB, same speed.
+
 **Measured and dropped in this session:**
 - Keys built with one 16-byte SIMD load and a length mask, or with `bzhi`, and a two-word lookup for tokens up to 16 bytes: 4 to 9% more instructions and the same cycles. The four-word build compiles well already.
 - Forcing the per-token handler inline (GCC left it out of line): more instructions, no fewer cycles.
 - One 8-byte entry per term for the last document and the count, instead of two arrays: no change.
 - A second prefetch stage (read the slot four tokens after prefetching it, then prefetch the key and the term's scan state): 7% more cycles.
 - The term table and keys on 2 MB pages (`MADV_HUGEPAGE`): no change, so the lookups are not TLB bound.
+- Binary search of a list term's segments instead of decoding it, for AND and NOT against a small running result: 160M fewer instructions, the same cycles (the searches miss cache where the decode streams).
+- Prefetching only the key of each token's home slot, four tokens ahead: more cycles.
+- A 1/64 sample instead of 1/32: no clear change.
 - Terms that occur only in phrases kept no lists: only 5.5% of list postings at full scale (625,000 of 11.3M), not worth the code.
 
 ## What the profile said, step by step

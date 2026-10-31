@@ -437,7 +437,7 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
         cut[t] = c;
     }
     std::vector<std::vector<BlockList>> seen(nthreads);
-    std::vector<std::vector<u32>> count(nthreads);
+    std::vector<std::vector<uint16_t>> count(nthreads);  // per thread: documents per term
     std::vector<u32> by_anchor_start;                     // per anchor: offset into by_anchor
     std::vector<std::pair<u32, u32>> by_anchor;           // (query, anchor position)
     std::vector<std::vector<std::pair<u32, u32>>> found(nthreads);  // (query, doc) matches
@@ -511,7 +511,7 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             const u32 first = ix.first[t] = begin < end ? parse_id(begin) : 0;
             auto& cnt = count[t];
             cnt.assign(nterms, 0);
-            std::vector<u32> last_doc(nterms, NONE);
+            std::vector<uint16_t> last_doc(nterms, UINT16_MAX);  // per term: offset of its last doc
 
             // Calls f(id, start, doc) for every token of each document in
             // [begin, stop). Returns the document count.
@@ -528,11 +528,11 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             };
 
             sampled[t] = walk(begin + (end - begin) / 32, [&](u32 id, const uint8_t*, u32 doc) {
-                if (id != NONE && last_doc[id] != doc) last_doc[id] = doc, ++cnt[id];
+                if (id != NONE && last_doc[id] != uint16_t(doc - first)) last_doc[id] = doc - first, ++cnt[id];
             });
             sync.arrive_and_wait();
             cnt.assign(space, 0);  // list postings per term
-            last_doc.assign(space, NONE);
+            last_doc.assign(space, UINT16_MAX);
             auto& out = seen[t];
             out.resize(nbuckets);
             std::vector<uint16_t> prev(nbuckets);  // per bucket: offset of its last doc
@@ -562,8 +562,8 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
                         if (auto [i, j] = by_anchor[k]; around(terms, s, s + terms.length(id), qs[i].terms, j))
                             found[t].push_back({i, doc});
                 }
-                if (last_doc[id] == doc) return;
-                last_doc[id] = doc;
+                if (last_doc[id] == uint16_t(doc - first)) return;
+                last_doc[id] = doc - first;
                 u32 b = (id - ix.list_base) >> BUCKET_BITS, off = doc - first, gap = off - prev[b];
                 prev[b] = off;
                 out[b].push((id & ((1u << BUCKET_BITS) - 1)) << GAP_BITS | std::min(gap, GAP));
@@ -592,11 +592,11 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
     ix.start.resize(space + 1);
     ix.seglen.resize(size_t(space) * nthreads);
     // Thread t lays out the lists of the term ids [lo, hi): it sums their
-    // postings, waits for every slice's sum, then sets each term's start, its
-    // segment lengths and every thread's write cursor there (count[s][id]).
-    // Once all are laid out, each thread scatters its own scan output, bucket
-    // by bucket; a bucket's terms are consecutive ids, so its lists are one
-    // stretch of post.
+    // postings, waits for every slice's sum, then sets each term's start and
+    // its segment lengths. Once all are laid out, the counts go, and each
+    // thread scatters its own scan output, bucket by bucket: a bucket's terms
+    // are consecutive ids, so its lists are one stretch of post, and the
+    // thread's write cursors there follow from the starts and lengths.
     std::vector<u32> slice(nthreads + 1);
     std::barrier summed(nthreads, [&]() noexcept { std::exclusive_scan(slice.begin(), slice.end(), slice.begin(), 0u); });
     std::barrier laid(nthreads);
@@ -609,31 +609,34 @@ Index build_index(const File& f, TermTable& terms, Queries& qs, int nthreads) {
             u32 pos = slice[t];
             for (u32 id = lo; id < hi; ++id) {
                 ix.start[id] = pos;
-                for (int s = 0; s < nthreads; ++s) {
-                    ix.seglen[size_t(id) * nthreads + s] = count[s][id];
-                    pos += std::exchange(count[s][id], pos);
-                }
+                for (int s = 0; s < nthreads; ++s) pos += ix.seglen[size_t(id) * nthreads + s] = count[s][id];
             }
             if (t == nthreads - 1) ix.start[space] = pos;
             laid.arrive_and_wait();
+            std::vector<uint16_t>().swap(count[t]);
+            std::vector<u32> cursor(1u << BUCKET_BITS);
             for (u32 b = 0; b < nbuckets; ++b) {
-                u32 doc = 0, id = 0;
+                const u32 first = ix.list_base + (b << BUCKET_BITS), n = std::min(space - first, 1u << BUCKET_BITS);
+                for (u32 k = 0; k < n; ++k) {
+                    const uint16_t* len = &ix.seglen[size_t(first + k) * nthreads];
+                    cursor[k] = std::accumulate(len, len + t, ix.start[first + k]);
+                }
+                u32 doc = 0, k = 0;
                 bool wide = false;  // the next unit is a whole gap
                 seen[t][b].drain([&](uint16_t x) {
                     if (!wide) {
-                        id = ix.list_base + (b << BUCKET_BITS | x >> GAP_BITS);
+                        k = x >> GAP_BITS;
                         if ((x & GAP) == GAP) { wide = true; return; }
                         doc += x & GAP;
                     } else {
                         doc += x, wide = false;
                     }
-                    ix.post[count[t][id]++] = doc;
+                    ix.post[cursor[k]++] = doc;
                 });
             }
         });
     }
     for (auto& th : pool) th.join();
-    std::vector<std::vector<u32>>().swap(count);
 
     // Documents per term, to order a phrase's terms (a bitmap counts as all).
     ix.df.resize(space);
