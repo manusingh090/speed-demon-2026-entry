@@ -9,7 +9,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 2 | Same design in 222 formatted lines instead of 373 | run-3c1dcbde6115 | 0.0293 | 31.8 | 79.7 |
 | 3 | One thread pool with a barrier; each hour written with pwrite at an offset handed on by the hour before, instead of per-hour strings and a writer thread; chunks released from the front of each region in 256 KB batches instead of one madvise per chunk; THP off | run-ab09a84f93b8 | 0.0310 | 20 | 80.64 |
 | 4 | Hours computed into compact per-group numbers with their exact text size, then formatted straight into the mapped output file at known offsets; endpoint names compared with one 32-byte SIMD compare | run-b962d6b976eb | 0.0301 | 20 | 80.47 |
-| 5 | Step 4 trimmed from 301 to about 261 counted lines: digit width by recursion, shorter error paths, unused includes and fields dropped, the three selections as one loop | pending | | | |
+| 5 | Step 4 trimmed from 301 to 271 counted lines: digit width by recursion, shorter error paths, unused includes and fields dropped, the three selections as one loop | run-20c5a50e4cb0 | 0.0301 | 21 | 80.69 |
 
 ## Local measurements
 
