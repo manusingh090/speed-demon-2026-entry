@@ -13,7 +13,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 6 | Rust port of step 5, same design; rustfmt-counted code trimmed from 444 to 341 lines | run-2048094dbc8d | 0.0323 | 20.9 | 79.14 |
 | 7 | Back to the C++ of step 5: on the box the Rust port was no faster and counts 349 lines against 271 | pending | | | |
 | 8 | One lock-free endpoint table shared by all threads (no per-thread tables, no merge), names copied into one compact arena; branch-free selection for the percentiles; 13-bit record keys | run-3b736d2f0408 | 0.0279 | 21 | 81.08 |
-| 9 | Chunks handed back in 64 KB batches instead of 256 KB; every remaining chunk and each thread's sort scratch freed before the output's pages start to count | pending | | | |
+| 9 | Chunks handed back in 64 KB batches instead of 256 KB; every remaining chunk and each thread's sort scratch freed before the output's pages start to count | run-0fb87a6d8f1a | 0.0280 | 18.6 | 81.56 |
 
 ## Local measurements
 
@@ -51,6 +51,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 8 on the board.** run-3b736d2f0408: 0.0279 s, 21.2 MiB, 306 counted lines, K 41.84, 81.08 points, the best Track A run so far (step 5's best was 0.0301 s and K 41.10). The box had been slow all afternoon (step 5's unchanged code measured 0.0334 to 0.0344 s in the three pushes before), so against the same box the step is about 17% faster, as on the laptop.
 
 **Step 8 to 9: memory.** `memory.current` and `memory.peak` read at each phase boundary (three runs): 16.3 MB at the end of the parse, a peak of 20.2 to 20.8 MB during the hours, and 21.6 MB while the output is written. The last was the peak, and it was leftovers: each thread's sort scratch (about 2 MB over 12 threads) was still alive in the text phase, and a release skipped while another thread held the release flag could leave finished chunks resident under the 10 MB of output pages. The scratch now lives in a block that ends before the barrier, and the barrier's completion releases every remaining chunk. That moved the peak into the hours phase (about 20.2 MB), where records are handed back in batches: 64 KB batches instead of 256 KB took about 1 MB more off (median of five, 19.7 against 20.3 MB). 4 KB chunks reached the same peak but cost CPU in three of four `perf stat` rounds; 16 KB chunks released four at a time cost none (four interleaved `perf stat -r 8` rounds: CPU time 222 to 258 ms against 232 to 364 ms for step 8, instructions the same). Peak about 19.7 MB against 21.6 MB, 303 formatted lines against 299. Same hash on full, sample, tiny, the worked example, the seed-9 sample and an empty log, and 20 repeated full runs gave one hash. What is left is the floor: about 5 MB for the container, the 10 MB summary itself (the box's `/out` is a tmpfs), and the records, which have to exist until their hour is computed.
+
+**Step 9 on the board.** run-0fb87a6d8f1a: 0.0280 s, 18.6 MiB against step 8's 21.2 MiB, 310 counted lines, K 42.78 against 41.84, 81.56 points, the best Track A run so far. Time held (0.0279 s for step 8), so the gain is all memory: (21.2 / 18.6)^0.2 is 2.7% on K, a little more than the laptop's 1.9 MB predicted.
 
 ## Tried and kept out
 
