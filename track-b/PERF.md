@@ -31,7 +31,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 24 | Rewritten from scratch in Rust, short: about 600 rustfmt lines against 968 | run-880032be5ecf | 0.253 | 65.6 | 67.55 |
 | 25 | Back to the C++ of step 23 while the Rust version is worked on | run-880032be5ecf (step 24) | | | |
 | 26 | Rust again: queries stored flat, the sample's counts freed at once, rustfmt-friendly helpers; 557 lines, 55 MB | run-5231ce22564c | 0.241 | 58.0 | 68.86 |
-| 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | pending | | | |
+| 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | run-b6f929f84526 | 0.237 | 69.1 | 68.03 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -112,6 +112,8 @@ A different laptop this time: Intel Core Ultra 9 185H (6 P-cores with hyperthrea
 
 **Step 27 against step 26** (15 alternating runs): 162 against 180 ms median, 157 against 172 ms best, 51 against 53 MB. rustfmt counts 601 code lines against 557: the `#[inline(always)]` closure arguments make rustfmt put every argument of those two calls on its own line. Trims that do not change what the program does won some of that back (636 to 601): class bounds and anchor starts by `partition_point` instead of counting loops, the scan buckets as plain addresses so they derive `Default` and `Send`, and the posting array as relaxed atomics instead of a raw-pointer wrapper. Estimated K: time 1.054, memory 1.008, code 0.989, about 5% higher. Same hash on full, sample, tiny, the worked example, a seed-5 sample and a seed-21 tiny set through `check.py`, and on 25 repeated full runs.
 
+**Step 27 on the board.** run-b6f929f84526 (commit 8d77fc0, the same code as 4ef6f6b): 0.237 s against 0.241 s, but 69.1 MiB against 58.0 MiB and 609 counted lines against 565, so K fell from 23.83 to 22.94 and the points from 68.86 to 68.03. The laptop's 10% did not show on the box, where the run is 1.6% faster. The memory moved the other way from the laptop's 53 to 51 MB. Neither Rust version turns transparent huge pages off, as the C++ did at step 13 (175 to 69.6 MiB on the box), so the likely cause is the new layout's regions being backed by whole 2 MB pages on the box: every thread now writes every bucket's region of one shared posting array at once, where step 26 wrote per-thread arrays. That is not measured yet.
+
 ## What the profile said, step by step
 
 **Step 1 to 2.** Instrumenting the query phase showed phrase queries took 80% of it (about 4.2 s of CPU over 12 threads). Intersection took 14 ms per thread; the rest was verification, which re-tokenized and hashed 63M tokens, more than the whole corpus holds, because long documents are over-represented among candidates. Verification now walks the candidate's text and compares tokens to the rarest phrase term byte by byte, then checks the neighbours in place.
@@ -155,6 +157,7 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | 3086948 | run-c2b149a34d40 | 0.2318 | 52.7 | 22.85 | 67.95 | Steps 18 to 23 together (Track B code of 6b4b312): T 0.277 to 0.232 s, M 59 to 52.7 MiB, the box agreeing with the laptop |
 | ccc3bc5 | run-880032be5ecf | 0.2526 | 65.6 | 22.44 | 67.55 | Step 24, the first short Rust version: slower and larger than the C++ on the box |
 | 0a8b262 | run-5231ce22564c | 0.2410 | 58.0 | 23.83 | 68.86 | Step 26, Rust with flat queries and 557 lines: the best Track B run so far |
+| 8d77fc0 | run-b6f929f84526 | 0.2372 | 69.1 | 22.94 | 68.03 | Step 27: 10% faster and 2 MB smaller on the laptop, but on the box only 1.6% faster and 11 MiB larger, so K fell |
 
 ## Step 16: phrase anchors
 
