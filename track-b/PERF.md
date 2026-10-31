@@ -113,7 +113,7 @@ A different laptop this time: Intel Core Ultra 9 185H (6 P-cores with hyperthrea
 
 **Step 27 against step 26** (15 alternating runs): 162 against 180 ms median, 157 against 172 ms best, 51 against 53 MB. rustfmt counts 601 code lines against 557: the `#[inline(always)]` closure arguments make rustfmt put every argument of those two calls on its own line. Trims that do not change what the program does won some of that back (636 to 601): class bounds and anchor starts by `partition_point` instead of counting loops, the scan buckets as plain addresses so they derive `Default` and `Send`, and the posting array as relaxed atomics instead of a raw-pointer wrapper. Estimated K: time 1.054, memory 1.008, code 0.989, about 5% higher. Same hash on full, sample, tiny, the worked example, a seed-5 sample and a seed-21 tiny set through `check.py`, and on 25 repeated full runs.
 
-**Step 27 on the board.** run-b6f929f84526 (commit 8d77fc0, the same code as 4ef6f6b): 0.237 s against 0.241 s, but 69.1 MiB against 58.0 MiB and 609 counted lines against 565, so K fell from 23.83 to 22.94 and the points from 68.86 to 68.03. The laptop's 10% did not show on the box, where the run is 1.6% faster. The memory moved the other way from the laptop's 53 to 51 MB. Neither Rust version turns transparent huge pages off, as the C++ did at step 13 (175 to 69.6 MiB on the box), so the likely cause is the new layout's regions being backed by whole 2 MB pages on the box: every thread now writes every bucket's region of one shared posting array at once, where step 26 wrote per-thread arrays. That is not measured yet.
+**Step 27 on the board.** run-b6f929f84526 (commit f4d55ea): 0.237 s against 0.241 s, but 69.1 MiB against 58.0 MiB and 609 counted lines against 565, so K fell from 23.83 to 22.94 and the points from 68.86 to 68.03. The laptop's 10% did not show on the box, where the run is 1.6% faster. The memory moved the other way from the laptop's 53 to 51 MB. Neither Rust version turns transparent huge pages off, as the C++ did at step 13 (175 to 69.6 MiB on the box), so the likely cause is the new layout's regions being backed by whole 2 MB pages on the box: every thread now writes every bucket's region of one shared posting array at once, where step 26 wrote per-thread arrays. That is not measured yet.
 
 **Step 28.** This laptop's Docker VM runs huge pages in `madvise` mode, which is why it never showed the rise. With the VM switched to `always` for the measurement (9 alternating runs, then set back): step 26 53 MB at 178 ms, step 27 56 MB at 156 ms, step 27 with `PR_SET_THP_DISABLE` 51 MB at 157 ms. So huge pages cost step 27 about 5 MB here and nothing in time; the box's 11 MiB is the same effect, larger. Same hash on full, sample, tiny, the worked example and the seed-5 sample.
 
@@ -162,8 +162,10 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | 3086948 | run-c2b149a34d40 | 0.2318 | 52.7 | 22.85 | 67.95 | Steps 18 to 23 together (Track B code of 6b4b312): T 0.277 to 0.232 s, M 59 to 52.7 MiB, the box agreeing with the laptop |
 | ccc3bc5 | run-880032be5ecf | 0.2526 | 65.6 | 22.44 | 67.55 | Step 24, the first short Rust version: slower and larger than the C++ on the box |
 | 0a8b262 | run-5231ce22564c | 0.2410 | 58.0 | 23.83 | 68.86 | Step 26, Rust with flat queries and 557 lines: the best Track B run so far |
-| 8d77fc0 | run-b6f929f84526 | 0.2372 | 69.1 | 22.94 | 68.03 | Step 27: 10% faster and 2 MB smaller on the laptop, but on the box only 1.6% faster and 11 MiB larger, so K fell |
-| 5d75239 | run-174007cb966d | 0.2352 | 48.8 | 24.68 | 69.62 | Step 28, huge pages off: 69.1 to 48.8 MiB, the best Track B run so far |
+| f4d55ea | run-b6f929f84526 | 0.2372 | 69.1 | 22.94 | 68.03 | Step 27: 10% faster and 2 MB smaller on the laptop, but on the box only 1.6% faster and 11 MiB larger, so K fell |
+| 533c94e | run-174007cb966d | 0.2352 | 48.8 | 24.68 | 69.62 | Step 28, huge pages off: 69.1 to 48.8 MiB, the best Track B run so far |
+
+The board measured f4d55ea and 533c94e under their earlier hashes 8d77fc0 and 5d75239: the same code, before a duplicate commit was taken out of the history on Oct 31.
 
 ## Step 16: phrase anchors
 
