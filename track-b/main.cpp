@@ -318,15 +318,17 @@ private:
     size_t fill_ = BLOCK;
 };
 
-// The scan files each posting under a bucket of 512 consecutive term ids. A
-// thread meets its documents in order, so within one bucket's stream the docs
-// never go down: a posting is one 16-bit unit, the term's offset in the bucket
-// (9 bits) above the gap since the bucket's previous doc (7 bits). A gap of
+// The scan files each posting under a bucket of 2,048 consecutive term ids
+// (about 37 buckets, so each thread writes 37 streams; 512-term buckets meant
+// 148 and ran 10% slower). A thread meets its documents in order, so within
+// one bucket's stream the docs never go down: a posting is one 16-bit unit,
+// the term's offset in the bucket (11 bits) above the gap since the bucket's
+// previous doc (5 bits). A gap of
 // GAP or more is written as GAP followed by a unit holding the whole gap (a
 // thread covers fewer than 2^15 docs). The scatter then fills the posting
 // lists one bucket at a time, so the lists' pages are touched only as the scan
 // output that fills them is freed.
-constexpr u32 BUCKET_BITS = 9, DOC_BITS = 15, GAP = 127;
+constexpr u32 BUCKET_BITS = 11, GAP_BITS = 16 - BUCKET_BITS, DOC_BITS = 15, GAP = (1u << GAP_BITS) - 1;
 
 u32 parse_id(const uint8_t* p) {
     u32 v = 0;
@@ -430,7 +432,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
                 } else {
                     u32 b = id >> BUCKET_BITS, off = doc - first, gap = off - prev[b];
                     prev[b] = off;
-                    out[b].push((id & ((1u << BUCKET_BITS) - 1)) << 7 | std::min(gap, GAP));
+                    out[b].push((id & ((1u << BUCKET_BITS) - 1)) << GAP_BITS | std::min(gap, GAP));
                     if (gap >= GAP) out[b].push(gap);
                     ++cnt[id];
                 }
@@ -465,7 +467,7 @@ Index build_index(const File& f, TermTable& terms, std::vector<u32>& query_terms
                 bool wide = false;  // the next unit is a whole gap
                 seen[t][b].drain([&](uint16_t x) {
                     if (!wide) {
-                        id = b << BUCKET_BITS | x >> 7;
+                        id = b << BUCKET_BITS | x >> GAP_BITS;
                         if ((x & GAP) == GAP) { wide = true; return; }
                         doc += x & GAP;
                     } else {
