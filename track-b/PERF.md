@@ -73,8 +73,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 66 | Term frequencies sampled from 1/64 of each thread's share instead of 1/32 | run-146e73178a51 | 0.150 | 44.9 | 74.84 |
 | 67 | The term table on one 2 MB page, faulted in before huge pages are turned off for the rest of the process | run-dbeb88c7f0ba | 0.147 | 45.3 | 74.97 |
 | 68 | Ross's buckets in full: eight slots, one cache line, probed with two 32-byte compares, so the term table can be 1 MB (load 0.58) instead of 2 MB | run-468bf6de75ae | 0.151 | 46.9 | 74.56 |
-| 69 | Back to step 67's code | pending | | | |
-| 70 | Six threads, one per core, instead of twelve | pending | | | |
+| 69 | Back to step 67's code | run-1eb212067712 | 0.145 | 45.0 | 75.19 |
+| 70 | Six threads, one per core, instead of twelve | run-79b1ed0c8153 | 0.163 | 42.6 | 74.13 |
+| 71 | Back to step 67's code | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -289,6 +290,8 @@ Measured and kept out this session:
 **Step 68 on the board, and step 69.** run-468bf6de75ae: 0.1507 s against 0.1474 s and 46.9 MiB, so a 1 MB table loses on the box with eight-slot buckets too, as it did with one-slot probing at step 60: the longer probes of a fuller table cost more than the L2 it saves. Step 69 is step 67's code again.
 
 **Step 70: what a second round of reading left to try.** Polychroniou, Raghavan and Ross, *Rethinking SIMD Vectorization for In-Memory Databases* (SIGMOD 2015), probe a hash table with one input per SIMD lane and gathers; their large gains are on AVX-512 and Xeon Phi, and on the box's AVX2, which has no 64-bit multiply, hashing four tokens per vector costs about what four scalar hashes do. Polychroniou and Ross's vectorized Bloom filters skip the probes of keys that cannot match; only 21% of the tokens here miss the table, and a 128 KB filter measured after step 54 cost 10% more instructions. Askitis and Zobel's cache-conscious string hash tables describe what the table already is: one cache line per probe, no pointers. That leaves a question about the hardware. A core's two hyperthreads share its L1, L2 and its line fill buffers, and the profile has the tokenizer waiting on exactly those (step 61), so the second thread of each core may add little. Step 70 runs six threads; each share then holds about 41,700 documents, within the 16-bit offsets. On the laptop, which has eight cores, it is 14% slower (257 against 225 ms median) at 43 MB against 45, so it is a question for the box's six cores. Same hash on all six datasets, 5 repeated full runs gave one hash.
+
+**Steps 69 and 70 on the board, and step 71.** run-1eb212067712 (commit 96f3a3b, step 67's code again): 0.1448 s, 45.0 MiB, the best Track B run so far at 75.19; the same code ran at 0.1474 s as step 67, so the box's runs of one code differ by about 2%. run-79b1ed0c8153, six threads: 0.1632 s against 0.1448, 13% slower at 2.4 MiB less, so the second hyperthread of each core more than pays for the resources it shares. Step 71 is step 67's code again.
 
 ## What the profile said, step by step
 
