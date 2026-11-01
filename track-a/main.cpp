@@ -223,12 +223,24 @@ struct Parser {
       const char *name = m + __builtin_ctzll(sp) + 1;
       sp &= sp - 1;
       const char *ne = sp ? m + __builtin_ctzll(sp) : next_byte(m + 64, ' ');
-      // After " SSS " the latency has at most 10 digits: its LF is within 32.
-      u32 len = __builtin_ctz(eq32(ne + 5, '\n'));
-      const char *eol = ne + 5 + len;
+      // After " SSS " come the latency's digits (bit 0x10 set) and the LF
+      // (clear). Up to 7 digits are decoded in one word: moved to its top,
+      // so the bytes below read as leading zeros, then combined 2, 4 and 8
+      // at a time with multiplies. Longer latencies take the SIMD path.
+      u64 w, digits;
+      memcpy(&w, ne + 5, 8);
+      u32 len, lat;
+      if (u64 lf = ~w & 0x1010101010101010) {
+        len = __builtin_ctzll(lf) >> 3;
+        digits = (w << (64 - 8 * len)) & 0x0F0F0F0F0F0F0F0F;
+        digits = (digits * 2561) >> 8 & 0x00FF00FF00FF00FF;
+        digits = (digits * 6553601) >> 16 & 0x0000FFFF0000FFFF;
+        lat = (digits * 42949672960001) >> 32;
+      } else
+        len = __builtin_ctz(eq32(ne + 5, '\n')),
+        lat = decode(ne + 5 + len, len);
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
-      u32 lat = decode(eol, len);
-      p = eol + 1;
+      p = ne + 6 + len;
       if (__builtin_expect(lat >= PACKED_MAX, 0)) {
         wide[h].push_back({lat, key});
         continue;
@@ -252,13 +264,13 @@ struct Parser {
       madvise(kept, (c - kept) * sizeof(Chunk), MADV_DONTNEED), kept = c;
   }
 
-  // Calls f(endpoint rank, 5xx flag, latency) for every record of hour h.
-  template <class F> void each(int h, const u32 *rank, F &&f) const {
+  // Calls f(endpoint id, 5xx flag, latency) for every record of hour h.
+  template <class F> void each(int h, F &&f) const {
     for (const Chunk *c = last[h]; c; c = c->prev)
       for (u32 i = 0; i < c->n; ++i)
-        f(rank[c->rec[i] & ID_MASK], c->rec[i] & ERR, c->rec[i] >> KEY_BITS);
+        f(c->rec[i] & ID_MASK, c->rec[i] & ERR, c->rec[i] >> KEY_BITS);
     for (auto [lat, key] : wide[h])
-      f(rank[key & ID_MASK], key & ERR, lat);
+      f(key & ID_MASK, key & ERR, lat);
   }
 };
 
@@ -287,7 +299,7 @@ int main() {
 
   std::vector<Parser> parsers(nt);
   std::vector<std::string_view> names;
-  std::vector<u32> rank(1 << 12);
+  std::vector<u32> by_rank;
   u32 most = 0;
   // Endpoints ranked in unsigned byte order, the order of an hour's lines.
   // The first thread out of pieces ranks the names seen so far while the
@@ -302,9 +314,9 @@ int main() {
       if (u64 v = endpoints.slot[i])
         by_name.push_back({endpoints.name(v), u32(v >> 32) & 0xFFF});
     std::sort(by_name.begin(), by_name.end());
-    names.clear();
+    names.clear(), by_rank.clear();
     for (auto [name, id] : by_name)
-      rank[id] = names.size(), names.push_back(name);
+      by_rank.push_back(id), names.push_back(name);
   };
   std::barrier ranked(nt, [&]() noexcept {
     for (auto &n : count)
@@ -358,22 +370,24 @@ int main() {
       }
       ranked.arrive_and_wait();
       {
-        const u32 ne = names.size();
-        std::vector<u32> start(ne + 1), errors(ne), cursor(ne);
+        const u32 ne = names.size(), ids = endpoints.next_id;
+        std::vector<u32> start(ids), errors(ids), cursor(ids);
         std::unique_ptr<u32[]> latency(new u32[most]);
         for (int h; (h = claim++) < HOURS;) {
           std::fill(start.begin(), start.end(), 0);
           std::fill(errors.begin(), errors.end(), 0);
-          // Counting sort of the hour's latencies by endpoint rank.
+          // Counting sort of the hour's latencies, counted and placed by
+          // endpoint id with the groups laid out in rank order.
           for (auto &ps : parsers)
-            ps.each(h, rank.data(), [&](u32 e, u32 err, u32) {
-              ++start[e + 1], errors[e] += err != 0;
+            ps.each(h, [&](u32 id, u32 err, u32) {
+              ++start[id], errors[id] += err != 0;
             });
-          for (u32 e = 0; e < ne; ++e)
-            cursor[e] = start[e], start[e + 1] += start[e];
+          for (u32 e = 0, at = 0; e < ne; ++e) {
+            u32 id = by_rank[e];
+            cursor[id] = at, at += start[id], start[id] = cursor[id];
+          }
           for (auto &ps : parsers)
-            ps.each(h, rank.data(),
-                    [&](u32 e, u32, u32 l) { latency[cursor[e]++] = l; });
+            ps.each(h, [&](u32 id, u32, u32 l) { latency[cursor[id]++] = l; });
           finished[h] = true;
           if (!releasing.test_and_set()) {
             for (auto &ps : parsers)
@@ -382,18 +396,18 @@ int main() {
           }
           u64 sz = 0;
           for (u32 e = 0; e < ne; ++e) {
-            u32 n = start[e + 1] - start[e];
+            u32 id = by_rank[e], n = cursor[id] - start[id];
             if (!n)
               continue;
             // Nearest rank p is index ceil(p * n / 100) - 1; each higher rank
             // is selected among the values left after the one before.
-            u32 *a = latency.get() + start[e], r50 = (50 * n + 99) / 100 - 1,
+            u32 *a = latency.get() + start[id], r50 = (50 * n + 99) / 100 - 1,
                 r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
             for (u32 from = 0; u32 r : {r50, r95, r99})
               if (r >= from)
                 select(a + from, n - from, r - from), from = r + 1;
             const Line &l =
-                lines[h].emplace_back(e, n, a[r50], a[r95], a[r99], errors[e]);
+                lines[h].emplace_back(e, n, a[r50], a[r95], a[r99], errors[id]);
             sz += 28 + names[e].size();
             for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
               sz += width(x);
