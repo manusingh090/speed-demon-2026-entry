@@ -44,9 +44,11 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 22 | Chain contraction: nodes with one or two neighbours (31%) are never settled; junction edges into a chain are redirected in place to the junction at its far end, and a query on a chain starts from its junctions | run-3c80edc59750 | 0.160 s | 64 MiB | 68.30 |
 | 23 | Back to step 21's code (no board run of its own: superseded by the diagnostic) | | | | |
 | 23d | Diagnostic: time to the start of the searches reported through M | run-c7795c71063c | (0.304 s) | (290 MiB) | |
-| 24 | Reverse offsets summed in parallel and built without the final shift; chain edge totals counted during the blob BFS | pending | | | |
-| 25 | Renumbering walks the old edge list with a cursor, so the old offsets are freed first; the old graph is freed by all threads before the reverse graph is allocated | pending | | | |
-| 26 | Edge offsets packed: a u32 per 8 nodes and a byte per node (plain u32s if a group overflows a byte), for the old, new and reverse graphs | pending | | | |
+| 24 | Reverse offsets summed in parallel and built without the final shift; chain edge totals counted during the blob BFS | run-0a2518f20cca | 0.158 s | 63 MiB | 69.27 |
+| 25 | Renumbering walks the old edge list with a cursor, so the old offsets are freed first; the old graph is freed by all threads before the reverse graph is allocated | run-c59f249b924d | 0.161 s | 61 MiB | 69.15 |
+| 26 | Edge offsets packed: a u32 per 8 nodes and a byte per node (plain u32s if a group overflows a byte), for the old, new and reverse graphs | run-388cd0d32097 | 0.157 s | 55 MiB | 69.68 |
+| 26d | Diagnostic: time to the end of the parse reported through M | run-806bba02eb3c | (0.246 s) | (222 MiB) | |
+| 27 | Back to step 26's code | pending | | | |
 
 ## What the profile said, step by step
 
@@ -139,6 +141,10 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Step 24 to 25: memory.** The leaders run in 44 to 59 MB against our 63 MiB, and M is a fifth of K. Phase by phase (cgroup `memory.current` and `memory.peak` at each phase), the peak was not the searches but the reverse graph's count pass: 64.5 MiB, with the old graph (offsets, edges, id map, 34 MB) still being freed on a side thread while the reverse arrays filled. The part build reached 60.3 and the renumbering 63.2. Now the renumbering walks each thread's share of the old edge list with a cursor, a node's degree read off the new offsets, so the old offsets (7 MB) are freed before it; and after it all threads drop the old edges and the id map with `MADV_DONTNEED` before the reverse graph is allocated. Peak 64 to 62 MiB locally, now at the searches (55.5 MiB of graph plus about 7 MiB of per-thread distances and heaps), with the part build next at 60.3. Time unchanged within noise (six rounds: median 0.165 against 0.170 s, three pairs each). Same hash on all thirty datasets.
 
 **Step 25 to 26.** With the peak now at the searches, the per-thread search state was the next suspect, but distance pages of 256 or 128 nodes left the peak where it was (62.9 to 64.2 MB against 63.5). The graph itself is 55.5 MiB of it, and its two offset arrays are 7 MB each for small numbers: a node has at most ten edges here. Offsets are now packed as a u32 for every group of 8 nodes plus a byte per node to add (2.6 MB instead of 7). If any group has more than 255 edges before its last node, all offsets of that graph are plain u32s instead (gb = 0), so any input stays exact. The part build writes the old graph's offsets packed directly, since parts start on whole groups, which also takes 4.4 MB off the part build's peak; the new and reverse offsets are summed as before and packed in a parallel pass, their plain arrays freed at once. Every reader (blob BFS, renumbering, reverse build, searches) adds the byte to its group's u32, and the prefetch at queue time fetches the byte. Peak 63.5 to 57.5 MB locally (62 to 56 MiB). Single-CPU runs take the same time as step 25 (1128 against 1134 ms, 1101 against 1104, 1060 against 1038, 1045 against 1046), so the packing costs no work; twelve-thread rounds on the loaded laptop could not separate the two. The first version raised a shared overflow flag with an atomic per node and was 15% slower; the flag is now set once per part. 638 rustfmt lines against 590. Same hash on all thirty datasets.
+
+**Steps 24 to 26 on the board.** Step 24, run-0a2518f20cca: 0.158 s, 63 MiB, 69.27 points. Step 25, run-c59f249b924d: 0.161 s, 61 MiB, 69.15. Step 26, run-388cd0d32097: 0.157 s, 55 MiB (from 61, as measured locally), 649 lines, 69.68 points, the best so far.
+
+**Second diagnostic.** The same trick with the mark at the end of the parse: run-806bba02eb3c reported 233,181,184 bytes, so on the box the parse (with exec and reading the queries) ends about 18 ms in. With the first diagnostic, the box's 0.157 s is about 18 ms of parse, about 67 ms from the parse to the first search (part build, blob order, ids, renumbering, reverse graph) and about 70 ms of searches, release and exit. Step 27 is step 26's code again.
 
 ## Tried and kept out
 
