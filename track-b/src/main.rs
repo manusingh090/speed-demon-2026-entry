@@ -450,6 +450,26 @@ fn main() {
     // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let qtext = map("/data/queries.txt");
+    // Diagnostic for the board: the queries are parsed once more first, into
+    // tables that are then dropped, so the run's extra time is this step's cost.
+    {
+        let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
+        let keys = Vec::with_capacity(qtext.len() / 16);
+        let mut terms = Terms { slot: slots, keys };
+        let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
+        for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
+            let (phrase, from) = (q[0] == b'P', ids.len() as u32);
+            let body = &q[if phrase { 8 } else { 5 }..q.len() - phrase as usize];
+            for (k, word) in body.split(|&b| b == b' ').enumerate() {
+                match !phrase && k % 2 == 1 {
+                    true => *ops.last_mut().unwrap() = word[0],
+                    false => (ids.push(terms.insert(word)), ops.push(0)).1,
+                }
+            }
+            spans.push((phrase, from, ids.len() as u32));
+        }
+        std::hint::black_box((&terms.keys, &spans, &ids, &ops));
+    }
     let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
     let keys = Vec::with_capacity(qtext.len() / 16);
     let mut terms = Terms { slot: slots, keys };
@@ -682,9 +702,6 @@ fn main() {
     };
     let n = spans.len().div_ceil(64);
     let chunks: Vec<Mutex<String>> = (0..n).map(|_| Mutex::default()).collect();
-    // Diagnostic for the board: every query is answered twice, the first
-    // answers overwritten, so the run's extra time is this phase's cost there.
-    for _ in 0..2 {
     let next = AtomicUsize::new(0);
     on_threads(|_| loop {
         let k = next.fetch_add(1, Relaxed);
@@ -708,7 +725,6 @@ fn main() {
         }
         *chunk.lock().unwrap() = out;
     });
-    }
     // Chunk by chunk, so the answers are never held twice.
     let file = std::fs::File::create("/out/results.txt").expect("/out/results.txt");
     let mut out = std::io::BufWriter::new(file);
