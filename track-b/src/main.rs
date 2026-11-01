@@ -524,12 +524,11 @@ fn main() {
             }
         });
         flush(&mut pending, block);
-        // The share is not read again: its pages are dropped now, on every
-        // thread, rather than all of the file's by one thread at exit.
-        let (from, to) = (share.as_ptr() as usize, share.as_ptr() as usize + share.len());
-        if to & !4095 > (from + 4095) & !4095 {
-            unsafe { madvise(((from + 4095) & !4095) as *mut u8, (to & !4095) - ((from + 4095) & !4095), 4) };
-        }
+        // The share is not read again: its pages go now, on every thread,
+        // rather than all of the file's on one thread at exit.
+        let page = |n: usize| share.as_ptr() as usize + n & !4095;
+        let (a, b) = (page(4095), page(share.len()));
+        unsafe { madvise(a as *mut u8, b.saturating_sub(a), 4) };
         buckets.iter_mut().for_each(Units::finish);
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
@@ -590,8 +589,6 @@ fn main() {
     let n = spans.len().div_ceil(64);
     let chunks: Vec<Mutex<String>> = (0..n).map(|_| Mutex::default()).collect();
     let next = AtomicUsize::new(0);
-    for _ in 0..2 {
-    next.store(0, Relaxed);
     on_threads(|_| loop {
         let k = next.fetch_add(1, Relaxed);
         let Some(chunk) = chunks.get(k) else { return };
@@ -614,7 +611,6 @@ fn main() {
         }
         *chunk.lock().unwrap() = out;
     });
-    }
     let file = std::fs::File::create("/out/results.txt").expect("/out/results.txt");
     let mut out = std::io::BufWriter::new(file);
     for c in chunks {
