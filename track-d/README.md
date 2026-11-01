@@ -10,7 +10,8 @@ One Rust file, `src/main.rs`, with no crates (the C++ version it replaced is in 
 2. **Build each part on its own.** A thread takes a part, counts its nodes' out-degrees and places its edges, all inside a 64 KB counter array. This replaced two passes of random atomic adds over the whole graph. Every phase runs on one pool of threads started once.
 3. **Renumber for locality.** Node ids are a random relabelling, so each thread cuts the road network into compact blobs of 512 nodes grown by BFS (nodes claimed by compare-exchange), and the graph is copied into that numbering, then reversed in place.
 4. **Bidirectional Dijkstra.** Each query grows the side with the smaller queue, records the best length where the sides meet and stops once the two smallest queued keys reach it. 4-ary heaps; distances in pages handed out on first touch, stored as u32, which halves the memory a search touches. A length that does not fit is dropped and noted; if the answer then comes out at 2^32 - 1 or more, the query runs again with u64 distances. A target with no in-edge is -1 at once, read off the reverse graph.
-5. **A short exit.** Each thread drops its share of graph.txt's pages (`MADV_DONTNEED`) once it runs out of queries, and after the searches every thread hands its share of the graph's pages back the same way, so the exit no longer frees about 140 MB of mappings on one thread.
+5. **Packed offsets.** Each graph's edge offsets are a u32 per group of 8 nodes plus a byte per node (plain u32s if a group ever has more than 255 edges), 2.6 MB instead of 7 MB per graph.
+6. **A short exit.** Each thread drops its share of graph.txt's pages (`MADV_DONTNEED`) once it runs out of queries, and after the searches every thread hands its share of the graph's pages back the same way, so the exit no longer frees about 140 MB of mappings on one thread.
 
 ## Dependencies
 
