@@ -14,7 +14,7 @@ extern "C" {
     fn _exit(status: i32) -> !;
 }
 
-const THREADS: usize = 12;
+const THREADS: usize = 6;
 const NONE: u32 = u32::MAX;
 const BUCKETS: usize = 32;
 const GAP: u32 = 15;
