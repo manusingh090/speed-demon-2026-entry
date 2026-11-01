@@ -14,7 +14,7 @@ use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::fmt::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex, Once, OnceLock};
 
 extern "C" {
@@ -151,32 +151,20 @@ impl Terms {
         }
     }
 
-    /// The term's id, inserting it if new; any thread may call this at once.
-    /// A free slot is claimed with a compare-and-swap to a busy mark (id bits
-    /// all ones), then the next id's key is written and the slot published;
-    /// a thread meeting a busy slot waits for it. `keys` has room for every
-    /// id up front, so it never moves.
-    fn insert(&self, term: &[u8], used: &AtomicU32) -> u32 {
+    fn insert(&mut self, term: &[u8]) -> u32 {
         let k = unsafe { key(term.as_ptr(), term.len()) };
         let (h, mask) = (hash(k), self.slot.len() - 1);
-        let tag = h as u64 >> 32 << 32;
-        // u64 and AtomicU64 have the same layout.
-        let slot: &[AtomicU64] = unsafe { std::mem::transmute(&self.slot[..]) };
         let mut i = h & mask;
-        loop {
-            match slot[i].load(Acquire) {
-                0 if slot[i].compare_exchange(0, tag | u32::MAX as u64, Acquire, Relaxed).is_ok() => {
-                    let id = used.fetch_add(1, Relaxed);
-                    unsafe { (self.keys.as_ptr() as *mut __m256i).add(id as usize).write(k) };
-                    slot[i].store(tag | (id as u64 + 1), Release);
-                    return id;
-                }
-                0 => {}
-                s if s as u32 == u32::MAX => std::hint::spin_loop(),
-                s if s >> 32 == tag >> 32 && same(self.keys[s as u32 as usize - 1], k) => return s as u32 - 1,
-                _ => i = (i + 1) & mask,
+        while self.slot[i] != 0 {
+            let s = self.slot[i];
+            if s >> 32 == h as u64 >> 32 && same(self.keys[s as u32 as usize - 1], k) {
+                return s as u32 - 1;
             }
+            i = (i + 1) & mask;
         }
+        self.keys.push(k);
+        self.slot[i] = (h as u64 >> 32) << 32 | self.keys.len() as u64;
+        self.keys.len() as u32 - 1
     }
 }
 
@@ -462,43 +450,23 @@ fn main() {
     // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let qtext = map("/data/queries.txt");
-    // Room for a key per word (a word is at least 2 bytes with its space);
-    // pages are charged only for the keys written.
-    let mut keys = Vec::with_capacity(qtext.len() / 2 + 1);
-    unsafe { keys.set_len(keys.capacity()) };
-    let mut terms = Terms { slot: vec![0; (qtext.len() / 8).next_power_of_two()], keys };
-    let used = AtomicU32::new(0);
+    let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
+    let keys = Vec::with_capacity(qtext.len() / 16);
+    let mut terms = Terms { slot: slots, keys };
     // Queries, flat: query q's terms are ids[span.1..span.2], and for BOOL
-    // ops[i] joins ids[i] and ids[i + 1]. Parsed in line-aligned pieces on
-    // all threads, then joined in order.
-    let mut qcut: Vec<usize> = (0..=THREADS).map(|t| qtext.len() * t / THREADS).collect();
-    for c in &mut qcut[1..THREADS] {
-        while *c < qtext.len() && qtext[*c - 1] != b'\n' {
-            *c += 1;
-        }
-    }
-    let parts = on_threads(|t| {
-        let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
-        for q in qtext[qcut[t]..qcut[t + 1]].split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
-            let (phrase, from) = (q[0] == b'P', ids.len() as u32);
-            let body = &q[if phrase { 8 } else { 5 }..q.len() - phrase as usize];
-            for (k, word) in body.split(|&b| b == b' ').enumerate() {
-                match !phrase && k % 2 == 1 {
-                    true => *ops.last_mut().unwrap() = word[0],
-                    false => (ids.push(terms.insert(word, &used)), ops.push(0)).1,
-                }
-            }
-            spans.push((phrase, from, ids.len() as u32));
-        }
-        (spans, ids, ops)
-    });
+    // ops[i] joins ids[i] and ids[i + 1].
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
-    for (s, i, o) in parts {
-        let base = ids.len() as u32;
-        spans.extend(s.into_iter().map(|(p, from, to)| (p, from + base, to + base)));
-        (ids.extend(i), ops.extend(o));
+    for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
+        let (phrase, from) = (q[0] == b'P', ids.len() as u32);
+        let body = &q[if phrase { 8 } else { 5 }..q.len() - phrase as usize];
+        for (k, word) in body.split(|&b| b == b' ').enumerate() {
+            match !phrase && k % 2 == 1 {
+                true => *ops.last_mut().unwrap() = word[0],
+                false => (ids.push(terms.insert(word)), ops.push(0)).1,
+            }
+        }
+        spans.push((phrase, from, ids.len() as u32));
     }
-    unsafe { terms.keys.set_len(used.into_inner() as usize) };
     let nterms = terms.keys.len();
     assert!(nterms <= BUCKETS << 12, "too many terms"); // a unit's index has 12 bits
     let mut in_bool = vec![false; nterms];
