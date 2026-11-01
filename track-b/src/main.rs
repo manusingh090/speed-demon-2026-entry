@@ -63,8 +63,8 @@ fn number(text: &[u8], i: usize) -> u32 {
 
 unsafe fn hash(p: *const u8, len: usize) -> u64 {
     let load = |i| p.add(i).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020;
-    let (b, w0) = (len as u32 * 8, _bzhi_u64(load(0), len as u32 * 8));
-    let w1 = if len > 8 { _bzhi_u64(load(8), b - 64) } else { 0 };
+    let b = len as u32 * 8;
+    let (w0, w1) = (_bzhi_u64(load(0), b), _bzhi_u64(load(8), b.saturating_sub(64)));
     let mut h = (w0 ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ w1.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     if len > 16 {
@@ -75,20 +75,30 @@ unsafe fn hash(p: *const u8, len: usize) -> u64 {
     (h ^ h >> 31).wrapping_mul(0xD6E8_FEB8_6659_FD93)
 }
 
+// Slots are probed four at a time from the start of the aligned group of four
+// the hash points into: a 32-byte compare finds the term or the first free
+// slot, which is where it would have been inserted.
 struct Terms {
-    slot: Vec<u64>,
+    slot: &'static mut [u64],
     n: usize,
 }
 
 impl Terms {
     fn find(&self, h: u64) -> u32 {
-        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 1));
-        loop {
-            let s = unsafe { *self.slot.get_unchecked(i) };
-            if s == 0 || s >> ID_BITS == h >> ID_BITS {
-                return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32);
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
+        unsafe {
+            let (tag, keep) = (_mm256_set1_epi64x((h & !ID_MASK) as i64), _mm256_set1_epi64x(!ID_MASK as i64));
+            loop {
+                let v = _mm256_load_si256(self.slot.as_ptr().add(i).cast());
+                let hit = _mm256_cmpeq_epi64(_mm256_and_si256(v, keep), tag);
+                let found = _mm256_or_si256(hit, _mm256_cmpeq_epi64(v, _mm256_setzero_si256()));
+                let m = _mm256_movemask_pd(_mm256_castsi256_pd(found)) as usize;
+                if m != 0 {
+                    let s = *self.slot.get_unchecked(i + m.trailing_zeros() as usize);
+                    return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32);
+                }
+                i = (i + 4) & mask;
             }
-            i = (i + 1) & mask;
         }
     }
 
@@ -100,7 +110,7 @@ impl Terms {
 
     fn insert(&mut self, term: &[u8]) -> u32 {
         let h = unsafe { hash(term.as_ptr(), term.len()) };
-        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 1));
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
         while self.slot[i] != 0 {
             if self.slot[i] >> ID_BITS == h >> ID_BITS {
                 return (self.slot[i] & ID_MASK) as u32 - 1;
@@ -297,16 +307,12 @@ fn line(out: &mut String, docs: &Docs) {
 fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32, &[u32])) -> u32 {
     let (mut p, end) = (s.as_ptr(), s.as_ptr_range().end);
     let (mut doc, mut ids) = (first, Vec::with_capacity(1 << 12));
-    let mut again: Vec<u32> = Vec::with_capacity(1 << 12);
     while p < end {
         unsafe {
             while *p != b'\t' {
                 p = p.add(1);
             }
             ids.clear();
-            again.clear();
-            tokens(p, t, &mut again, pre);
-            std::hint::black_box(&again);
             p = tokens(p, t, &mut ids, pre);
         }
         (f(doc, &ids), doc += 1);
@@ -357,7 +363,10 @@ impl Units {
 fn main() {
     unsafe { (mallopt(-3, 1 << 16), prctl(41, 1u64, 0u64, 0u64, 0u64)) };
     let qtext = map("/data/queries.txt");
-    let slot = vec![0; (qtext.len() / 8).next_power_of_two()];
+    let n = (qtext.len() / 8).next_power_of_two().max(4);
+    let raw = vec![0u64; n + 8].leak();
+    let at = raw.as_ptr().align_offset(64);
+    let slot = &mut raw[at..][..n];
     let mut terms = Terms { slot, n: 0 };
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
