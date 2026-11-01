@@ -32,6 +32,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | Step 24's code with its explanatory comments (no counted line changes) | pending | | | |
 | 26 | The line's end from one 32-byte compare after the status code (a latency has at most 10 digits), so the parse keeps one mask of spaces instead of masks of spaces and LFs | run-028f1cfc1335 | 0.0227 s | 21.7 MiB | 83.14 |
 | 27 | Back to step 25's code | pending | | | |
+| 28 | Slot index as the endpoint id (no id counter), table of 4,096 slots instead of 8,192, full CRC32 as the tag, selection with min/max shortcuts; comments dropped | pending | | | |
 
 ## Local measurements
 
