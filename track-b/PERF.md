@@ -89,7 +89,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 82 | Measurement only: before exiting, wait as long as everything before the scan took | run-13662d2445f0 | 0.201 | 44.1 | 71.59 |
 | 83 | Measurement only: before exiting, wait ten times as long as mapping the term table took | run-02ebeca44f3b | 0.143 | 44.7 | 75.24 |
 | 84 | Measurement only: before exiting, wait twice as long as everything before the scan took | run-9c03805108ff | 0.177 | 44.9 | 72.88 |
-| 85 | Non-terms spread over 16 spare ids, `last` prefetched 8 tokens ahead in the callback, phrase windows checked on an end term kept in the anchor's entry, bitmap bits set once per document | pending | | | |
+| 85 | Non-terms spread over 16 spare ids, `last` prefetched 8 tokens ahead in the callback, phrase windows checked on an end term kept in the anchor's entry, bitmap bits set once per document | run-5eeae6f0c8cf | 0.144 | 45.6 | 75.04 |
+| 86 | Back to step 80's code | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -338,6 +339,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 83 on the board, and step 84.** run-02ebeca44f3b: 0.1431 s, no rise at all, so the huge page costs nothing to get. Step 82's 55 to 59 ms is three times the laptop's 17 to 21, more than the clocks explain, and came from one run in a slow minute; step 84 repeats it with the wait doubled, so the rise should be about 110 ms if it holds.
 
 **Step 84 on the board, and step 85.** run-9c03805108ff: 0.1774 s against about 0.142 s, so twice the time before the scan is about 35 ms and the time itself about 17 ms, near what the laptop shows; step 82's single run was the outlier. Step 85 is a version written by hand from step 80: tokens that are no term are given one of 16 spare ids past the last term (`n + (i & 60)`) instead of one, so their marks do not all land on one word; the callback prefetches `last` for the token 8 ahead (the ids are followed by 8 zeros); each phrase anchor's entry carries the term at the window's other end, compared before the phrase is read; and a bitmap term's bit is set once per document, in the loop over new terms, instead of for every occurrence. As first written its posting streams grew in 16 KB chunks, below the 64 KB at which malloc maps blocks of their own, so the freed stream memory stayed in malloc's heap and the peak was 66 MB; with 64 KB chunks it is 47 MB as before. On the laptop it runs 133M fewer instructions but twice the mispredictions (the bitmap-or-list branch per new term), and cycles within noise of step 80. Same hash on all six datasets, 5 repeated full runs gave one hash.
+
+**Step 85 on the board, and step 86.** run-5eeae6f0c8cf: 0.1439 s at 45.6 MiB, 75.04, the same as step 80's 0.1431 s within the box's spread, with 14 more counted lines. Step 86 is step 80's code again.
 
 ## What the profile said, step by step
 
