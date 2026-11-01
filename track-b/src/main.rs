@@ -77,8 +77,8 @@ unsafe fn hash(p: *const u8, len: usize) -> u64 {
     (h ^ h >> 31).wrapping_mul(0xD6E8_FEB8_6659_FD93)
 }
 
-// Slots are probed four at a time from the start of the aligned group of four
-// the hash points into: a 32-byte compare finds the term or the first free
+// Slots are probed a cache line (eight) at a time from the start of the line
+// the hash points into: two 32-byte compares find the term or the first free
 // slot, which is where it would have been inserted.
 struct Terms {
     slot: &'static mut [u64],
@@ -87,19 +87,22 @@ struct Terms {
 
 impl Terms {
     fn find(&self, h: u64) -> u32 {
-        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 8));
         unsafe {
             let (tag, keep) = (_mm256_set1_epi64x((h & !ID_MASK) as i64), _mm256_set1_epi64x(!ID_MASK as i64));
             loop {
-                let v = _mm256_load_si256(self.slot.as_ptr().add(i).cast());
-                let hit = _mm256_cmpeq_epi64(_mm256_and_si256(v, keep), tag);
-                let found = _mm256_or_si256(hit, _mm256_cmpeq_epi64(v, _mm256_setzero_si256()));
-                let m = _mm256_movemask_pd(_mm256_castsi256_pd(found)) as usize;
+                let found = |at: usize| {
+                    let v = _mm256_load_si256(self.slot.as_ptr().add(at).cast());
+                    let hit = _mm256_cmpeq_epi64(_mm256_and_si256(v, keep), tag);
+                    let free = _mm256_cmpeq_epi64(v, _mm256_setzero_si256());
+                    _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(hit, free))) as usize
+                };
+                let m = found(i) | found(i + 4) << 4;
                 if m != 0 {
                     let s = *self.slot.get_unchecked(i + m.trailing_zeros() as usize);
                     return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32);
                 }
-                i = (i + 4) & mask;
+                i = (i + 8) & mask;
             }
         }
     }
@@ -111,7 +114,7 @@ impl Terms {
     }
 
     fn insert(&mut self, h: u64) -> u32 {
-        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 8));
         while self.slot[i] != 0 {
             if self.slot[i] >> ID_BITS == h >> ID_BITS {
                 return (self.slot[i] & ID_MASK) as u32 - 1;
@@ -363,7 +366,7 @@ impl Units {
 fn main() {
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
-    let n = (qtext.len() / 8).next_power_of_two().max(4);
+    let n = (qtext.len() / 16).next_power_of_two().max(8);
     // Mapped on its own and handed back after the scan. Every token's lookup
     // lands on a random line of it, so it is put on 2 MB pages (one TLB entry
     // instead of 512), faulted in before huge pages are turned off for the rest,
