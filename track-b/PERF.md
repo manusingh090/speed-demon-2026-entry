@@ -57,7 +57,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 50 | Queries parsed on all threads, in line-aligned pieces joined in order, into a lock-free term table | run-0849e5ad6dd0 | 0.178 | 50.1 | 72.32 |
 | 51 | Back to step 46's code | pending | | | |
 | 52 | Diagnostic: step 46's code with each thread scanning its share twice, the first result dropped (same output), so the extra time is the scan's cost on the box | run-6f25326f6975 | 0.311 | 50.4 | 66.45 |
-| 53 | Term table of 64-bit fingerprints: each slot holds the token's hash above its id, and no key array is kept or read | pending | | | |
+| 53 | Term table of 64-bit fingerprints: each slot holds the token's hash above its id, and no key array is kept or read | run-f0281b69a8d6 | 0.173 | 45.6 | 73.23 |
+| 54 | The tokenizer prefetches the corpus 2 KB ahead of each 64-byte window | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -236,6 +237,8 @@ Measured and kept out this session:
 **Step 50 on the board, and step 51.** run-0849e5ad6dd0: 0.178 s against 0.172 s, 3 MB more and 41 more counted lines, so the parallel parse loses on the box: the common terms are inserted or found by all twelve threads at once on the same slots and key lines, and the per-thread lists are copied once more to be joined. Step 51 is step 46's code again. Spreading the sample's sums and the renumbering over the threads (built after step 50) saved about 2 ms on the laptop for about 15 lines and stays out.
 
 **Steps 51 to 53.** Measured on the box by doing one phase twice with the same output: answering costs about 21 ms (step 48), the serial query parse about 17 ms (step 49), and the scan about 139 ms (step 52, 0.311 s against 0.172 s), 81% of the run where the laptop shows about 57%. Parallelising the query parse (step 50) lost on the box. So the scan is the work, and on the box it waits on memory. Each token was looked up in two tables, one dependent read after the other: the 2 MB slot array (32-bit hash tag and id), then the 2.4 MB key array to confirm the bytes, both beyond the L2 that two threads of a core share. Step 53 keeps one table: each slot holds the token's 64-bit hash above bit 18 and the id + 1 below, and a token matches a term when the 46 stored bits agree in a slot of its probe run. No key is stored or read back. With about 600,000 distinct tokens against 76,000 terms, a false match has a chance of about 1 in 10^9 a run (Track C's names rely on a 64-bit key the same way). The CRC hash had only 32 bits of entropy (CRC is linear, so a second seed adds none), so the 64 bits now come from multiplying and folding the key's words. On the laptop: 3% more instructions for the hash, 4 to 6% fewer cycles in each of three interleaved rounds, `cmp.ps1` (11 runs) median 163 against 181 ms, 46 against 47 MB. Same hash on all six datasets.
+
+**Step 53 on the board, and step 54.** run-f0281b69a8d6: 0.173 s, the same time, and 45.6 MiB against 47.2, the best Track B run so far at 73.23 by a little. Step 54 is Track C's step 11 here: the page cache's pages are scattered in physical memory and the hardware prefetcher stops at each 4 KB page, so the tokenizer asks for the line 2 KB ahead of each window. On the laptop it is within noise, as it was for Track C before the box gave it 3.7%. A slot table half the size (1 MB, more probes) cost 2.5% more instructions for no fewer cycles and stays out. Same hash on all six datasets.
 
 ## What the profile said, step by step
 

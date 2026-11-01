@@ -198,6 +198,9 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
             _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
             (*buf.add(out), out) = (id, out + 1);
         };
+        // The corpus's pages are scattered in memory and the hardware prefetcher
+        // stops at each 4 KB page; this reaches into the next one in time.
+        _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(2048).cast());
         let (word, nl) = classes(p);
         let stop = if nl != 0 { nl.trailing_zeros() } else { 64 }; // the window's bytes in this document
         let mut m = word & ((1u128 << stop) - 1) as u64;
