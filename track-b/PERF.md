@@ -51,7 +51,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 44 | A token's bits cleared from the window mask by adding its lowest bit (`m & (m + (m & -m))`) instead of a checked shift | run-6c03749873e8 | 0.175 | 47.3 | 73.02 |
 | 45 | The tokenizer prefetches each term's last-document mark as it resolves the token, so the handler finds it in cache | run-56404803018d | 0.174 | 47.1 | 73.07 |
 | 46 | Term lookup without bounds checks; token ids written into room reserved once per 64-byte window | pending | | | |
-| 47 | All threads unmap (`MADV_DONTNEED`) their share of docs.txt right after the scan, instead of the whole 254 MB being torn down at exit by one thread | pending | | | |
+| 47 | All threads unmap (`MADV_DONTNEED`) their share of docs.txt right after the scan, instead of the whole 254 MB being torn down at exit by one thread | run-47fab754c7f7 | 0.174 | 47.3 | 72.97 |
+| 48 | Diagnostic: step 46's code with every query answered twice, the first answers overwritten (same output), so the extra time is the answer phase's cost on the box | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -220,6 +221,8 @@ Measured and kept out this session:
 - Keys and hashes computed for all query terms first, then inserted with the slot prefetched 16 terms ahead, and idle threads pre-faulting the corpus during the query parse: no faster, 12 MB more.
 
 **Step 47.** Found on Track A by measuring its phases on the box (doing one phase twice, output unchanged): a large part of its time outside the work was the process exit tearing down the mapping of its 239 MB input on one thread. Unmapping the input in parallel before exit took Track A from 0.026 to 0.0215 s (run-1bfda4424f2e) and Track C from 0.0322 to 0.0288 s (run-ed042f9337ff); on Track D, where the threads unmapped while others were still faulting pages in, it was slower. Here the scan is the last reader of docs.txt and ends for all threads together, so every thread unmaps its share just after it, with no thread faulting the file in. Same hash on all six datasets; ten repeated full runs gave one hash.
+
+**Step 47 on the board, and step 48.** run-47fab754c7f7: 0.174 s against 0.172 s, no gain here, so it goes. Step 48 measures the phases on the box instead, as on Track A: one phase done twice with the same output, the extra time being that phase's cost there. On the laptop the answer phase is 11 to 17 ms of 178.
 
 ## What the profile said, step by step
 
