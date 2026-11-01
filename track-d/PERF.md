@@ -45,6 +45,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 23 | Back to step 21's code (no board run of its own: superseded by the diagnostic) | | | | |
 | 23d | Diagnostic: time to the start of the searches reported through M | run-c7795c71063c | (0.304 s) | (290 MiB) | |
 | 24 | Reverse offsets summed in parallel and built without the final shift; chain edge totals counted during the blob BFS | pending | | | |
+| 25 | Renumbering walks the old edge list with a cursor, so the old offsets are freed first; the old graph is freed by all threads before the reverse graph is allocated | pending | | | |
 
 ## What the profile said, step by step
 
@@ -133,6 +134,8 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Step 23 diagnostic.** The laptop's phase timers have misled twice now (steps 18 and 22), so this run measured the box itself. The board reports memory to the byte, so the diagnostic build notes the time at which the searches start and, after writing the answers, touches 200 MiB plus one MiB per millisecond of it; locally the memory left at that point is 4 to 5 MiB. run-c7795c71063c reported 303,976,448 bytes (289.9 MiB), so on the box the searches start about 85 ms after exec: of step 21's 0.16 s, about 85 ms is parse and build and about 75 ms is the searches, the release and the exit.
 
 **Step 23 to 24.** Three serial pieces of the build went: the reverse graph's offsets are summed by all threads (two passes over shares) instead of one; the in-degrees are counted into roff[v + 2], so that roff[v + 1] serves as v's cursor and ends at the start of v + 1, which removes the 7 MB shift after the fill; and each blob thread totals its chain's edges as it records the degrees, instead of a serial sum over 1.74 million degrees afterwards. Six `perf stat -r 5` rounds against step 21: median 0.173 against 0.197 s (a loaded laptop), 170 ms less CPU, five of six pairs. Same hash on all thirty datasets.
+
+**Step 24 to 25: memory.** The leaders run in 44 to 59 MB against our 63 MiB, and M is a fifth of K. Phase by phase (cgroup `memory.current` and `memory.peak` at each phase), the peak was not the searches but the reverse graph's count pass: 64.5 MiB, with the old graph (offsets, edges, id map, 34 MB) still being freed on a side thread while the reverse arrays filled. The part build reached 60.3 and the renumbering 63.2. Now the renumbering walks each thread's share of the old edge list with a cursor, a node's degree read off the new offsets, so the old offsets (7 MB) are freed before it; and after it all threads drop the old edges and the id map with `MADV_DONTNEED` before the reverse graph is allocated. Peak 64 to 62 MiB locally, now at the searches (55.5 MiB of graph plus about 7 MiB of per-thread distances and heaps), with the part build next at 60.3. Time unchanged within noise (six rounds: median 0.165 against 0.170 s, three pairs each). Same hash on all thirty datasets.
 
 ## Tried and kept out
 

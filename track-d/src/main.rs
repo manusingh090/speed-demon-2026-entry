@@ -558,29 +558,34 @@ fn main() {
     drop((claimed, chains));
 
     // The graph in the new numbering: each edge's head mapped (weight bits
-    // kept), with the random reads of later nodes started 8 and 4 nodes early.
+    // kept), with the random reads started early. A thread walks its share of
+    // the old edge list with a cursor, each node's degree read off the new
+    // offsets, so the old offsets can go first.
+    let cursor: Vec<u32> = (0..nt).map(|t| first[share(n, t, nt).start]).collect();
+    drop(first_v);
     let id = &id_v[..];
     let mut adj = vec![0u32; m];
     let ar = Raw::of(&mut adj);
     let off = &off;
     let mut heavy2: Vec<(u32, u32)> = on_threads(nt, |t| {
-        let (mut out, r) = (Vec::new(), share(n, t, nt));
+        let (mut out, r, mut e) = (Vec::new(), share(n, t, nt), cursor[t]);
         for u in r.clone() {
             if u + 8 < r.end {
                 prefetch(&off[id[u + 8] as usize]);
-                (first[u + 8]..first[u + 9]).for_each(|e| prefetch(&id[(link[e as usize] & hmask) as usize]));
             }
             if u + 4 < r.end {
                 prefetch(unsafe { ar.at(off[id[u + 4] as usize] as usize) });
             }
-            let mut j = off[id[u] as usize];
-            for e in first[u]..first[u + 1] {
+            for j in off[id[u] as usize]..off[id[u] as usize + 1] {
+                if let Some(&y) = link.get(e as usize + 24) {
+                    prefetch(&id[(y & hmask) as usize]);
+                }
                 let x = link[e as usize];
                 if x >> hb == big {
                     out.push((j, heavy_weight(&heavy, e)));
                 }
                 unsafe { *ar.at(j as usize) = id[(x & hmask) as usize] | (x & !hmask) };
-                j += 1;
+                e += 1;
             }
         }
         out
@@ -588,9 +593,10 @@ fn main() {
     .concat();
     heavy2.sort_unstable();
     // Queries in the new numbering (sorted later), then the old graph and the
-    // id map can go, freed on a side thread while the reverse graph is built.
+    // id map go, freed by all threads before the reverse graph is allocated.
     let ends: Vec<(u32, u32)> = queries.iter().map(|&(s, t)| (id[s as usize], id[t as usize])).collect();
-    std::thread::spawn(move || drop((heavy, first_v, link_v, id_v)));
+    on_threads(nt, |t| (drop_pages(link, t, nt), drop_pages(id, t, nt)));
+    drop((heavy, link_v, id_v));
 
     // The reverse graph in the same format: in-degrees counted into
     // roff[v + 2] and summed, so roff[v + 1] is where v's in-edges start; as
