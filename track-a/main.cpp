@@ -79,22 +79,6 @@ inline void put(char *end, u32 x) {
     end[-1] = '0' + x;
 }
 
-// The value of the len (1 to 10) digits ending just before end, with no loop:
-// the 16 bytes before end, less '0' and with the bytes ahead of the number
-// zeroed, combined 2, 4 and then 8 digits at a time.
-inline u32 decode(const char *end, u32 len) {
-  __m128i v = _mm_subs_epu8(_mm_loadu_si128((const __m128i *)(end - 16)),
-                            _mm_set1_epi8('0'));
-  __m128i lane =
-      _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-  v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
-  v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
-  v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));
-  v = _mm_madd_epi16(_mm_packus_epi32(v, v), _mm_set1_epi32(0x00012710));
-  return u32(_mm_cvtsi128_si32(v)) * u64(100000000) +
-         u32(_mm_extract_epi32(v, 1));
-}
-
 // Puts the k-th smallest of a[0, n) at a[k], the smaller ones before it,
 // without a branch on the data: each round partitions around the median of
 // three with an unconditional swap. Many equal values could shrink a round by
@@ -222,7 +206,7 @@ struct Parser {
       // After " SSS " come the latency's digits (bit 0x10 set) and the LF
       // (clear). Up to 7 digits are decoded in one word: moved to its top,
       // so the bytes below read as leading zeros, then combined 2, 4 and 8
-      // at a time with multiplies. Longer latencies take the SIMD path.
+      // at a time with multiplies. Longer ones (rare) go digit by digit.
       u64 w, digits;
       memcpy(&w, ne + 5, 8);
       u32 len, lat;
@@ -233,8 +217,8 @@ struct Parser {
         digits = (digits * 6553601) >> 16 & 0x0000FFFF0000FFFF;
         lat = (digits * 42949672960001) >> 32;
       } else
-        len = __builtin_ctz(eq32(ne + 5, '\n')),
-        lat = decode(ne + 5 + len, len);
+        for (len = lat = 0; ne[5 + len] != '\n'; ++len)
+          lat = lat * 10 + ne[5 + len] - '0';
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
       p = ne + 6 + len;
       if (__builtin_expect(lat >= PACKED_MAX, 0)) {
