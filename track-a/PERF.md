@@ -165,6 +165,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 
 **Step 44 on the board.** run-545cc82ae638: 17.7 MiB, the lowest Track A memory so far (step 40's runs: 18.0 to 18.7 MiB), and 344 lines. Its 0.0229 s came in a slow run for every track: Track C's unchanged code took 0.0296 s there against its usual 0.0284 s.
 
+**Step 44's best run.** Later pushes for other tracks ran step 44's code again: run-a5cbcba2db02 (commit ad04ba8) took **0.0203 s at 18.1 MiB, 344 lines, 84.84 points**, the best Track A run so far (the previous best was step 25's run-38c8b98f7941, 0.0209 s and 84.75), and run-35b66d0323a7 (commit f0ac06e) reached 17.5 MiB, the lowest memory so far.
+
 ## Tried and kept out
 
 - **The hour phase priced by switching parts off** (laptop, user-mode `perf stat`): the three selections per group are 135M of 685M user instructions and about 80M of 410M cycles; placing each latency at its group's cursor about 20M cycles more. **Counting sort by endpoint and latency octave** (16 octaves of bit length), so each percentile is found in a known octave and selected among that octave's latencies only (the median's octave holds about a fifth of a group): correct, but 683M instructions against 685M and the same cycles, as the octave is computed twice a record and the counting table is 16 times larger; 2 MB more at peak. Kept out.
