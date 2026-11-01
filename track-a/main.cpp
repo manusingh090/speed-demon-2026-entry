@@ -180,6 +180,9 @@ struct Parser {
 
     void run(const char* p, const char* end) {
         while (p < end) {
+            // The log's pages are scattered in memory and the hardware prefetcher
+            // stops at each 4 KB page; this reaches into the next one in time.
+            _mm_prefetch(p + 2048, _MM_HINT_T0);
             // YYYY-MM-DDTHH: month's last digit at 6, day at 8-9, hour at 11-12.
             int day = (p[8] - '0') * 10 + (p[9] - '0'), hour = (p[11] - '0') * 10 + (p[12] - '0');
             int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
