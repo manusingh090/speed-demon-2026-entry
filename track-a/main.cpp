@@ -64,6 +64,21 @@ inline u32 width(u32 x) {
   return t + ((x | 1) >= p10[t]);
 }
 
+// Writes x in decimal ending at end, whose width is already known, two digits
+// at a time from a table of the 100 pairs.
+inline void put(char *end, u32 x) {
+  static constexpr char pairs[] =
+      "000102030405060708091011121314151617181920212223242526272829303132333435"
+      "363738394041424344454647484950515253545556575859606162636465666768697071"
+      "72737475767778798081828384858687888990919293949596979899";
+  for (; x >= 100; x /= 100)
+    memcpy(end -= 2, &pairs[x % 100 * 2], 2);
+  if (x >= 10)
+    memcpy(end - 2, &pairs[x * 2], 2);
+  else
+    end[-1] = '0' + x;
+}
+
 // The value of the len (1 to 10) digits ending just before end, with no loop:
 // the 16 bytes before end, less '0' and with the bytes ahead of the number
 // zeroed, combined 2, 4 and then 8 digits at a time.
@@ -397,7 +412,7 @@ int main() {
           o = std::copy_n(label, 21, o);
           o = std::copy(names[l.e].begin(), names[l.e].end(), o);
           for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
-            *o++ = ' ', o = std::to_chars(o, o + 10, x).ptr;
+            *o = ' ', o += 1 + width(x), put(o, x);
           *o++ = '\n';
         }
         std::vector<Line>().swap(lines[h]);
