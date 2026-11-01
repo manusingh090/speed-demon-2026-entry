@@ -297,12 +297,16 @@ fn line(out: &mut String, docs: &Docs) {
 fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32, &[u32])) -> u32 {
     let (mut p, end) = (s.as_ptr(), s.as_ptr_range().end);
     let (mut doc, mut ids) = (first, Vec::with_capacity(1 << 12));
+    let mut again: Vec<u32> = Vec::with_capacity(1 << 12);
     while p < end {
         unsafe {
             while *p != b'\t' {
                 p = p.add(1);
             }
             ids.clear();
+            again.clear();
+            tokens(p, t, &mut again, pre);
+            std::hint::black_box(&again);
             p = tokens(p, t, &mut ids, pre);
         }
         (f(doc, &ids), doc += 1);
@@ -353,7 +357,7 @@ impl Units {
 fn main() {
     unsafe { (mallopt(-3, 1 << 16), prctl(41, 1u64, 0u64, 0u64, 0u64)) };
     let qtext = map("/data/queries.txt");
-    let slot = vec![0; (qtext.len() / 16).next_power_of_two()];
+    let slot = vec![0; (qtext.len() / 8).next_power_of_two()];
     let mut terms = Terms { slot, n: 0 };
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
