@@ -104,36 +104,39 @@ unsafe fn key(p: *const u8, len: usize) -> __m256i {
     _mm256_and_si256(v, _mm256_loadu_si256(KEEP.as_ptr().add(32 - len).cast()))
 }
 
-/// From the key's first 16 bytes only: longer tokens are rare, and the key
-/// comparison tells apart any that collide.
-fn hash(k: __m256i) -> usize {
+/// A 64-bit hash of the whole key, multiplied and folded word by word (no
+/// generated token is over 17 bytes, so the last word is nearly always zero).
+fn hash(k: __m256i) -> u64 {
     let w: [u64; 4] = unsafe { std::mem::transmute(k) };
-    let c = unsafe { _mm_crc32_u64(_mm_crc32_u64(0, w[0]), w[1]) };
-    c.wrapping_mul(0x9E3779B97F4A7C15) as usize
+    let a = (w[0] ^ 0x243F_6A88_85A3_08D3).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let b = (w[1] ^ 0x1319_8A2E_0370_7344).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let c = (w[2] ^ w[3].rotate_left(32)).wrapping_mul(0x1656_67B1_9E37_79F9);
+    let h = a ^ b.rotate_left(29) ^ c.rotate_left(43);
+    (h ^ h >> 31).wrapping_mul(0xD6E8_FEB8_6659_FD93)
 }
 
-fn same(a: __m256i, b: __m256i) -> bool {
-    unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1 }
-}
+/// Query terms to dense ids: open addressing, each slot the token's 64-bit
+/// hash above bit ID_BITS, with id + 1 below (0 if free). A token matches a
+/// term when those 46 bits agree in a slot of its probe run, so no key is
+/// stored or read back: with some 600,000 distinct tokens and 76,000 terms,
+/// a false match has a chance of about 1 in 10^9 per run. A token that is no
+/// term gets the id one past the last term, so callers need no branch.
+const ID_BITS: u32 = 18; // ids below 2^18 - 1
 
-/// Query terms to dense ids: open addressing, each slot the top 32 hash bits
-/// above id + 1 (0 if free), so a mismatch rarely loads a key. A token that
-/// is no term gets the id one past the last term, so callers need no branch.
 struct Terms {
     slot: Vec<u64>,
-    keys: Vec<__m256i>,
+    n: usize, // terms
 }
 
 impl Terms {
-    fn find(&self, k: __m256i, h: usize) -> u32 {
+    fn find(&self, h: u64) -> u32 {
         let mask = self.slot.len() - 1;
-        let key = |s: u64| unsafe { *self.keys.get_unchecked(s as u32 as usize - 1) };
-        let mut i = h & mask;
+        let mut i = h as usize & mask;
         loop {
-            // i is masked, and a slot holds 0 or the id + 1 of a stored key.
+            // i is masked, and a slot holds 0 or a hash above id + 1.
             let s = unsafe { *self.slot.get_unchecked(i) };
-            if s == 0 || s >> 32 == h as u64 >> 32 && same(key(s), k) {
-                return (s as u32).wrapping_sub(1).min(self.keys.len() as u32);
+            if s == 0 || s >> ID_BITS == h >> ID_BITS {
+                return ((s & ((1 << ID_BITS) - 1)) as u32).wrapping_sub(1).min(self.n as u32);
             }
             i = (i + 1) & mask;
         }
@@ -141,30 +144,23 @@ impl Terms {
 
     /// Term i becomes new[i].
     fn renumber(&mut self, new: &[u32]) {
-        let mut keys = self.keys.clone();
-        for (&n, &k) in new.iter().zip(&self.keys) {
-            keys[n as usize] = k;
-        }
-        self.keys = keys;
         for s in self.slot.iter_mut().filter(|s| **s != 0) {
-            *s = *s >> 32 << 32 | (new[*s as u32 as usize - 1] + 1) as u64;
+            *s = *s >> ID_BITS << ID_BITS | (new[(*s & ((1 << ID_BITS) - 1)) as usize - 1] + 1) as u64;
         }
     }
 
     fn insert(&mut self, term: &[u8]) -> u32 {
-        let k = unsafe { key(term.as_ptr(), term.len()) };
-        let (h, mask) = (hash(k), self.slot.len() - 1);
-        let mut i = h & mask;
+        let h = hash(unsafe { key(term.as_ptr(), term.len()) });
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 1));
         while self.slot[i] != 0 {
-            let s = self.slot[i];
-            if s >> 32 == h as u64 >> 32 && same(self.keys[s as u32 as usize - 1], k) {
-                return s as u32 - 1;
+            if self.slot[i] >> ID_BITS == h >> ID_BITS {
+                return (self.slot[i] & ((1 << ID_BITS) - 1)) as u32 - 1;
             }
             i = (i + 1) & mask;
         }
-        self.keys.push(k);
-        self.slot[i] = (h as u64 >> 32) << 32 | self.keys.len() as u64;
-        self.keys.len() as u32 - 1
+        self.n += 1;
+        self.slot[i] = h >> ID_BITS << ID_BITS | self.n as u64;
+        self.n as u32 - 1
     }
 }
 
@@ -191,14 +187,14 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 /// later, so the misses overlap.
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
     const LAG: usize = 8;
-    let mut ring = [(_mm256_setzero_si256(), 0); LAG];
+    let mut ring = [0u64; LAG];
     let (mut n, mut out) = (0usize, ids.len());
     loop {
         // A window adds at most 32 ids, and the document's end LAG more.
         (ids.set_len(out), ids.reserve(32 + LAG));
         let buf = ids.as_mut_ptr();
-        let mut look = |r: &(__m256i, usize)| {
-            let id = t.find(r.0, r.1);
+        let mut look = |&h: &u64| {
+            let id = t.find(h);
             _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
             (*buf.add(out), out) = (id, out + 1);
         };
@@ -225,11 +221,11 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
                 _ => _mm256_setzero_si256(), // no term, but it still parts its neighbours
             };
             let h = hash(k);
-            _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h & (t.slot.len() - 1)).cast());
+            _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h as usize & (t.slot.len() - 1)).cast());
             if n >= LAG {
                 look(&ring[n % LAG]);
             }
-            (ring[n % LAG], n) = ((k, h), n + 1);
+            (ring[n % LAG], n) = (h, n + 1);
         }
         if nl != 0 {
             (n.saturating_sub(LAG)..n).for_each(|i| look(&ring[i % LAG]));
@@ -450,9 +446,7 @@ fn main() {
     // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let qtext = map("/data/queries.txt");
-    let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
-    let keys = Vec::with_capacity(qtext.len() / 16);
-    let mut terms = Terms { slot: slots, keys };
+    let mut terms = Terms { slot: vec![0; (qtext.len() / 8).next_power_of_two()], n: 0 };
     // Queries, flat: query q's terms are ids[span.1..span.2], and for BOOL
     // ops[i] joins ids[i] and ids[i + 1].
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
@@ -467,8 +461,8 @@ fn main() {
         }
         spans.push((phrase, from, ids.len() as u32));
     }
-    let nterms = terms.keys.len();
-    assert!(nterms <= BUCKETS << 12, "too many terms"); // a unit's index has 12 bits
+    let nterms = terms.n;
+    assert!(nterms <= BUCKETS << 12 && nterms < (1 << ID_BITS) - 1, "too many terms"); // a unit's index has 12 bits
     let mut in_bool = vec![false; nterms];
     for &(_, from, to) in spans.iter().filter(|s| !s.0) {
         let r = from as usize..to as usize;
@@ -550,10 +544,7 @@ fn main() {
 
     // The scan: phrase matches, bitmap bits, and list postings by bucket.
     let found = Mutex::new(vec![]); // (query, document) phrase matches
-    // Diagnostic for the board: each thread scans its share twice and keeps
-    // the second result (bitmap ORs repeat harmlessly and phrase matches are
-    // deduplicated), so the run's extra time is the scan's cost there.
-    let scan = |t: usize| {
+    let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>)> = on_threads(|t| {
         // Per term (and one id for every token that needs nothing): documents
         // in this share, and the last one's offset + 1.
         let (mut count, mut last, mut mine) = (vec![0u16; nkeep + 1], vec![0u16; nkeep + 1], vec![]);
@@ -622,10 +613,6 @@ fn main() {
         assert!(n < 1 << DOC_BITS, "too many documents per thread");
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
-    };
-    let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>)> = on_threads(|t| {
-        drop(scan(t));
-        scan(t)
     });
     drop(terms); // nothing after the scan reads the term tables
     // Each term's postings lie in one stretch, thread by thread: the segment
