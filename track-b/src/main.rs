@@ -109,8 +109,7 @@ impl Terms {
         }
     }
 
-    fn insert(&mut self, term: &[u8]) -> u32 {
-        let h = unsafe { hash(term.as_ptr(), term.len()) };
+    fn insert(&mut self, h: u64) -> u32 {
         let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
         while self.slot[i] != 0 {
             if self.slot[i] >> ID_BITS == h >> ID_BITS {
@@ -137,8 +136,9 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
     (w0 | w1 << 32, n0 | n1 << 32)
 }
 
+// The ids of the document at p, appended to ids after LAG throwaway ones.
+const LAG: usize = 8;
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
-    const LAG: usize = 8;
     let mut ring = [0u64; LAG];
     let (mut n, mut out, mask) = (0usize, ids.len(), t.slot.len() - 1);
     loop {
@@ -170,13 +170,11 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
             m &= e;
             let h = if len <= 32 { hash(p.add(s as usize), len as usize) } else { 0 };
             _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h as usize & mask).cast());
-            if n >= LAG {
-                look(&ring[n % LAG]);
-            }
+            look(&ring[n % LAG]);
             (ring[n % LAG], n) = (h, n + 1);
         }
         if nl != 0 {
-            (n.saturating_sub(LAG)..n).for_each(|i| look(&ring[i % LAG]));
+            (n..n + LAG).for_each(|i| look(&ring[i % LAG]));
             ids.set_len(out);
             return p.add(stop as usize + 1);
         }
@@ -316,7 +314,7 @@ fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32,
             ids.clear();
             p = tokens(p, t, &mut ids, pre);
         }
-        (f(doc, &ids), doc += 1);
+        (f(doc, &ids[LAG..]), doc += 1);
     }
     doc - first
 }
@@ -375,11 +373,20 @@ fn main() {
         for (k, word) in q[start..q.len() - phrase as usize].split(|&b| b == b' ').enumerate() {
             match !phrase && k % 2 == 1 {
                 true => *ops.last_mut().unwrap() = word[0],
-                false => (ids.push(terms.insert(word)), ops.push(0)).1,
+                false => (ids.push(unsafe { hash(word.as_ptr(), word.len()) }), ops.push(0)).1,
             }
         }
         spans.push((phrase, from, ids.len() as u32));
     }
+    // The terms' hashes come first, so each insert's slot is fetched 16 ahead.
+    let slot = terms.slot.as_ptr();
+    let mut ids: Vec<u32> = (0..ids.len())
+        .map(|k| {
+            let ahead = ids.get(k + 16).map_or(0, |&h| h as usize & (terms.slot.len() - 4));
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(slot.add(ahead).cast()) };
+            terms.insert(ids[k])
+        })
+        .collect();
     let nterms = terms.n;
     let text = map("/data/docs.txt");
     let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
