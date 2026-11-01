@@ -106,36 +106,46 @@ class NameTable {
 public:
     static constexpr u32 BITS = 17, SLOTS = 1 << BITS;  // the pool holds 100,000 names
 
+    static u64 mix(u64 a, u64 b) {
+        unsigned __int128 p = (unsigned __int128)a * b;
+        return u64(p) ^ u64(p >> 64);
+    }
+
     static u64 key(const char* s, u32 len) {
         static constexpr char KEEP[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
         __m128i head = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
         head = _mm_and_si128(head, _mm_loadu_si128(reinterpret_cast<const __m128i*>(KEEP + 16 - std::min(len, 16u))));
-        u64 h = (u64(_mm_cvtsi128_si64(head)) * 0x9E3779B97F4A7C15ull ^ len) + u64(_mm_extract_epi64(head, 1)) * 0xBF58476D1CE4E5B9ull;
+        // The two words, each XORed with a constant that has bytes of 0x80
+        // and over (so never zero: the text is ASCII), multiplied to 128
+        // bits and folded, as in wyhash; a longer name's further words are
+        // folded in the same way.
+        u64 h = mix(u64(_mm_cvtsi128_si64(head)) ^ 0x9E3779B97F4A7C15ull,
+                    u64(_mm_extract_epi64(head, 1)) ^ len ^ 0xBF58476D1CE4E5B9ull);
         for (u32 i = 16; i < len; i += 8) {
             u64 w = load8(s + i);
             if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
-            h = (h ^ w) * 0x94D049BB133111EBull;
+            h = mix(h ^ w, 0x94D049BB133111EBull);
         }
-        h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
-        h ^= h >> 32;
-        return h + (h == 0);  // 0 marks a free slot
+        return h;
     }
 
     void prefetch(u64 k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[k >> (64 - BITS)]), _MM_HINT_T0); }
 
-    // Slots are probed four at a time, from the aligned group of four the key
-    // hashes to: one 32-byte compare finds the key, or the first free slot,
-    // which is claimed (no key ever sits past a free slot, as none is freed).
+    // A slot holds the key's low 32 bits (never 0: 0 is a free slot); the
+    // top bits choose the aligned group of eight it starts in. Groups are
+    // probed whole: one 32-byte compare finds the key, or the first free
+    // slot, which is claimed (no key ever sits past a free slot, as none is
+    // freed).
     u32 id(u64 k) {
-        for (u32 i = k >> (64 - BITS) & ~3u;; i = (i + 4) % SLOTS) {
+        const u32 tag = u32(k) | (u32(k) == 0);
+        for (u32 i = k >> (64 - BITS) & ~7u;; i = (i + 8) % SLOTS) {
             __m256i v = _mm256_load_si256(reinterpret_cast<const __m256i*>(&slots_[i]));
-            u32 hit = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_set1_epi64x(k))));
-            u32 free = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())));
+            u32 hit = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, _mm256_set1_epi32(tag))));
+            u32 free = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, _mm256_setzero_si256())));
             if (hit) return i + __builtin_ctz(hit);
             for (; free; free &= free - 1) {
-                u32 j = i + __builtin_ctz(free);
-                u64 s = 0;
-                if (slots_[j].compare_exchange_strong(s, k) || s == k) return j;
+                u32 j = i + __builtin_ctz(free), s = 0;
+                if (slots_[j].compare_exchange_strong(s, tag) || s == tag) return j;
             }
         }
     }
@@ -144,7 +154,7 @@ public:
     void populate(int t, int n) const { populate_share(slots_, SLOTS, t, n); }
 
 private:
-    std::atomic<u64>* slots_ = zeroed<std::atomic<u64>>(SLOTS);  // 0 = free
+    std::atomic<u32>* slots_ = zeroed<std::atomic<u32>>(SLOTS);  // 0 = free
 };
 
 // One country's running aggregates (per thread, summed at the end). The
@@ -216,7 +226,7 @@ struct Numbers {
 // word prefetched; LAG records after that the name is marked. So each of the
 // three random reads (region table, name table, bitsets) has a steady lead.
 void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
-                   size_t regions, NameTable& names, NamesSeen& seen, Totals* totals) {
+                   size_t regions, NameTable names, NamesSeen seen, Totals* totals) {
     constexpr u64 LAG = 16;
     struct Pending {
         u64 name;
