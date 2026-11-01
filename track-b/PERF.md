@@ -44,8 +44,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 37 | Term order from one unstable sort of packed (class, rarity, id) keys | run-82fdc51f9741 (with 38) | | | |
 | 38 | AND and NOT of two lists totalling over 768 documents go through a bitmap of the term's list instead of a merge | run-82fdc51f9741 | 0.180 | 46.7 | 72.66 |
 | 39 | The frequency sample reads the first 1/64 of each thread's share instead of 1/32 | run-b3fbbbcbb03a | 0.216 | 48.4 | 70.53 |
-| 40 | Count and position sum of a bitmap answer with AVX2, four words at a time; the sample back to 1/32 | pending (with 41) | | | |
-| 41 | OR of two lists totalling over 2,048 documents goes into a bitmap | pending | | | |
+| 40 | Count and position sum of a bitmap answer with AVX2, four words at a time; the sample back to 1/32 | run-393a2f308eda (with 41) | | | |
+| 41 | OR of two lists totalling over 2,048 documents goes into a bitmap | run-393a2f308eda | 0.178 | 47.1 | 72.52 |
+| 42 | The same code in 602 counted lines instead of 671: bitmaps padded to whole vectors, and long chains and tuples split where rustfmt would wrap them | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -179,6 +180,10 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Step 40.** The bitmap sums now run four words at a time with AVX2: popcounts by nibble lookup (`vpshufb`) summed per word (`vpsadbw`), the six position masks applied per vector, and the word-index part as one multiply per vector. The scan for the ten smallest ids stops once it has them. 4.1% fewer instructions and about 3.5% fewer cycles here; on the box, which has no AVX-512, the old loop was scalar, so the gain there should be larger.
 
 **Step 41.** With bitmap answers now cheap to count, an OR of two lists totalling over 2,048 documents is set into a bitmap instead of merged (rejected at step 38, when counting a bitmap answer cost seven scalar popcounts per word). 3.5% fewer cycles in each of 5 interleaved rounds, and only a wider condition on an existing arm. A branch-free filter for list against bitmap removed a million branch misses but no cycles, and stayed out.
+
+**Steps 40 and 41 on the board.** run-393a2f308eda: 0.1775 s, the fastest Track B run so far, 47.1 MiB, but 671 counted lines against 620, so K 28.21 and 72.52 points, just under step 38's 72.66. rustfmt had spread the 32-entry nibble table, the six masks and several tuples one item per line.
+
+**Step 42.** A local count now matches the board exactly (rustfmt 1.10, then `scc` over the source and the Dockerfile: 620 for step 38, 671 for step 41). rustfmt's default heuristics split a method chain over 60 characters, a struct literal over 18 and an `if`/`else` over 50, which added 66 lines at 28 places. The bitmaps are now padded to whole 4-word vectors (so `bit_sums` needs no scalar tail), its masks come from one formula and its table is 16 bytes, and fifteen long chains and tuples became two short statements each. 602 lines, same hashes, same instructions to within 1%.
 
 Measured and kept out this session (from step 36 on):
 - OR of two long lists into a bitmap (over 1,024 or 4,096 documents): more cycles, since the bitmap results cost more to count and sum.

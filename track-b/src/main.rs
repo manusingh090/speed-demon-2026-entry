@@ -70,7 +70,8 @@ fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     gate.wait();
     run(0);
     gate.wait();
-    out.into_iter().map(|r| r.into_inner().unwrap().unwrap()).collect()
+    let take = |r: Mutex<Option<R>>| r.into_inner().unwrap().unwrap();
+    out.into_iter().map(take).collect()
 }
 
 /// The decimal number at text[i..].
@@ -169,7 +170,8 @@ impl Terms {
 /// letter lies in 'a'..='z', and a digit lies in '0'..='9' as is), and LFs.
 unsafe fn classes(p: *const u8) -> (u64, u64) {
     let half = |q: *const u8| {
-        let (v, c) = (_mm256_loadu_si256(q.cast()), |b: u8| _mm256_set1_epi8(b as i8));
+        let v = _mm256_loadu_si256(q.cast());
+        let c = |b: u8| _mm256_set1_epi8(b as i8);
         let at_most = |x: __m256i, n: u8| _mm256_cmpeq_epi8(_mm256_subs_epu8(x, c(n)), c(0));
         let letter = _mm256_sub_epi8(_mm256_or_si256(v, c(0x20)), c(b'a'));
         let word = _mm256_or_si256(at_most(letter, 25), at_most(_mm256_sub_epi8(v, c(b'0')), 9));
@@ -209,8 +211,10 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>) -> *const u8 {
                 len = next;
             }
             m &= (!0u64).checked_shl(s + len).unwrap_or(0); // the tokens after this one
-            // A token of over 32 bytes is no term, but it still parts its neighbours.
-            let k = if len <= 32 { key(p.add(s as usize), len as usize) } else { _mm256_setzero_si256() };
+            let k = match len {
+                ..=32 => key(p.add(s as usize), len as usize),
+                _ => _mm256_setzero_si256(), // no term, but it still parts its neighbours
+            };
             let h = hash(k);
             _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h & (t.slot.len() - 1)).cast());
             if n >= LAG {
@@ -309,35 +313,31 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
     }
 }
 
-/// The number of set bits in b and the sum of their positions, four words at
-/// a time: popcounts by nibble lookup, and position bit k counted from the
-/// bits under mask SEL[k] (bit k of a position adds 2^k).
+/// The number of set bits in b (whole 4-word vectors) and the sum of their
+/// positions, with AVX2: popcounts by nibble lookup summed per word, and bit
+/// k of the positions counted from the bits under a mask.
 unsafe fn bit_sums(b: &[u64]) -> (u64, u64) {
-    const SEL: [u64; 6] = [0xAAAA_AAAA_AAAA_AAAA, 0xCCCC_CCCC_CCCC_CCCC, 0xF0F0_F0F0_F0F0_F0F0, 0xFF00_FF00_FF00_FF00, 0xFFFF_0000_FFFF_0000, 0xFFFF_FFFF_0000_0000];
-    let nib = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
-    let low = _mm256_set1_epi8(0x0F);
-    let pop = |v: __m256i| {
-        let n = _mm256_add_epi8(_mm256_shuffle_epi8(nib, _mm256_and_si256(v, low)), _mm256_shuffle_epi8(nib, _mm256_and_si256(_mm256_srli_epi16::<4>(v), low)));
-        _mm256_sad_epu8(n, _mm256_setzero_si256()) // per word
-    };
-    let (mut acc, mut at, mut word) = ([_mm256_setzero_si256(); 7], _mm256_setzero_si256(), _mm256_setr_epi64x(0, 1, 2, 3));
-    let quads = b.len() / 4;
-    for i in 0..quads {
-        let v = _mm256_loadu_si256(b.as_ptr().add(4 * i).cast());
+    const NIB: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]; // bits set in 0..16
+    let nib = _mm256_broadcastsi128_si256(_mm_loadu_si128(NIB.as_ptr().cast()));
+    let (low, z) = (_mm256_set1_epi8(0x0F), _mm256_setzero_si256());
+    let h = |v: __m256i| _mm256_shuffle_epi8(nib, _mm256_and_si256(v, low));
+    let pop = |v: __m256i| _mm256_sad_epu8(_mm256_add_epi8(h(v), h(_mm256_srli_epi16::<4>(v))), z);
+    // The bits whose position has bit k set: 0xAAAA.., 0xCCCC.., ..., 0xFFFF_FFFF_0000_0000.
+    let sel = |k: usize| _mm256_set1_epi64x(!(u64::MAX / ((1u64 << (1 << k)) + 1)) as i64);
+    let (mut acc, mut word) = ([z; 8], _mm256_setr_epi64x(0, 1, 2, 3));
+    for q in b.chunks_exact(4) {
+        let v = _mm256_loadu_si256(q.as_ptr().cast());
         let c = pop(v);
-        (acc[6], at) = (_mm256_add_epi64(acc[6], c), _mm256_add_epi64(at, _mm256_mul_epu32(c, word)));
+        acc[6] = _mm256_add_epi64(acc[6], c);
+        acc[7] = _mm256_add_epi64(acc[7], _mm256_mul_epu32(c, word)); // weighted by word index
         for k in 0..6 {
-            acc[k] = _mm256_add_epi64(acc[k], pop(_mm256_and_si256(v, _mm256_set1_epi64x(SEL[k] as i64))));
+            acc[k] = _mm256_add_epi64(acc[k], pop(_mm256_and_si256(v, sel(k))));
         }
         word = _mm256_add_epi64(word, _mm256_set1_epi64x(4));
     }
-    let total = |v: __m256i| -> u64 { std::mem::transmute::<_, [u64; 4]>(v).iter().sum() };
-    let (mut count, mut sum) = (total(acc[6]), 64 * total(at) + (0..6).map(|k| total(acc[k]) << k).sum::<u64>());
-    for (w, &x) in b.iter().enumerate().skip(4 * quads) {
-        let c = x.count_ones() as u64;
-        (count, sum) = (count + c, sum + 64 * w as u64 * c + (0..6).map(|k| ((x & SEL[k]).count_ones() as u64) << k).sum::<u64>());
-    }
-    (count, sum)
+    let total = |k: usize| -> u64 { std::mem::transmute::<_, [u64; 4]>(acc[k]).iter().sum() };
+    let sum = 64 * total(7) + (0..6).map(|k| total(k) << k).sum::<u64>();
+    (total(6), sum)
 }
 
 /// "count sum id1 ... id10" for a set of documents.
@@ -370,7 +370,8 @@ fn line(out: &mut String, docs: &Docs) {
 /// Calls f(doc, ids) with the token ids of each line in text, the first
 /// being document first; returns the number of documents.
 fn walk(text: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, &[u32])) -> u32 {
-    let (mut p, end, mut doc, mut ids) = (text.as_ptr(), text.as_ptr_range().end, first, Vec::with_capacity(1 << 12));
+    let (mut p, end) = (text.as_ptr(), text.as_ptr_range().end);
+    let (mut doc, mut ids) = (first, Vec::with_capacity(1 << 12));
     while p < end {
         unsafe {
             while *p != b'\t' {
@@ -439,7 +440,8 @@ fn main() {
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
     let qtext = map("/data/queries.txt");
     let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
-    let mut terms = Terms { slot: slots, keys: Vec::with_capacity(qtext.len() / 16) };
+    let keys = Vec::with_capacity(qtext.len() / 16);
+    let mut terms = Terms { slot: slots, keys };
     // Queries, flat: query q's terms are ids[span.1..span.2], and for BOOL
     // ops[i] joins ids[i] and ids[i + 1].
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
@@ -472,7 +474,7 @@ fn main() {
     while last_line > 0 && text[last_line - 1] != b'\n' {
         last_line -= 1;
     }
-    let ndocs = if text.is_empty() { 0 } else { number(text, last_line) as usize + 1 };
+    let ndocs = (!text.is_empty()) as usize * (number(text, last_line) as usize + 1);
     let first_doc = |c: usize| text.get(c).map_or(ndocs as u32, |_| number(text, c));
     let firsts: Vec<u32> = cut[..THREADS].iter().map(|&c| first_doc(c)).collect();
 
@@ -513,7 +515,8 @@ fn main() {
     };
     // One sort of (class, rarity, id) packed in a u64: the key is computed
     // once per term instead of twice per comparison.
-    let mut packed: Vec<u64> = (0..nterms).map(|i| (class(i) as u64) << 56 | ((u32::MAX - df[i]) as u64) << 24 | i as u64).collect();
+    let pack = |i: usize| (class(i) as u64) << 56 | ((u32::MAX - df[i]) as u64) << 24 | i as u64;
+    let mut packed: Vec<u64> = (0..nterms).map(pack).collect();
     packed.sort_unstable();
     let order: Vec<usize> = packed.iter().map(|&k| k as usize & 0xFF_FFFF).collect();
     let [nbits, a0, lists, nkeep] = [0, 1, 2, 3].map(|c| order.partition_point(|&i| class(i) <= c));
@@ -526,8 +529,9 @@ fn main() {
     anchored.iter_mut().for_each(|a| a.0 = new[a.0 as usize]);
     anchored.sort_unstable();
     // Where the phrases of anchor a0 + k start in anchored.
-    let astart: Vec<usize> = (a0..=nkeep).map(|i| anchored.partition_point(|a| (a.0 as usize) < i)).collect();
-    let words = ndocs.div_ceil(64);
+    let first_of = |i: usize| anchored.partition_point(|a| (a.0 as usize) < i);
+    let astart: Vec<usize> = (a0..=nkeep).map(first_of).collect();
+    let words = ndocs.div_ceil(256) * 4; // whole 4-word vectors, for bit_sums
     // Zero pages from the kernel, written only where a bit is set.
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
 
@@ -545,8 +549,10 @@ fn main() {
         // takes the bits of every other term), ORed in when the block ends.
         let (mut pending, mut block) = (vec![0u64; nbits + 1], first as usize / 64);
         let flush = |pending: &mut [u64], w: usize| {
-            for (b, x) in pending[..nbits].iter_mut().enumerate().filter(|(_, x)| **x != 0) {
-                bits[b * words + w].fetch_or(std::mem::take(x), Relaxed);
+            for (b, x) in pending[..nbits].iter_mut().enumerate() {
+                if *x != 0 {
+                    bits[b * words + w].fetch_or(std::mem::take(x), Relaxed);
+                }
             }
         };
         // Every token does the same work, kept or not by masks, so whether a
@@ -581,8 +587,10 @@ fn main() {
                 for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
                     let span = spans[q as usize];
                     let phrase = &ids[span.1 as usize..span.2 as usize];
-                    // Do the tokens around this one spell the phrase?
-                    if at.checked_sub(j as usize).and_then(|s| toks.get(s..s + phrase.len())) == Some(phrase) {
+                    // Do the tokens around this one spell the phrase? (A start before
+                    // the document wraps around, and the slice is then out of range.)
+                    let s = at.wrapping_sub(j as usize);
+                    if toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
                         mine.push((q, doc));
                     }
                 }
@@ -616,7 +624,8 @@ fn main() {
         let mut cursor = vec![0u32; lists.div_ceil(BUCKETS)];
         for (b, units) in buckets.into_iter().enumerate() {
             for (c, i) in cursor.iter_mut().zip((b..lists).step_by(BUCKETS)) {
-                *c = start[i] + seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum::<u32>();
+                let before: u32 = seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum();
+                *c = start[i] + before;
             }
             let (mut doc, mut term) = (0u32, NONE);
             for x in units.chunks.into_iter().flatten() {
@@ -657,17 +666,20 @@ fn main() {
             Docs::List(v)
         }
     };
-    let chunks: Vec<Mutex<String>> = (0..spans.len().div_ceil(64)).map(|_| Mutex::default()).collect();
+    let n = spans.len().div_ceil(64);
+    let chunks: Vec<Mutex<String>> = (0..n).map(|_| Mutex::default()).collect();
     let next = AtomicUsize::new(0);
     on_threads(|_| loop {
         let k = next.fetch_add(1, Relaxed);
         let Some(chunk) = chunks.get(k) else { return };
         let mut out = String::new();
         for (q, &(phrase, from, to)) in spans.iter().enumerate().skip(k * 64).take(64) {
-            let (tids, ops) = (&ids[from as usize..to as usize], &ops[from as usize..to as usize]);
+            let r = from as usize..to as usize;
+            let (tids, ops) = (&ids[r.clone()], &ops[r]);
             let set = if phrase {
                 let at = found.partition_point(|m| m.0 < q as u32);
-                Docs::List(found[at..].iter().take_while(|m| m.0 == q as u32).map(|m| m.1).collect())
+                let end = at + found[at..].partition_point(|m| m.0 == q as u32);
+                Docs::List(found[at..end].iter().map(|m| m.1).collect())
             } else {
                 let cur = docs(tids[0]);
                 ops.iter().zip(&tids[1..]).fold(cur, |cur, (&op, &id)| match &cur {
@@ -680,7 +692,8 @@ fn main() {
         *chunk.lock().unwrap() = out;
     });
     // Chunk by chunk, so the answers are never held twice.
-    let mut out = std::io::BufWriter::new(std::fs::File::create("/out/results.txt").expect("/out/results.txt"));
+    let file = std::fs::File::create("/out/results.txt").expect("/out/results.txt");
+    let mut out = std::io::BufWriter::new(file);
     for c in chunks {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
