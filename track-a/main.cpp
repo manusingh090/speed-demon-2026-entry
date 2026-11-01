@@ -234,20 +234,25 @@ int main() {
     // backed by whole 2 MB pages and count against peak memory.
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
-    int in = open("/data/requests.log", O_RDONLY), out = -1;
-    if (in < 0) return perror("open"), 1;
+    int in = open("/data/requests.log", O_RDONLY);
+    int out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (in < 0 || out < 0) return perror("open"), 1;
 
     // Map the log over one spare zero page, so the 64-byte scans stay in bounds.
     size_t size = lseek(in, 0, SEEK_END);
     auto* log = (char*)mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (size && mmap(log, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED) return perror("mmap"), 1;
     // Line-aligned pieces, eight per thread, claimed in order: a thread that
-    // starts late or shares its core takes fewer.
+    // starts late or shares its core takes fewer. Piece k starts at the first
+    // line that starts at or after k/pieces of the log; the thread that claims
+    // it finds both ends (so no one thread first touches the log 96 times).
     const int pieces = 8 * nt;
-    std::vector<size_t> cut(pieces + 1, size);
-    cut[0] = 0;
-    for (int k = 1; k < pieces; ++k)
-        for (cut[k] = std::max(cut[k - 1], size * k / pieces); cut[k] < size && log[cut[k] - 1] != '\n';) ++cut[k];
+    auto cut = [&](int k) -> const char* {
+        size_t at = size * k / pieces;
+        if (at == 0 || at >= size) return log + at;
+        auto* nl = static_cast<const char*>(memchr(log + at - 1, '\n', size - at + 1));
+        return nl ? nl + 1 : log + size;
+    };
     std::atomic<int> claim_piece{0};
 
     // Between the phases, endpoints are ranked in unsigned byte order (a
@@ -288,8 +293,6 @@ int main() {
         u64 total = 0;
         for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
         at[HOURS] = total;
-        out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
-        if (out < 0) _exit(1);
         if (total == 0) return;
         if (ftruncate(out, total) != 0) _exit(1);
         text = (char*)mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
@@ -298,12 +301,8 @@ int main() {
 
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
-        // An output left by an earlier run is truncated page by page, which
-        // here would hold up the start; one thread deletes it while the
-        // others parse (it is created again once its size is known).
-        if (t == 0) unlink("/out/summary.txt");
         parsers[t].map(size);
-        for (int k; (k = claim_piece++) < pieces;) parsers[t].run(log + cut[k], log + cut[k + 1]);
+        for (int k; (k = claim_piece++) < pieces;) parsers[t].run(cut(k), cut(k + 1));
         ranked.arrive_and_wait();
 
         {  // the scratch goes before the text phase, where the output counts
