@@ -32,7 +32,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 25 | Step 24's code with its explanatory comments (no counted line changes) | pending | | | |
 | 26 | The line's end from one 32-byte compare after the status code (a latency has at most 10 digits), so the parse keeps one mask of spaces instead of masks of spaces and LFs | run-028f1cfc1335 | 0.0227 s | 21.7 MiB | 83.14 |
 | 27 | Back to step 25's code | pending | | | |
-| 28 | Slot index as the endpoint id (no id counter), table of 4,096 slots instead of 8,192, full CRC32 as the tag, selection with min/max shortcuts; comments dropped | pending | | | |
+| 28 | Slot index as the endpoint id (no id counter), table of 4,096 slots instead of 8,192, full CRC32 as the tag, selection with min/max shortcuts; comments dropped | run-9e40422cd8dd | 0.0214 s | 18.4 MiB | 84.48 |
+| 29 | Back to step 25's code | pending | | | |
 
 ## Local measurements
 
@@ -112,6 +113,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 25 to 26.** From a rewrite that also made the endpoint table hash-only (no name compare): that table cost 3 to 6% more cycles (its multiply chain over a long name's middle is slower than a CRC and one 64-byte compare) and would merge two endpoints whose 52-bit fingerprints collide, so only the parse change is kept. Laptop: 700M user instructions against 715M, cycles lower in two of three interleaved rounds, 308 counted lines both. Same hash on all six datasets, 20 repeated full runs gave one hash.
 
 **Step 26 on the board, and step 27.** run-028f1cfc1335: 0.0227 s and 21.7 MiB, 83.14, below step 25's code, which a later push ran again in 0.0209 s (run-38c8b98f7941, 84.75, the best Track A run so far). Step 27 is step 25's code again.
+
+**Step 28 on the board, and step 29.** Three small changes against step 24's design: the slot index as the endpoint id instead of a dense id from a counter, a table of 4,096 slots instead of 8,192, and min/max shortcuts in the selection. Correct on full, sample, tiny, the worked example, an empty log, two other seeds and a hand-made edge log, with the same hash on 50 repeated runs. Locally it lost before it was pushed: 2 to 3% slower in two rounds of 1,000 alternating pairs on mains power and 0.5 to 1% slower in four rounds on battery, each with an interval that excludes a tie, with peak memory level at 19.27 MiB over 60 pairs and 2 more counted lines. The board agreed: run-9e40422cd8dd, 0.0214 s, 18.4 MiB and 317 lines, K 48.93 and 84.48 points, against 0.0209 s, 18.3 MiB, 315 lines, K 49.53 and 84.75 for step 25's best run and K 49.27 for its latest. Step 29 is step 25's code again.
 
 ## Tried and kept out
 
