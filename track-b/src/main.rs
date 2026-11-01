@@ -375,6 +375,7 @@ impl Units {
 }
 
 fn main() {
+    let t0 = std::time::Instant::now();
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
@@ -382,7 +383,6 @@ fn main() {
     // lands on a random line of it, so it is put on 2 MB pages (one TLB entry
     // instead of 512), faulted in before huge pages are turned off for the rest,
     // where a page written only in part would cost memory.
-    let t_table = std::time::Instant::now();
     let slot = unsafe {
         let len = (n * 8).next_multiple_of(1 << 21);
         let raw = mmap(std::ptr::null_mut(), len + (1 << 21), 3, 0x22, -1, 0);
@@ -391,7 +391,6 @@ fn main() {
         prctl(41, 1u64, 0u64, 0u64, 0u64);
         std::slice::from_raw_parts_mut(p.cast(), n)
     };
-    let table_time = t_table.elapsed();
     let mut terms = Terms { slot, n: 0 };
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
@@ -484,6 +483,7 @@ fn main() {
         (nbits, a0, lists, nkeep, anchored, astart)
     };
 
+    let before_scan = t0.elapsed();
     let words = ndocs.div_ceil(256) * 4;
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
     let found = Mutex::new(vec![]);
@@ -636,8 +636,8 @@ fn main() {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
     std::io::Write::flush(&mut out).unwrap();
-    // Measurement only: wait ten times as long as mapping the table took.
-    let until = std::time::Instant::now() + table_time * 10;
+    // Measurement only: wait twice as long as everything before the scan took.
+    let until = std::time::Instant::now() + before_scan * 2;
     while std::time::Instant::now() < until {}
     unsafe { _exit(0) };
 }

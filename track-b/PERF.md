@@ -87,7 +87,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 80 | Step 78's code, the answers' numbers written by hand instead of with `write!` | run-35e2245a0253 | 0.143 | 46.5 | 75.08 |
 | 81 | Measurement only: after the scan, wait as long as its threads ended apart | run-3ad72b5c123d | 0.144 | 45.0 | 75.13 |
 | 82 | Measurement only: before exiting, wait as long as everything before the scan took | run-13662d2445f0 | 0.201 | 44.1 | 71.59 |
-| 83 | Measurement only: before exiting, wait ten times as long as mapping the term table took | pending | | | |
+| 83 | Measurement only: before exiting, wait ten times as long as mapping the term table took | run-02ebeca44f3b | 0.143 | 44.7 | 75.24 |
+| 84 | Measurement only: before exiting, wait twice as long as everything before the scan took | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -332,6 +333,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 81 on the board, and step 82.** run-3ad72b5c123d: 0.1439 s against 0.1397 to 0.1431 s for step 80's work, so the scan's threads end within a few milliseconds of one another on the box; balancing them would gain little. Step 82 measures everything before the scan the same way (start-up, the query parse, the sample, the classes and renumbering): the main thread notes how long it took and waits that long again before exiting.
 
 **Step 82 on the board, and step 83.** run-13662d2445f0: 0.2012 s against about 0.142 s, so everything before the scan takes 55 to 59 ms on the box (Track C's run of the same commit was 6% slow). On a warm laptop it takes 17 to 21 ms: splitting and hashing the queries 4.6 to 6.6, the inserts 1.9 to 3.0, the sample (with starting the threads) 5.4 to 13.7, then merging the samples, the anchors, packing, sorting, renumbering and remapping 5 to 7 ms on one thread. The box's slower clock accounts for perhaps 35 ms of it. One thing the box may do that the laptop does not: find a free 2 MB page for the term table (step 67) by compacting memory, which a box whose memory is full of page cache may need to; on the laptop mapping it takes 0.2 ms. Step 83 waits ten times as long as mapping the table took, so a cost of milliseconds there shows tenfold.
+
+**Step 83 on the board, and step 84.** run-02ebeca44f3b: 0.1431 s, no rise at all, so the huge page costs nothing to get. Step 82's 55 to 59 ms is three times the laptop's 17 to 21, more than the clocks explain, and came from one run in a slow minute; step 84 repeats it with the wait doubled, so the rise should be about 110 ms if it holds.
 
 ## What the profile said, step by step
 
