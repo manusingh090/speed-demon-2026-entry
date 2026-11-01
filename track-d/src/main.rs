@@ -450,7 +450,6 @@ fn main() {
     })
     .concat();
     heavy.sort_unstable();
-    drop(filed);
 
     // 3. Locality order: compact BFS blobs. A thread grows a blob over
     // unclaimed nodes (claimed by compare-exchange), then starts the next one
@@ -463,13 +462,22 @@ fn main() {
     };
     let (first_v, link_v) = (first, link);
     let (first, link) = (&first_v[..], &link_v[..]);
-    let chains: Vec<Vec<u32>> = on_threads(nt, |t| {
+    // Each thread's chain of nodes, with their out-degrees.
+    let chains: Vec<(Vec<u32>, Vec<u32>)> = on_threads(nt, |t| {
+        drop_pages(&filed[t].offs, 0, 1); // the parse output is read no more
+        drop_pages(&filed[t].words, 0, 1);
         let (mut ord, mut seeds) = (Vec::with_capacity(n / nt + BLOB), Vec::new());
+        let mut degs = Vec::with_capacity(n / nt + BLOB);
         let mut scan = share(n, t, nt).start;
-        // Fetch the offsets 8 queue entries ahead and the edges 4 ahead.
+        // Fetch the offsets 8 queue entries ahead, the edges 4 ahead and the
+        // claim flags of their heads 2 ahead.
         let ahead = |ord: &Vec<u32>, i: usize| {
             ord.get(i + 8).map(|&u| prefetch(&first[u as usize]));
             ord.get(i + 4).map(|&u| prefetch(&link[first[u as usize] as usize]));
+            ord.get(i + 2).map(|&u| {
+                let u = u as usize;
+                (first[u]..first[u + 1]).for_each(|e| prefetch(&claimed[(link[e as usize] & hmask) as usize]))
+            });
         };
         loop {
             let mut seed = None;
@@ -485,12 +493,13 @@ fn main() {
                 }
                 scan += 1;
             }
-            let Some(seed) = seed else { return ord };
+            let Some(seed) = seed else { return (ord, degs) };
             let (blob, mut i) = (ord.len(), ord.len());
             ord.push(seed);
             while i < ord.len() && ord.len() - blob < BLOB {
                 ahead(&ord, i);
                 let u = ord[i] as usize;
+                degs.push(first[u + 1] - first[u]);
                 for e in first[u]..first[u + 1] {
                     let v = link[e as usize] & hmask;
                     if ord.len() - blob < BLOB && claim(v) {
@@ -502,6 +511,7 @@ fn main() {
             for i in i..ord.len() {
                 ahead(&ord, i);
                 let u = ord[i] as usize;
+                degs.push(first[u + 1] - first[u]);
                 for e in first[u]..first[u + 1] {
                     let v = link[e as usize] & hmask;
                     if claimed[v as usize].load(Relaxed) == 0 {
@@ -512,26 +522,28 @@ fn main() {
         }
     });
 
-    // New ids: each thread's chain in turn (every node is in one).
-    let mut id_v = vec![0u32; n];
-    let mut start = vec![0u32; nt + 1];
-    for t in 0..nt {
-        start[t + 1] = start[t] + chains[t].len() as u32;
+    drop(filed);
+
+    // New ids and offsets: each thread's chain in turn (every node is in one).
+    let (mut id_v, mut off) = (vec![0u32; n], vec![0u32; n + 1]);
+    let mut start = vec![(0, 0); nt + 1]; // a chain's first id and first edge
+    for (t, (ord, degs)) in chains.iter().enumerate() {
+        start[t + 1] = (start[t].0 + ord.len() as u32, start[t].1 + degs.iter().sum::<u32>());
     }
-    let ir = Raw::of(&mut id_v);
-    on_threads(nt, |t| chains[t].iter().zip(start[t]..).for_each(|(&u, k)| unsafe { *ir.at(u as usize) = k }));
+    let (ir, or) = (Raw::of(&mut id_v), Raw::of(&mut off));
+    on_threads(nt, |t| {
+        let ((ord, degs), (mut k, mut e)) = (&chains[t], start[t]);
+        for (&u, &d) in ord.iter().zip(degs) {
+            unsafe { (*ir.at(u as usize), *or.at(k as usize)) = (k, e) };
+            (k, e) = (k + 1, e + d);
+        }
+    });
+    off[n] = m as u32;
     drop((claimed, chains));
 
-    // The graph in the new numbering: degrees scattered, summed, then each
-    // edge's head mapped (weight bits kept), with the random reads of later
-    // nodes started 8 and 4 nodes early.
+    // The graph in the new numbering: each edge's head mapped (weight bits
+    // kept), with the random reads of later nodes started 8 and 4 nodes early.
     let id = &id_v[..];
-    let mut off = vec![0u32; n + 1];
-    let or = Raw::of(&mut off);
-    on_threads(nt, |t| share(n, t, nt).for_each(|u| unsafe { *or.at(id[u] as usize + 1) = first[u + 1] - first[u] }));
-    for v in 0..n {
-        off[v + 1] += off[v];
-    }
     let mut adj = vec![0u32; m];
     let ar = Raw::of(&mut adj);
     let off = &off;

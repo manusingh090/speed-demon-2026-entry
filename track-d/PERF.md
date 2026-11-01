@@ -38,7 +38,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 16 | Each thread unmaps (`MADV_DONTNEED`) the part of graph.txt it parsed as soon as it is done, instead of the whole 92 MB being torn down at exit by one thread | run-beecc52de687 | 0.190 s | 66.7 MiB | 67.47 |
 | 17 | Back to step 15's code | run-6891f144a066 | 0.182 s | 66.5 MiB | 68.04 |
 | 18 | Distances stored as u32 (u64 rerun when the answer may not fit); graph pages released on all threads after the searches; graph.txt unmapped during them | run-c466ddb7873a | 0.193 s | 63.6 MiB | 67.21 |
-| 19 | graph.txt's pages dropped by each thread as it runs out of queries (`MADV_DONTNEED`), instead of one unmap at the start of the searches | pending | | | |
+| 19 | graph.txt's pages dropped by each thread as it runs out of queries (`MADV_DONTNEED`), instead of one unmap at the start of the searches | run-f7b046478181 | 0.171 s | 63.4 MiB | 68.60 |
+| 20 | Out-degrees recorded while the blobs grow, so new ids and new offsets come from one pass (no degree scatter, no serial prefix sum); parse arenas dropped in parallel; claim flags prefetched in the blob BFS | pending | | | |
 
 ## What the profile said, step by step
 
@@ -103,6 +104,10 @@ Four interleaved `perf stat -r 5` rounds: 0.167 to 0.170 s against 0.197 to 0.22
 **Step 18 on the board.** run-c466ddb7873a: 0.193 s, 63.6 MiB (from 66.5), 577 counted lines, 67.21 points. The other tracks ran at their usual speed in the same run (A 0.0219 s, B 0.1439 s, C 0.0282 s), so this is not a slow box. The likely cause is the one step 16 ran into: unmapping graph.txt takes the address-space lock for writing, and at the start of the searches every thread is faulting in its first distance pages and heap, so they all waited behind the unmap.
 
 **Step 18 to 19.** graph.txt's pages are now dropped with `MADV_DONTNEED` (the lock taken for reading, so page faults go on) by each thread for its share once it finds no query left, which is the tail of the search phase, when threads are idle anyway. Locally in three `perf stat -r 5` rounds: 0.151, 0.156 and 0.171 s against 0.214, 0.171 and 0.176 s for step 18. Same hash on all twelve datasets.
+
+**Step 19 on the board.** run-f7b046478181: 0.171 s, 63.4 MiB, 575 counted lines, 68.60 points, in a run where Track A's unchanged code measured 0.0236 s against its best of 0.0209 s (a slow box). So step 18's 0.193 s was the unmap at the start of the searches, and the u32 distances and the parallel release are kept.
+
+**Step 19 to 20.** Phase timers (medians of 9, ms): parse 22.4, part build 6.9, dropping the parse arenas 3.8 (one thread, between phases), blobs 20.5, new ids 3.6, degree scatter 2.4, prefix sum 1.2 (serial), renumbering 18.4, reverse count 3.8, its prefix sum 1.6, reverse fill 6.5, searches 82, release 2.6. Every node's edges are read once while the blobs grow, so the blob phase now records each node's out-degree next to it in the chain; the pass that numbers the chains writes the new offsets from those as it goes (a chain's first edge is the sum of the degrees in the chains before it), which removes the degree scatter and the serial prefix sum. Each thread also drops its own parse arena with `MADV_DONTNEED` at the start of the blob phase, instead of one thread unmapping all twelve after the build, and the BFS prefetches the claim flags of the heads two queue entries ahead (their edge lists were fetched two entries before). Peak memory is unchanged: the degree lists (7 MB) live only through the blob and id phases, where the build holds about 57 MB against 61 MB in the renumbering. From the end of the part build to the end of the renumbering, 44.1 to 41.3 ms; whole run 170 to 163 ms (medians of 9); four `perf stat -r 5` rounds 0.158 to 0.172 s against 0.179 to 0.220 s, 130 ms less CPU. 573 rustfmt lines against 567. Same hash on all twelve datasets.
 
 ## Tried and kept out
 
