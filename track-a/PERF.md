@@ -28,7 +28,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 21 | Back to step 18's code (eight pieces) | pending | | | |
 | 22 | Endpoint table probed four slots at a time with AVX2 on a 44-bit tag (CRC32 of the first, middle and last eight bytes, and the length); per-hour counts kept during the parse instead of walking the chunks for the largest hour; a claim-and-count phase helper in place of `std::barrier`; all hours' lines in one block | run-8d2ebb562c15 | 0.0286 s | 17.7 MiB | 81.22 |
 | 23 | Back to step 18's code | pending | | | |
-| 24 | Endpoint table of 8,192 slots with dense ids from a counter, a 20-bit hash tag and the length checked before the name compare; code in 308 counted lines instead of 327 | pending | | | |
+| 24 | Endpoint table of 8,192 slots with dense ids from a counter, a 20-bit hash tag and the length checked before the name compare; code in 308 counted lines instead of 327 | run-645ac82c679c | 0.0212 s | 18.0 MiB | 84.66 |
+| 25 | Step 24's code with its explanatory comments (no counted line changes) | pending | | | |
 
 ## Local measurements
 
@@ -102,6 +103,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 22 on the board, and step 23.** run-8d2ebb562c15: 0.0286 s against step 18's 0.0215 s, so the rework is slower on the box though level on the laptop. Step 23 is step 18's code again.
 
 **Step 23 to 24.** A tighter form of step 18. Laptop: 715M user instructions against 685M, cycles within noise in three interleaved rounds, `cmp.ps1` (15 runs) median 26 ms and best 22 ms for both, 19 MB both, 308 counted lines against 327. Same hash on all six datasets, 20 repeated full runs gave one hash.
+
+**Step 24 on the board, and step 25.** run-645ac82c679c: 0.0212 s, 18.0 MiB, 315 counted lines, the best Track A run so far at 84.66. Step 25 puts back the comments the rewrite had dropped; the counted lines stay 308 and the hashes are the same.
 
 ## Tried and kept out
 
