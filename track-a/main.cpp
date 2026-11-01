@@ -57,8 +57,8 @@ inline u32 eq32(const char *p, char c) {
 
 // The number of decimal digits in x, from its bit length.
 inline u32 width(u32 x) {
-  static constexpr u32 p10[] = {1,         10,        100,       1000,
-                                10000,     100000,    1000000,   10000000,
+  static constexpr u32 p10[] = {1,         10,        100,     1000,
+                                10000,     100000,    1000000, 10000000,
                                 100000000, 1000000000};
   u32 t = (32 - __builtin_clz(x | 1)) * 1233 >> 12;
   return t + ((x | 1) >= p10[t]);
@@ -127,7 +127,7 @@ inline const char *next_byte(const char *s, char c) {
 struct Names {
   static constexpr u32 SLOTS = 1 << 13, ARENA = 1 << 19;
   std::atomic<u64> slot[SLOTS];
-  std::atomic<u32> used{0}, next_id{0};
+  std::atomic<u32> used{0}, next_id{0}, count{0};
   char arena[ARENA + 64];
 
   std::string_view name(u64 v) const {
@@ -150,7 +150,7 @@ struct Names {
         memcpy(arena + at, s.data(), n);
         u64 nv = (u64(h >> 12) << 44) | (u64(id) << 32) | (n << 20) | at;
         if (slot[j].compare_exchange_strong(v, nv))
-          return id;
+          return ++count, id;
       }
       if ((v >> 44) == (h >> 12) && ((v >> 20) & 0xFFF) == n &&
           same(name(v), s))
@@ -201,8 +201,8 @@ struct Parser {
       u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
       u64 nl = eq32(m, '\n') | u64(eq32(m + 32, '\n')) << 32;
       const char *name = m + __builtin_ctzll(sp) + 1;
-      const char *ne = nl ? m + __builtin_ctzll(sp & (sp - 1))
-                          : next_byte(name, ' ');
+      const char *ne =
+          nl ? m + __builtin_ctzll(sp & (sp - 1)) : next_byte(name, ' ');
       const char *eol = nl ? m + __builtin_ctzll(nl) : next_byte(ne + 5, '\n');
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
       u32 lat = decode(eol, eol - ne - 5);
@@ -268,20 +268,27 @@ int main() {
   std::vector<u32> rank(1 << 12);
   u32 most = 0;
   // Endpoints ranked in unsigned byte order, the order of an hour's lines.
-  std::barrier ranked(nt, [&]() noexcept {
-    for (int h = 0; h < HOURS; ++h) {
-      u32 n = 0;
-      for (auto &ps : parsers)
-        ps.each(h, rank.data(), [&](u32, u32, u32) { ++n; });
-      most = std::max(most, n);
-    }
+  // The first thread out of pieces ranks the names seen so far while the
+  // others finish theirs, and the barrier ranks again only if a name was
+  // added since (on the full log, never). Each thread adds its own hours'
+  // sizes before it arrives, while its chunks are still in its cache.
+  std::atomic_flag ranking;
+  std::vector<std::atomic<u32>> count(HOURS);
+  auto rank_names = [&] {
     std::vector<std::pair<std::string_view, u32>> by_name;
     for (u32 i = 0; i < Names::SLOTS; ++i)
       if (u64 v = endpoints.slot[i])
         by_name.push_back({endpoints.name(v), u32(v >> 32) & 0xFFF});
     std::sort(by_name.begin(), by_name.end());
+    names.clear();
     for (auto [name, id] : by_name)
       rank[id] = names.size(), names.push_back(name);
+  };
+  std::barrier ranked(nt, [&]() noexcept {
+    for (auto &n : count)
+      most = std::max(most, n.load());
+    if (names.size() != endpoints.count)
+      rank_names();
   });
 
   std::vector<std::atomic<bool>> finished(HOURS);
@@ -319,6 +326,13 @@ int main() {
                   b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
         if (b > a)
           madvise((void *)a, b - a, MADV_DONTNEED);
+      }
+      if (!ranking.test_and_set())
+        rank_names();
+      for (int h = 0; h < HOURS; ++h) {
+        count[h] += parsers[t].wide[h].size();
+        for (const Chunk *c = parsers[t].last[h]; c; c = c->prev)
+          count[h] += c->n;
       }
       ranked.arrive_and_wait();
       {
