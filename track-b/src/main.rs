@@ -20,6 +20,7 @@ use std::sync::{Barrier, Mutex, Once, OnceLock};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
 }
 
@@ -621,6 +622,15 @@ fn main() {
         (count, Mutex::new(buckets))
     });
     drop(terms); // nothing after the scan reads the term tables
+    // Nor the documents: every thread unmaps its share (MADV_DONTNEED) now,
+    // while no thread faults the file in, instead of all 254 MB at exit by one.
+    on_threads(|t| {
+        let page = |c: usize| (text.as_ptr() as usize + c) & !4095;
+        let (from, to) = (page(cut[t] + 4095), page(cut[t + 1]));
+        if to > from {
+            unsafe { madvise(from as *mut u8, to - from, 4) };
+        }
+    });
     // Each term's postings lie in one stretch, thread by thread: the segment
     // from thread t holds seg[i * THREADS + t] offsets from firsts[t]. The
     // stretches go bucket by bucket, so a bucket's scatter writes one region,

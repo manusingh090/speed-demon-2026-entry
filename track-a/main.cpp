@@ -242,9 +242,9 @@ int main() {
     size_t size = lseek(in, 0, SEEK_END);
     auto* log = (char*)mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (size && mmap(log, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED) return perror("mmap"), 1;
-    // Line-aligned pieces, four per thread, claimed in order: a thread that
+    // Line-aligned pieces, eight per thread, claimed in order: a thread that
     // starts late or shares its core takes fewer.
-    const int pieces = 4 * nt;
+    const int pieces = 8 * nt;
     std::vector<size_t> cut(pieces + 1, size);
     cut[0] = 0;
     for (int k = 1; k < pieces; ++k)

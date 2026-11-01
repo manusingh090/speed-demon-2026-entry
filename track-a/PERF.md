@@ -24,7 +24,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 17 | Diagnostic: each piece parsed twice, the first time into a parser that is then dropped (same output) | run-f846b47b55e9 | 0.0395 s | 32.6 MiB | 75.15 |
 | 18 | Step 11's code, and each parsed piece's log pages unmapped (`MADV_DONTNEED`) by the thread that parsed it | run-1bfda4424f2e | 0.0215 s | 18.1 MiB | 84.30 |
 | 19 | Sixteen pieces per thread instead of eight | run-df667e59ec60 | 0.0246 s | 18.9 MiB | 82.67 |
-| 20 | Four pieces per thread | pending | | | |
+| 20 | Four pieces per thread | run-47a955df5a0a | 0.0257 s | 18.1 MiB | 82.37 |
+| 21 | Back to step 18's code (eight pieces) | pending | | | |
 
 ## Local measurements
 
@@ -90,6 +91,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 18 to 19.** With the exit's teardown gone, about 4 ms remain outside the parse and the hour phase. A parse piece is about 2.5 MB, some 1.5 ms of work on the box, and the barrier after the parse waits for the last one; sixteen pieces a thread halve that tail. (Track C's sixteen pieces were slower, but each of its pieces costs a populate call and a pipeline fill and drain; a Track A piece costs nothing extra.) Same hash on all six datasets.
 
 **Step 19 on the board, and step 20.** run-df667e59ec60: 0.0246 s against 0.0215 s, slower: since step 18 each piece ends in an unmapping call, and twice the calls means twice the page-table work landing while other threads still fault the log in. Step 20 goes the other way, to four pieces a thread.
+
+**Step 20 on the board, and step 21.** run-47a955df5a0a: 0.0257 s, slower too, so eight pieces a thread (step 18) stay: fewer pieces leave a longer tail at the barrier, more put more unmapping calls among other threads' page faults.
 
 ## Tried and kept out
 
