@@ -56,7 +56,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 48 | Diagnostic: step 47 with the time from main's start to the end of the parse reported through M (one page per 4 us, touched after the output is complete) | run-007acf4500a8 | 0.0261 s | 25.7 MiB | 80.58 |
 | 49 | Back to step 47's code | pending | | | |
 | 50 | Groups of 16 or fewer sorted by Batcher's 63-pair odd-even merge network (its first 19 pairs for 8 or fewer) instead of three chained selections | run-dabeae4d5c50 | 0.0214 s | 17.4 MiB | 84.30 |
-| 51 | Step 50 with the log fetched 1 KB ahead of each line with the non-temporal prefetch hint | pending | | | |
+| 51 | Step 50 with the log fetched 1 KB ahead of each line with the non-temporal prefetch hint | run-0d7c54395879 | 0.0207 s | 17.7 MiB | 84.59 |
 
 ## Local measurements
 
@@ -190,6 +190,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 49 to 50: small groups.** Cycle counters by group size showed where selection's time goes: groups of 16 or fewer (81% of groups, 19% of records) take about 40% of it, at 50 to 120 cycles a record, because three selection calls on four or ten values are mostly loop set-up and mispredicted branches. Such a group is now padded to 16 with the largest value and sorted by Batcher's odd-even merge network, 63 min/max pairs and no branch on the data; the network's first 19 pairs sort the first 8 places on their own, so a group of 8 or fewer stops there. The network was generated and checked against all 65,536 zero-one inputs. Same hash on all six datasets and 10 repeated full runs; four `perf stat` rounds: branch misses 1.73 to 1.75M against 2.21 to 2.25M, user cycles 376 to 389M against 381 to 408M, 10M more instructions. Laptop phase timers could not separate the hour phase within their spread, so the box decides.
 
 **Step 50 on the board, and step 51.** run-dabeae4d5c50: 0.0214 s, 17.4 MiB (the lowest Track A memory so far), 361 lines, 84.30 points. Measured and dropped: storing each group's ppm in its line and skipping the division when it has no 5xx (most groups), so the text phase does not divide again: 1M fewer instructions, cycles level. Kept for step 51: an instruction profile of the parse puts 17% of its samples just after the endpoint table's slot load, as if the table and the name arena (about 125 KB together) are pushed out of the core's caches by the 239 MB of log streaming past them. Each line now fetches the log 1 KB ahead with `prefetchnta`, which brings the data near the core while disturbing the outer caches less. Same hash on all six datasets and 10 repeated full runs; three `perf stat` rounds: user cycles 367 to 373M against 377 to 390M (512 bytes ahead gave 371 to 379M), 3M more instructions.
+
+**Step 51 on the board.** run-0d7c54395879 (from a later commit carrying step 51's Track A code): 0.0207 s, 17.7 MiB, 362 lines, 84.59 points, the second fastest Track A run so far, at less memory than the best (0.0203 s, 18.1 MiB). Also measured after it and dropped: 2 KB and 4 KB prefetch distances (no better than 1 KB), and non-temporal stores for the records (user cycles 3% higher, wall time mixed).
 
 ## Tried and kept out
 
