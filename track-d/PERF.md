@@ -51,7 +51,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 27 | Back to step 26's code | pending | | | |
 | 28 | Reverse graph counted and placed with plain increments, each thread owning its share's nodes; edges into another share handed over | run-62ef9877e352 | 0.159 s | 55 MiB | 69.41 |
 | 29 | Back to step 26's code | pending | | | |
-| 30 | Offsets packed group by group; the distance lookup's fast path inlined, the page hand-out out of line | pending | | | |
+| 30 | Offsets packed group by group; the distance lookup's fast path inlined, the page hand-out out of line | run-3abb5a273094 | 0.157 s | 55 MiB | 69.66 |
 
 ## What the profile said, step by step
 
@@ -156,6 +156,10 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Step 28 on the board, and step 29.** run-62ef9877e352: 0.159 s against 0.157 s for step 26, 675 lines, 69.41 points: the box did not see the gain the laptop measured, and the 26 extra lines cost more than any time it saved. Step 29 is step 26's code again.
 
 **Step 29 to 30: counting instructions.** Twice now (steps 18, 22 and 28) the laptop's wall-clock gains did not appear on the box. A likely reason: the box runs at a fixed 2.5 GHz, where a memory miss costs about half as many cycles as on this laptop's 5 GHz cores, so instructions weigh relatively more there. `perf record -e instructions` (deterministic, unlike time here) splits step 26's 7.03 billion instructions: the search's settle 35% (plus 4% in the distance lookup and 3% in heap pushes), the blob BFS 12.8% (about 520 per node), the parse 7.3%, the offset packing 5.9% and the renumbering 5.7%. The packing at about 60 instructions per offset was plainly wasteful: it now works group by group, writes the group's u32 once and checks a group's fit by its last offset only (offsets only grow). The distance lookup was a call on every relaxation; its fast path is now inlined and the page hand-out kept out of line. Instructions 6.99 to 6.37 billion (minus 9%), three `perf stat -r 5` rounds all faster (0.142 to 0.150 s against 0.145 to 0.198 s). Same hash on all thirty datasets.
+
+**Step 30 on the board.** run-3abb5a273094: 0.1566 s against 0.1571 s for step 26: 9% fewer instructions bought about 0.3% on the box, inside its run-to-run spread. Together with Track A's and Track B's six-thread runs (13 to 34% slower than twelve, so the box is bound by the program's own work and the second hyperthread pays), this says the search's time goes to waiting on memory on the box too, not to instructions.
+
+**Measured after step 30 and kept out: 2 MB pages for the edge arrays.** The searches read the forward and reverse edge arrays (20 MB each) at random, so with 4 KB pages most reads also miss the TLB. Transparent huge pages are off for the whole process (step 8), so they were allowed only while those two arrays were allocated and filled, with `MADV_HUGEPAGE` on them; 17 of their pages (34.8 MB) became huge and the peak did not move. The searches took the same time (median 66.9 against 67.3 ms over six runs) and the renumbering and reverse build 4.4 ms longer (each 2 MB fault zeroes and may compact), so the TLB misses are not what the searches wait on.
 
 ## Tried and kept out
 
