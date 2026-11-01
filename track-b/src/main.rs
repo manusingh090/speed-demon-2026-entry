@@ -35,7 +35,6 @@ fn map(path: &str) -> &'static [u8] {
 type Job = &'static (dyn Fn(usize) + Sync);
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
 static GATE: OnceLock<Barrier> = OnceLock::new();
-static ENDS: Mutex<Vec<std::time::Instant>> = Mutex::new(Vec::new());
 
 fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     if GATE.set(Barrier::new(THREADS)).is_ok() {
@@ -376,6 +375,7 @@ impl Units {
 }
 
 fn main() {
+    let t0 = std::time::Instant::now();
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
@@ -483,6 +483,7 @@ fn main() {
         (nbits, a0, lists, nkeep, anchored, astart)
     };
 
+    let before_scan = t0.elapsed();
     let words = ndocs.div_ceil(256) * 4;
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
     let found = Mutex::new(vec![]);
@@ -542,7 +543,6 @@ fn main() {
             }
         });
         flush(&mut pending, block);
-        ENDS.lock().unwrap().push(std::time::Instant::now());
         // The share is not read again: its pages go now, on every thread,
         // rather than all of the file's on one thread at exit.
         let page = |n: usize| share.as_ptr() as usize + n & !4095;
@@ -553,10 +553,6 @@ fn main() {
         (count, Mutex::new(buckets))
     });
     unsafe { munmap(terms.slot.as_mut_ptr().cast(), terms.slot.len() * 8) };
-    // Measurement only: wait as long as the scan's threads ended apart.
-    let spread = { let e = ENDS.lock().unwrap(); *e.iter().max().unwrap() - *e.iter().min().unwrap() };
-    let until = std::time::Instant::now() + spread;
-    while std::time::Instant::now() < until {}
 
     let (mut seg, mut start, mut end) = (vec![0u16; lists * THREADS], vec![0u32; lists], 0);
     for i in (0..BUCKETS).flat_map(|b| (b..lists).step_by(BUCKETS)) {
@@ -640,5 +636,8 @@ fn main() {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
     std::io::Write::flush(&mut out).unwrap();
+    // Measurement only: wait as long as everything before the scan took.
+    let until = std::time::Instant::now() + before_scan;
+    while std::time::Instant::now() < until {}
     unsafe { _exit(0) };
 }
