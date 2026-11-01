@@ -414,7 +414,7 @@ fn main() {
     let first_doc = |c: usize| text.get(c).map_or(ndocs as u32, |_| number(text, c));
     let firsts: Vec<u32> = cut[..THREADS].iter().map(|&c| first_doc(c)).collect();
 
-    let (nbits, a0, lists, nkeep, arec, astart) = {
+    let (nbits, a0, lists, nkeep, anchored, astart) = {
         let mut in_bool = vec![false; nterms];
         for &(_, from, to) in spans.iter().filter(|s| !s.0) {
             ids[from as usize..to as usize].iter().for_each(|&id| in_bool[id as usize] = true);
@@ -463,16 +463,9 @@ fn main() {
         ids.iter_mut().for_each(|id| *id = new[*id as usize]);
         anchored.iter_mut().for_each(|a| a.0 = new[a.0 as usize]);
         anchored.sort_unstable();
-        // Each anchor's phrases in one run of records: query, anchor offset
-        // << 8 | length, then the phrase's terms, so a check reads one stretch.
-        let (mut arec, mut astart) = (vec![], vec![0; nkeep - a0 + 1]);
-        for &(a, q, j) in &anchored {
-            let (_, from, to) = spans[q as usize];
-            arec.extend([q, j << 8 | (to - from)].into_iter().chain(ids[from as usize..to as usize].iter().copied()));
-            astart[a as usize - a0 + 1] = arec.len();
-        }
-        (1..astart.len()).for_each(|k| astart[k] = astart[k].max(astart[k - 1]));
-        (nbits, a0, lists, nkeep, arec, astart)
+        let first_of = |i: usize| anchored.partition_point(|a| (a.0 as usize) < i);
+        let astart: Vec<usize> = (a0..=nkeep).map(first_of).collect();
+        (nbits, a0, lists, nkeep, anchored, astart)
     };
 
     let words = ndocs.div_ceil(256) * 4;
@@ -516,13 +509,11 @@ fn main() {
             }
             for &at in &anchors[..na] {
                 let k = (toks[at] as usize).min(nkeep) - a0;
-                let mut p = astart[k];
-                while p < astart[k + 1] {
-                    let (q, j, len) = (arec[p], (arec[p + 1] >> 8) as usize, (arec[p + 1] & 255) as usize);
-                    let phrase = &arec[p + 2..p + 2 + len];
-                    p += 2 + len;
-                    let window = toks.get(at.wrapping_sub(j)..at.wrapping_sub(j).wrapping_add(len));
-                    if window.unwrap_or_default().iter().zip(phrase).fold(window.is_some(), |e, (a, b)| e & (a == b)) {
+                for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
+                    let span = spans[q as usize];
+                    let phrase = &ids[span.1 as usize..span.2 as usize];
+                    let s = at.wrapping_sub(j as usize);
+                    if toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
                         mine.push((q, doc));
                     }
                 }
@@ -533,6 +524,12 @@ fn main() {
             }
         });
         flush(&mut pending, block);
+        // The share is not read again: its pages are dropped now, on every
+        // thread, rather than all of the file's by one thread at exit.
+        let (from, to) = (share.as_ptr() as usize, share.as_ptr() as usize + share.len());
+        if to & !4095 > (from + 4095) & !4095 {
+            unsafe { madvise(((from + 4095) & !4095) as *mut u8, (to & !4095) - ((from + 4095) & !4095), 4) };
+        }
         buckets.iter_mut().for_each(Units::finish);
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
