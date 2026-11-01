@@ -23,7 +23,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | run-7f4f12386a23 | 0.0315 s | 19.1 MiB | 79.75 |
 | 17 | Diagnostic: each piece parsed twice, the first time into a parser that is then dropped (same output) | run-f846b47b55e9 | 0.0395 s | 32.6 MiB | 75.15 |
 | 18 | Step 11's code, and each parsed piece's log pages unmapped (`MADV_DONTNEED`) by the thread that parsed it | run-1bfda4424f2e | 0.0215 s | 18.1 MiB | 84.30 |
-| 19 | Sixteen pieces per thread instead of eight | pending | | | |
+| 19 | Sixteen pieces per thread instead of eight | run-df667e59ec60 | 0.0246 s | 18.9 MiB | 82.67 |
+| 20 | Four pieces per thread | pending | | | |
 
 ## Local measurements
 
@@ -87,6 +88,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 18 on the board.** run-1bfda4424f2e: 0.0215 s against about 0.026 s, 18% faster and the best so far at 84.30 points. Most of the 8 ms outside the two phases was the exit's teardown of the log's mapping on one thread.
 
 **Step 18 to 19.** With the exit's teardown gone, about 4 ms remain outside the parse and the hour phase. A parse piece is about 2.5 MB, some 1.5 ms of work on the box, and the barrier after the parse waits for the last one; sixteen pieces a thread halve that tail. (Track C's sixteen pieces were slower, but each of its pieces costs a populate call and a pipeline fill and drain; a Track A piece costs nothing extra.) Same hash on all six datasets.
+
+**Step 19 on the board, and step 20.** run-df667e59ec60: 0.0246 s against 0.0215 s, slower: since step 18 each piece ends in an unmapping call, and twice the calls means twice the page-table work landing while other threads still fault the log in. Step 20 goes the other way, to four pieces a thread.
 
 ## Tried and kept out
 
