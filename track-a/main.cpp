@@ -110,6 +110,43 @@ inline void select(u32 *a, u32 n, u32 k) {
   }
 }
 
+// Writes the values at ranks r[0] <= r[1] <= r[2] of a[0, n) to v. A group
+// of 16 or fewer (four in five groups) is padded to 16 and sorted by Batcher's
+// odd-even merge network, 63 min/max pairs with no branch on the data; its
+// first 19 pairs already sort the first 8 places, so a group of 8 or fewer
+// stops there. Otherwise each rank is selected among the values left above
+// the one before.
+inline void percentiles(u32 *a, u32 n, const u32 *r, u32 *v) {
+  if (n <= 16) {
+    static constexpr int net[63][2] = {
+        {0, 1},   {2, 3},   {0, 2},   {1, 3},   {1, 2},   {4, 5},   {6, 7},
+        {4, 6},   {5, 7},   {5, 6},   {0, 4},   {2, 6},   {2, 4},   {1, 5},
+        {3, 7},   {3, 5},   {1, 2},   {3, 4},   {5, 6},   {8, 9},   {10, 11},
+        {8, 10},  {9, 11},  {9, 10},  {12, 13}, {14, 15}, {12, 14}, {13, 15},
+        {13, 14}, {8, 12},  {10, 14}, {10, 12}, {9, 13},  {11, 15}, {11, 13},
+        {9, 10},  {11, 12}, {13, 14}, {0, 8},   {4, 12},  {4, 8},   {2, 10},
+        {6, 14},  {6, 10},  {2, 4},   {6, 8},   {10, 12}, {1, 9},   {5, 13},
+        {5, 9},   {3, 11},  {7, 15},  {7, 11},  {3, 5},   {7, 9},   {11, 13},
+        {1, 2},   {3, 4},   {5, 6},   {7, 8},   {9, 10},  {11, 12}, {13, 14}};
+    u32 s[16];
+    for (u32 i = 0; i < 16; ++i)
+      s[i] = i < n ? a[i] : ~0u;
+    for (int c = 0, pairs = n <= 8 ? 19 : 63; c < pairs; ++c) {
+      auto [i, j] = net[c];
+      u32 x = std::min(s[i], s[j]);
+      s[j] = std::max(s[i], s[j]), s[i] = x;
+    }
+    for (int t = 0; t < 3; ++t)
+      v[t] = s[r[t]];
+    return;
+  }
+  for (u32 from = 0, t = 0; t < 3; ++t)
+    if (r[t] >= from)
+      select(a + from, n - from, r[t] - from), from = r[t] + 1;
+  for (int t = 0; t < 3; ++t)
+    v[t] = a[r[t]];
+}
+
 // The first c at or after s; one is known to follow.
 inline const char *next_byte(const char *s, char c) {
   for (;; s += 32)
@@ -381,15 +418,13 @@ int main() {
             u32 id = by_rank[e], n = cursor[id] - start[id];
             if (!n)
               continue;
-            // Nearest rank p is index ceil(p * n / 100) - 1; each higher rank
-            // is selected among the values left after the one before.
+            // Nearest rank p is index ceil(p * n / 100) - 1.
             u32 *a = latency.get() + start[id], r50 = (50 * n + 99) / 100 - 1,
                 r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
-            for (u32 from = 0; u32 r : {r50, r95, r99})
-              if (r >= from)
-                select(a + from, n - from, r - from), from = r + 1;
+            u32 ranks[3] = {r50, r95, r99}, v[3];
+            percentiles(a, n, ranks, v);
             Line &l = ((Line *)(lines + h * hour_bytes))[count[h]++];
-            l = {e, n, a[r50], a[r95], a[r99], errors[id]};
+            l = {e, n, v[0], v[1], v[2], errors[id]};
             sz += 28 + names[e].size();
             for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
               sz += width(x);
