@@ -41,7 +41,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 19 | graph.txt's pages dropped by each thread as it runs out of queries (`MADV_DONTNEED`), instead of one unmap at the start of the searches | run-f7b046478181 | 0.171 s | 63.4 MiB | 68.60 |
 | 20 | Out-degrees recorded while the blobs grow, so new ids and new offsets come from one pass (no degree scatter, no serial prefix sum); parse arenas dropped in parallel; claim flags prefetched in the blob BFS | run-a8aa780ac7a5 | 0.163 s | 63.4 MiB | 69.03 |
 | 21 | After each pop, the edge list of the node now on top of that side's queue is prefetched | run-92286f5c8205 (best run-2f7e69f47d7a) | 0.161 (0.159) s | 63 MiB | 69.16 (69.24) |
-| 22 | Chain contraction: nodes with one or two neighbours (31%) are never settled; junction edges into a chain are redirected in place to the junction at its far end, and a query on a chain starts from its junctions | pending | | | |
+| 22 | Chain contraction: nodes with one or two neighbours (31%) are never settled; junction edges into a chain are redirected in place to the junction at its far end, and a query on a chain starts from its junctions | run-3c80edc59750 | 0.160 s | 64 MiB | 68.30 |
+| 23 | Back to step 21's code | pending | | | |
 
 ## What the profile said, step by step
 
@@ -124,6 +125,8 @@ So after the reverse graph is built, every node is classified (a bitset), and ea
 In Rust, settled nodes on the full data fell from 7.12 million to 5.09 million and the single-thread search from 875 to 664 ms. The construction had to be made cheap to keep that: the first version scanned every junction's rows and walked each chain four times (classification 10 ms, rewrite 36 ms on twelve threads, which ate the gain); the committed one walks each chain once from a chain node next to a junction (a lone node between two junctions needs no walk at all), reads a chain node's two rows in one pass, and writes junction rows with relaxed atomics because two chains may redirect entries of one row. Also measured and dropped: following chains lazily inside the search instead of rewriting (search time hardly moved, since the chain rows are still read on every relaxation), and starting the searches at chain endpoints without the start labels (wrong: with the junction rows rewritten the two sides no longer search mirror-image graphs, so "a side ran dry" no longer proves there is no path; the worked example's query 1 4 caught it).
 
 Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178 s, best 0.132 against 0.148 s, about 100 ms less CPU, 13% fewer instructions. 751 rustfmt lines against 573. Same hash on full, sample, tiny, the worked example, seeds 7, 9, 13, 21, 22 and 23 at sample scale, and seeds 2 to 21 at tiny scale (the tiny ones against the reference).
+
+**Step 22 on the board, and step 23.** run-3c80edc59750: 0.160 s, 64 MiB, 759 counted lines, 68.30 points. Track A's unchanged code ran at its best speed in the same run, so the box was fast, and Track D only matched step 21's best (0.159 s): on the scoring machine the 28% fewer settled nodes are paid for by the classification and rewrite passes, and the 172 extra lines cost about a point. Step 23 is step 21's code again; the contraction stays in the history (commit 2e866e5) as a measured negative.
 
 ## Tried and kept out
 

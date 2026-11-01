@@ -17,9 +17,6 @@
 //!    pages handed out on first touch, as u32 unless the answer may not fit.
 //!    A target with no in-edge is -1 at once. The graph's pages are handed
 //!    back on every thread at the end, so the exit has little left to free.
-//! 5. Before the searches, chains are contracted: a node with one or two
-//!    neighbours (a third of the nodes) is never settled, as junctions' edges
-//!    into a chain are redirected to the junction at its far end.
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
@@ -250,7 +247,7 @@ impl<T: Len> Dist<T> {
 
 /// One direction's graph: offsets, packed edge words, heavy weights, and the
 /// bits an edge word gives the head.
-type Graph<'a> = (&'a [u32], &'a [u32], &'a [(u32, u64)], u32);
+type Graph<'a> = (&'a [u32], &'a [u32], &'a [(u32, u32)], u32);
 
 /// One side of a search, with distances stored as T.
 struct Side<T> {
@@ -267,8 +264,8 @@ impl<T: Len> Side<T> {
     /// length of a path through a node the other side has reached. A length
     /// that does not fit T is dropped and *over set.
     fn settle(&mut self, g: Graph, other: &Dist<T>, mut best: u64, over: &mut bool) -> u64 {
-        let (off, adj, _, hb) = g;
-        let hmask = (1 << hb) - 1;
+        let (off, adj, heavy, hb) = g;
+        let (hmask, big) = ((1 << hb) - 1, u32::MAX >> hb);
         let (d, u) = self.queue.pop();
         if let Some(&(_, next)) = self.queue.0.first() {
             // Its offsets were fetched when it was queued; start on its edges.
@@ -282,7 +279,9 @@ impl<T: Len> Side<T> {
         let hi = unsafe { *off.get_unchecked(u as usize + 1) };
         for e in lo..hi {
             let x = unsafe { *adj.get_unchecked(e as usize) };
-            let (v, nd) = (x & hmask, d + weight_of(g, e, x));
+            let (v, w) = (x & hmask, x >> hb);
+            let w = if w == big { heavy_weight(heavy, e) } else { w };
+            let nd = d + w as u64;
             if nd < best {
                 let Some(nt) = T::try_from(nd).ok().filter(|&x| x != T::MAX) else {
                     *over = true;
@@ -301,26 +300,17 @@ impl<T: Len> Side<T> {
     }
 }
 
-/// Bidirectional Dijkstra over g (forward, reverse) from each side's
-/// labelled starts, best being a length already known: grow the
+/// Bidirectional Dijkstra from s to t over g (forward, reverse): grow the
 /// side with the smaller queue, record the best length where the sides meet,
 /// and stop once the two smallest queued keys add up to at least that. A side
 /// that runs dry has reached every node it can, so the best meeting seen is
 /// the answer. Also says whether a length too large for T was dropped; the
 /// answer is exact all the same if it is below T::MAX.
-fn search<T: Len>(side: &mut [Side<T>; 2], g: [Graph; 2], from: [&[(u32, u64)]; 2], mut best: u64) -> (u64, bool) {
-    let mut over = false;
-    for (x, starts) in side.iter_mut().zip(from) {
-        for &(v, d) in starts {
-            match T::try_from(d).ok().filter(|&d| d != T::MAX) {
-                Some(d) if d < *x.dist.at(v) => (*x.dist.at(v), _) = (d, x.queue.push(d, v)),
-                Some(_) => {}
-                None => over = true,
-            }
-        }
-    }
-    for &(v, d) in from[0] {
-        best = best.min(d.saturating_add(side[1].dist.get(v)));
+fn search<T: Len>(side: &mut [Side<T>; 2], g: [Graph; 2], s: u32, t: u32) -> (u64, bool) {
+    let (mut best, mut over) = (INF, false);
+    for (x, v) in side.iter_mut().zip([s, t]) {
+        *x.dist.at(v) = 0.into();
+        x.queue.push(0.into(), v);
     }
     while let (Some(a), Some(b)) = (side[0].queue.0.first(), side[1].queue.0.first()) {
         if a.0.into() + b.0.into() >= best {
@@ -363,94 +353,8 @@ impl Filed {
 }
 
 /// The weight of edge e stored as all ones: its entry in the sorted list.
-fn heavy_weight(heavy: &[(u32, u64)], e: u32) -> u64 {
+fn heavy_weight(heavy: &[(u32, u32)], e: u32) -> u32 {
     heavy[heavy.partition_point(|h| h.0 < e)].1
-}
-
-/// The weight in word x of edge e of g.
-fn weight_of(g: Graph, e: u32, x: u32) -> u64 {
-    if x >> g.3 == u32::MAX >> g.3 { heavy_weight(g.2, e) } else { (x >> g.3) as u64 }
-}
-
-/// How many distinct nodes v has an edge to or from (3 standing for more),
-/// and the first two of them.
-fn neighbours(g: [Graph; 2], v: u32) -> (usize, [u32; 2]) {
-    let mut nb = (0, [0; 2]);
-    for (off, adj, _, hb) in g {
-        for &x in &adj[off[v as usize] as usize..off[v as usize + 1] as usize] {
-            let u = x & ((1 << hb) - 1);
-            if !nb.1[..nb.0].contains(&u) {
-                if nb.0 == 2 {
-                    return (3, nb.1);
-                }
-                (nb.1[nb.0], nb.0) = (u, nb.0 + 1);
-            }
-        }
-    }
-    nb
-}
-
-/// One bit per node, set for a chain node: one with one or two neighbours.
-struct Bits(Vec<u64>);
-
-impl Bits {
-    fn has(&self, v: u32) -> bool {
-        let word = unsafe { *self.0.get_unchecked(v as usize / 64) };
-        word >> (v % 64) & 1 == 1
-    }
-}
-
-/// The one or two neighbours of chain node c, each with the lightest edge to
-/// it and from it (INF if none), from one pass over c's two rows.
-fn links(g: [Graph; 2], c: u32) -> ([(u32, [u64; 2]); 2], usize) {
-    let (mut l, mut cnt) = ([(u32::MAX, [INF; 2]); 2], 0);
-    for (k, gk @ (off, adj, _, hb)) in g.into_iter().enumerate() {
-        for e in off[c as usize]..off[c as usize + 1] {
-            let x = adj[e as usize];
-            let (v, w) = (x & ((1 << hb) - 1), weight_of(gk, e, x));
-            let i = l[..cnt].iter().position(|y| y.0 == v).unwrap_or(cnt);
-            cnt = cnt.max(i + 1);
-            (l[i].0, l[i].1[k]) = (v, l[i].1[k].min(w));
-        }
-    }
-    (l, cnt)
-}
-
-/// Where a search may start from v on side k (0 forward, 1 backward): v
-/// itself if it is a junction, else the junctions at its chain's ends with
-/// the chain's length to (or from) each. Also the length from v along its
-/// chain to mark, and false if the chain reaches no junction (a part of the
-/// graph made of chain nodes only, whose rows are as they were).
-fn starts(g: [Graph; 2], chain: &Bits, v: u32, k: usize, mark: u32) -> (Vec<(u32, u64)>, u64, bool) {
-    if !chain.has(v) {
-        return (vec![(v, 0)], INF, true);
-    }
-    let (mut out, mut direct, mut joined) = (Vec::new(), INF, false);
-    let (l, cnt) = links(g, v);
-    for &(n, w) in &l[..cnt] {
-        // On from v through n, lengths [to, from], to a junction; not past
-        // a dead end or back at v.
-        let (mut p, mut c, mut len) = (v, n, w);
-        loop {
-            if c == mark {
-                direct = direct.min(len[0]);
-            }
-            if !chain.has(c) {
-                (joined, _) = (true, out.push((c, len[k])));
-                break;
-            }
-            let (l, cnt) = links(g, c);
-            match l[..cnt].iter().find(|y| y.0 != p) {
-                Some(&(next, w)) if next != v => {
-                    len = [len[0].saturating_add(w[0]), len[1].saturating_add(w[1])];
-                    (p, c) = (c, next);
-                }
-                _ => break,
-            }
-        }
-    }
-    out.retain(|x| x.1 < INF);
-    (out, direct, joined)
 }
 
 fn main() {
@@ -519,7 +423,7 @@ fn main() {
     first[n] = m as u32;
     let (fr, lr) = (Raw::of(&mut first), Raw::of(&mut link));
     let claim_part = AtomicUsize::new(0);
-    let mut heavy: Vec<(u32, u64)> = on_threads(nt, |_| {
+    let mut heavy: Vec<(u32, u32)> = on_threads(nt, |_| {
         let (mut heavy, mut cursor) = (Vec::new(), vec![0u32; 1 << sh]);
         loop {
             let p = claim_part.fetch_add(1, Relaxed);
@@ -540,7 +444,7 @@ fn main() {
                 for (o, x) in f.records(p) {
                     let c = &mut cursor[o];
                     if x >> hb == big {
-                        heavy.push((*c, *h.next().unwrap() as u64));
+                        heavy.push((*c, *h.next().unwrap()));
                     }
                     unsafe { *lr.at(*c as usize) = x };
                     *c += 1;
@@ -647,7 +551,7 @@ fn main() {
     let mut adj = vec![0u32; m];
     let ar = Raw::of(&mut adj);
     let off = &off;
-    let mut heavy2: Vec<(u32, u64)> = on_threads(nt, |t| {
+    let mut heavy2: Vec<(u32, u32)> = on_threads(nt, |t| {
         let (mut out, r) = (Vec::new(), share(n, t, nt));
         for u in r.clone() {
             if u + 8 < r.end {
@@ -679,6 +583,7 @@ fn main() {
     // The reverse graph in the same format: in-degrees counted into
     // roff[v + 1], summed, then roff[v] used as v's cursor, which leaves it at
     // v's end, so shifting it up by one restores the offsets.
+    let adj = &adj;
     let mut roff = vec![0u32; n + 1];
     let rr = Raw::of(&mut roff);
     let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
@@ -688,7 +593,7 @@ fn main() {
     }
     let mut radj = vec![0u32; m];
     let rar = Raw::of(&mut radj);
-    let mut rheavy: Vec<(u32, u64)> = on_threads(nt, |t| {
+    let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
         let mut out = Vec::new();
         for u in share(n, t, nt) {
             for e in off[u]..off[u + 1] {
@@ -706,95 +611,6 @@ fn main() {
     rheavy.sort_unstable();
     roff.copy_within(0..n, 1);
     roff[0] = 0;
-
-    // 5. Chains. A node with at most two distinct neighbours (about a third of
-    // a road network: dead ends and nodes along a street between junctions)
-    // need never be settled. Each junction's edge into a chain is redirected to
-    // the junction at the chain's far end, weighted with the chain's length,
-    // in both graphs; an edge into a dead end, a loop back or a chain one-way
-    // against it becomes a self-loop of weight 0, which never gains anything.
-    // A query that starts or ends on a chain starts from its junctions.
-    let raw = [Raw::of(&mut adj), Raw::of(&mut radj)];
-    let rows = |k: usize| unsafe { std::slice::from_raw_parts(raw[k].0 as *const u32, m) };
-    let g = [(&off[..], rows(0), &heavy2[..], hb), (&roff[..], rows(1), &rheavy[..], hb)];
-    let words = n.div_ceil(64);
-    let chain = on_threads(nt, |t| {
-        let bit = |v: usize| (v < n && (1..=2).contains(&neighbours(g, v as u32).0)) as u64;
-        share(words, t, nt).map(|i| (0..64).fold(0, |b, j| b | bit(64 * i + j) << j)).collect::<Vec<_>>()
-    });
-    let chain = Bits(chain.concat());
-    // Each chain is rewritten once, from a chain node next to a junction:
-    // a lone node between two junctions directly, a longer chain by the walk
-    // from its end with the smaller (junction, chain node) pair. The edges of
-    // both its end junctions are redirected. Two walks may change one junction's row (other
-    // entries), so rows are read and written as atomics here.
-    let cell = |k: usize, e: u32| unsafe { AtomicU32::from_ptr(raw[k].at(e as usize)) };
-    let changes = on_threads(nt, |t| {
-        // Per graph, heavy weights gone and added.
-        let mut out: [(Vec<u32>, Vec<(u32, u64)>); 2] = Default::default();
-        // Redirects junction j's edges to or from chain node h in graph k to
-        // node to, adding len; to == j (or len INF) makes them self-loops.
-        let mut redirect = |k: usize, j: u32, h: u32, to: u32, len: u64| {
-            for e in g[k].0[j as usize]..g[k].0[j as usize + 1] {
-                let x = cell(k, e).load(Relaxed);
-                if x & hmask == h {
-                    let w = weight_of(g[k], e, x);
-                    let (to, w2) = if to == j || len == INF { (j, 0) } else { (to, w.saturating_add(len)) };
-                    cell(k, e).store(to | (w2.min(big as u64) as u32) << hb, Relaxed);
-                    (w >= big as u64).then(|| out[k].0.push(e));
-                    (w2 >= big as u64).then(|| out[k].1.push((e, w2)));
-                }
-            }
-        };
-        for x in share(n, t, nt).map(|x| x as u32).filter(|&x| chain.has(x)) {
-            let (l, cnt) = links(g, x);
-            let junction = [cnt > 0 && !chain.has(l[0].0), cnt > 1 && !chain.has(l[1].0)];
-            // The chain a -> x .. c -> b: the edges between a and x, the
-            // lengths [forward, backward] from x to c, and b with the edges
-            // between c and b (None at a dead end).
-            let (a, first, c, mid, end) = match junction {
-                [true, true] => (l[0].0, l[0].1, x, [0, 0], Some(l[1])), // x alone between two junctions
-                [true, false] | [false, true] => {
-                    let (i, o) = if junction[0] { (0, 1) } else { (1, 0) };
-                    let (a, mut c, mut mid, mut end) = (l[i].0, x, [0u64; 2], None);
-                    let mut next = (cnt > 1).then(|| l[o]);
-                    while let Some((nx, w)) = next {
-                        if !chain.has(nx) {
-                            end = Some((nx, w));
-                            break;
-                        }
-                        mid = [mid[0].saturating_add(w[0]), mid[1].saturating_add(w[1])];
-                        let p = std::mem::replace(&mut c, nx);
-                        let (l, cnt) = links(g, c);
-                        next = l[..cnt].iter().find(|y| y.0 != p).copied();
-                    }
-                    if end.is_some_and(|(b, _)| (b, c) < (a, x)) {
-                        continue; // the walk from the other end rewrites this chain
-                    }
-                    (a, l[i].1, c, mid, end)
-                }
-                _ => continue, // inside a chain
-            };
-            let (b, last) = end.unwrap_or((a, [INF; 2]));
-            redirect(0, a, x, b, mid[0].saturating_add(last[0]));
-            redirect(1, a, x, b, last[1].saturating_add(mid[1]));
-            if end.is_some() {
-                redirect(0, b, c, a, mid[1].saturating_add(first[0]));
-                redirect(1, b, c, a, first[1].saturating_add(mid[0]));
-            }
-        }
-        out
-    });
-    let mut heavy = [heavy2, rheavy];
-    for (k, h) in heavy.iter_mut().enumerate() {
-        let mut gone: Vec<u32> = changes.iter().flat_map(|c| c[k].0.clone()).collect();
-        gone.sort_unstable();
-        h.retain(|x| gone.binary_search(&x.0).is_err());
-        h.extend(changes.iter().flat_map(|c| c[k].1.clone()));
-        h.sort_unstable();
-    }
-    let [heavy2, rheavy] = heavy;
-    drop(changes);
 
     // 4. Queries sorted so neighbouring searches share cached pages.
     let mut order: Vec<usize> = (0..ends.len()).collect();
@@ -819,21 +635,15 @@ fn main() {
             if roff[t as usize + 1] == roff[t as usize] {
                 continue; // no in-edge: unreachable
             }
-            let (fs, direct, fj) = starts(graphs, &chain, s, 0, t);
-            let (bs, _, bj) = starts(graphs, &chain, t, 1, u32::MAX);
-            let (fs, bs) = match fj && bj {
-                true => (fs, bs),
-                false => (vec![(s, 0)], vec![(t, 0)]), // a part with chain nodes only
-            };
-            let mut best = search(&mut narrow, graphs, [&fs, &bs], direct);
+            let mut best = search(&mut narrow, graphs, s, t);
             if best.1 && best.0 >= u32::MAX as u64 {
-                best = search(&mut wide, graphs, [&fs, &bs], direct); // the answer may not fit u32
+                best = search(&mut wide, graphs, s, t); // the answer may not fit u32
             }
             unsafe { *ansr.at(i) = best.0 };
         }
     });
     // Free the graph on every thread at once rather than at exit on one.
-    on_threads(nt, |t| [off, &adj, &roff, &radj].iter().for_each(|b| drop_pages(b, t, nt)));
+    on_threads(nt, |t| [off, adj, &roff, &radj].iter().for_each(|b| drop_pages(b, t, nt)));
 
     // INF prints as -1 (u64::MAX as i64); every real distance is below 2^63.
     let out: String = ans.iter().map(|&a| format!("{}\n", a as i64)).collect();
