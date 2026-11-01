@@ -32,7 +32,6 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <memory>
-#include <numeric>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -185,6 +184,7 @@ struct Chunk {
 
 struct Parser {
   Chunk *last[HOURS] = {}, *next = nullptr, *kept = nullptr;
+  int h = 0;
   std::vector<std::pair<u32, u32>> wide[HOURS];
 
   void map(size_t size) {
@@ -193,20 +193,26 @@ struct Parser {
         (Chunk *)mmap(nullptr, bytes, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   }
 
+  // Lines arrive in about clock order, so the hour index is worked out only
+  // when the line's "MM-DDTHH" bytes differ from the line before's.
   void run(const char *p, const char *end) {
-    while (p < end) {
-      int day = (p[8] - '0') * 10 + p[9] - '0',
-          hr = (p[11] - '0') * 10 + p[12] - '0',
-          h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18;
+    for (u64 stamp = 0, at; p < end;) {
+      memcpy(&at, p + 5, 8);
+      if (at != stamp) {
+        int day = (p[8] - '0') * 10 + p[9] - '0',
+            hr = (p[11] - '0') * 10 + p[12] - '0';
+        h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18, stamp = at;
+      }
       const char *m = p + 28;
       u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
-      u64 nl = eq32(m, '\n') | u64(eq32(m + 32, '\n')) << 32;
       const char *name = m + __builtin_ctzll(sp) + 1;
-      const char *ne =
-          nl ? m + __builtin_ctzll(sp & (sp - 1)) : next_byte(name, ' ');
-      const char *eol = nl ? m + __builtin_ctzll(nl) : next_byte(ne + 5, '\n');
+      sp &= sp - 1;
+      const char *ne = sp ? m + __builtin_ctzll(sp) : next_byte(m + 64, ' ');
+      // After " SSS " the latency has at most 10 digits: its LF is within 32.
+      u32 len = __builtin_ctz(eq32(ne + 5, '\n'));
+      const char *eol = ne + 5 + len;
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
-      u32 lat = decode(eol, eol - ne - 5);
+      u32 lat = decode(eol, len);
       p = eol + 1;
       if (__builtin_expect(lat >= PACKED_MAX, 0)) {
         wide[h].push_back({lat, key});
@@ -275,9 +281,6 @@ int main() {
   // sizes before it arrives, while its chunks are still in its cache.
   std::atomic_flag ranking;
   std::vector<std::atomic<u32>> count(HOURS);
-  // Hours are claimed in clock order, so their chunks go back in order, but
-  // the last day's, the largest, go largest first so none of them starts last.
-  std::vector<int> order(HOURS);
   auto rank_names = [&] {
     std::vector<std::pair<std::string_view, u32>> by_name;
     for (u32 i = 0; i < Names::SLOTS; ++i)
@@ -291,9 +294,6 @@ int main() {
   std::barrier ranked(nt, [&]() noexcept {
     for (auto &n : count)
       most = std::max(most, n.load());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.end() - 24, order.end(),
-              [&](int a, int b) { return count[a] > count[b]; });
     if (names.size() != endpoints.count)
       rank_names();
   });
@@ -346,8 +346,7 @@ int main() {
         const u32 ne = names.size();
         std::vector<u32> start(ne + 1), errors(ne), cursor(ne);
         std::unique_ptr<u32[]> latency(new u32[most]);
-        for (int i; (i = claim++) < HOURS;) {
-          int h = order[i];
+        for (int h; (h = claim++) < HOURS;) {
           std::fill(start.begin(), start.end(), 0);
           std::fill(errors.begin(), errors.end(), 0);
           // Counting sort of the hour's latencies by endpoint rank.
