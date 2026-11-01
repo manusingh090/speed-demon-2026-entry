@@ -423,6 +423,10 @@ int main() {
                 madvise(reinterpret_cast<void*>(from), uintptr_t(records + cut[k + 1]) - from, MADV_POPULATE_READ);
                 parse_records(records + cut[k], records + cut[k + 1], records + size, country_of, nregions, names,
                               seen, totals[t].data());
+                // The piece is not read again: its pages are unmapped now, by
+                // this thread, instead of all of the file's at exit by one.
+                uintptr_t to = uintptr_t(records + cut[k + 1]) & ~uintptr_t(4095);
+                if (to > from) madvise(reinterpret_cast<void*>(from), to - from, MADV_DONTNEED);
             });
         });
     for (auto& th : pool) th.join();
