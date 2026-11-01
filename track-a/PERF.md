@@ -30,7 +30,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 23 | Back to step 18's code | pending | | | |
 | 24 | Endpoint table of 8,192 slots with dense ids from a counter, a 20-bit hash tag and the length checked before the name compare; code in 308 counted lines instead of 327 | run-645ac82c679c | 0.0212 s | 18.0 MiB | 84.66 |
 | 25 | Step 24's code with its explanatory comments (no counted line changes) | pending | | | |
-| 26 | The line's end from one 32-byte compare after the status code (a latency has at most 10 digits), so the parse keeps one mask of spaces instead of masks of spaces and LFs | pending | | | |
+| 26 | The line's end from one 32-byte compare after the status code (a latency has at most 10 digits), so the parse keeps one mask of spaces instead of masks of spaces and LFs | run-028f1cfc1335 | 0.0227 s | 21.7 MiB | 83.14 |
+| 27 | Back to step 25's code | pending | | | |
 
 ## Local measurements
 
@@ -108,6 +109,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 24 on the board, and step 25.** run-645ac82c679c: 0.0212 s, 18.0 MiB, 315 counted lines, the best Track A run so far at 84.66. Step 25 puts back the comments the rewrite had dropped; the counted lines stay 308 and the hashes are the same.
 
 **Step 25 to 26.** From a rewrite that also made the endpoint table hash-only (no name compare): that table cost 3 to 6% more cycles (its multiply chain over a long name's middle is slower than a CRC and one 64-byte compare) and would merge two endpoints whose 52-bit fingerprints collide, so only the parse change is kept. Laptop: 700M user instructions against 715M, cycles lower in two of three interleaved rounds, 308 counted lines both. Same hash on all six datasets, 20 repeated full runs gave one hash.
+
+**Step 26 on the board, and step 27.** run-028f1cfc1335: 0.0227 s and 21.7 MiB, 83.14, below step 25's code, which a later push ran again in 0.0209 s (run-38c8b98f7941, 84.75, the best Track A run so far). Step 27 is step 25's code again.
 
 ## Tried and kept out
 

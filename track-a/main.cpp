@@ -199,14 +199,13 @@ struct Parser {
           h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18;
       const char *m = p + 28;
       u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
+      u64 nl = eq32(m, '\n') | u64(eq32(m + 32, '\n')) << 32;
       const char *name = m + __builtin_ctzll(sp) + 1;
-      sp &= sp - 1;
-      const char *ne = sp ? m + __builtin_ctzll(sp) : next_byte(m + 64, ' ');
-      // After " SSS " the latency has at most 10 digits: its LF is within 32.
-      u32 len = __builtin_ctz(eq32(ne + 5, '\n'));
-      const char *eol = ne + 5 + len;
+      const char *ne = nl ? m + __builtin_ctzll(sp & (sp - 1))
+                          : next_byte(name, ' ');
+      const char *eol = nl ? m + __builtin_ctzll(nl) : next_byte(ne + 5, '\n');
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
-      u32 lat = decode(eol, len);
+      u32 lat = decode(eol, eol - ne - 5);
       p = eol + 1;
       if (__builtin_expect(lat >= PACKED_MAX, 0)) {
         wide[h].push_back({lat, key});
