@@ -56,6 +56,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Diagnostic: the query parse done twice, the first time into tables that are then dropped (same output) | run-6b36d19e3be3 | 0.189 | 47.2 | 72.06 |
 | 50 | Queries parsed on all threads, in line-aligned pieces joined in order, into a lock-free term table | run-0849e5ad6dd0 | 0.178 | 50.1 | 72.32 |
 | 51 | Back to step 46's code | pending | | | |
+| 52 | Diagnostic: step 46's code with each thread scanning its share twice, the first result dropped (same output), so the extra time is the scan's cost on the box | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 

@@ -550,7 +550,10 @@ fn main() {
 
     // The scan: phrase matches, bitmap bits, and list postings by bucket.
     let found = Mutex::new(vec![]); // (query, document) phrase matches
-    let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>)> = on_threads(|t| {
+    // Diagnostic for the board: each thread scans its share twice and keeps
+    // the second result (bitmap ORs repeat harmlessly and phrase matches are
+    // deduplicated), so the run's extra time is the scan's cost there.
+    let scan = |t: usize| {
         // Per term (and one id for every token that needs nothing): documents
         // in this share, and the last one's offset + 1.
         let (mut count, mut last, mut mine) = (vec![0u16; nkeep + 1], vec![0u16; nkeep + 1], vec![]);
@@ -619,6 +622,10 @@ fn main() {
         assert!(n < 1 << DOC_BITS, "too many documents per thread");
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
+    };
+    let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>)> = on_threads(|t| {
+        drop(scan(t));
+        scan(t)
     });
     drop(terms); // nothing after the scan reads the term tables
     // Each term's postings lie in one stretch, thread by thread: the segment
