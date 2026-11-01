@@ -298,7 +298,15 @@ int main() {
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
         parsers[t].map(size);
-        for (int k; (k = claim_piece++) < pieces;) parsers[t].run(log + cut[k], log + cut[k + 1]);
+        // Diagnostic for the board: each piece is parsed once more first, into
+        // a parser that is then dropped, so the run's extra time is the parse's
+        // cost on the box.
+        Parser shadow;
+        shadow.map(size);
+        for (int k; (k = claim_piece++) < pieces;) {
+            shadow.run(log + cut[k], log + cut[k + 1]);
+            parsers[t].run(log + cut[k], log + cut[k + 1]);
+        }
         ranked.arrive_and_wait();
 
         {  // the scratch goes before the text phase, where the output counts
@@ -308,25 +316,6 @@ int main() {
         std::vector<u32> start(ne + 1), errors(ne);
         std::unique_ptr<u32[]> latency(new u32[most]);  // not zeroed: only pages used count
         for (int h; (h = claim++) < HOURS;) {
-            // Diagnostic for the board: the hour's sort and selections are done
-            // once more first and thrown away, so the run's extra time is the
-            // hour phase's cost on the box.
-            {
-                std::fill(start.begin(), start.end(), 0);
-                std::fill(errors.begin(), errors.end(), 0);
-                for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32 e, u32 err, u32) { ++start[e + 1], errors[e] += err != 0; });
-                for (u32 e = 0; e < ne; ++e) start[e + 1] += start[e];
-                std::vector<u32> cursor(start.begin(), start.end() - 1);
-                for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32 e, u32, u32 l) { latency[cursor[e]++] = l; });
-                for (u32 e = 0; e < ne; ++e) {
-                    u32 n = start[e + 1] - start[e];
-                    if (n == 0) continue;
-                    u32* a = latency.get() + start[e];
-                    u32 r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
-                    for (u32 from = 0; u32 r : {r50, r95, r99})
-                        if (r >= from) select(a + from, n - from, r - from), from = r + 1;
-                }
-            }
             // Counting sort of the hour's latencies by endpoint rank: count into
             // start[e + 1], prefix, then place each latency at its group's cursor.
             std::fill(start.begin(), start.end(), 0);

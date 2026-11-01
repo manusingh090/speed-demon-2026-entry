@@ -20,7 +20,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | No prefetch (step 11's parse); an output left by an earlier run is deleted by one thread while the others parse, and the file is created once its size is known | run-4746252bf871 | 0.0263 s | 18.1 MiB | 82.16 |
 | 14 | Step 13's output handling undone; each piece's line-aligned ends found by the thread that claims it instead of all 96 by `main` before the threads start | run-04a166e09845 | 0.0264 s | 18.5 MiB | 82.01 |
 | 15 | Back to step 11's code | pending | | | |
-| 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | pending | | | |
+| 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | run-7f4f12386a23 | 0.0315 s | 19.1 MiB | 79.75 |
+| 17 | Diagnostic: each piece parsed twice, the first time into a parser that is then dropped (same output) | pending | | | |
 
 ## Local measurements
 
@@ -77,7 +78,7 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 
 **Step 14 on the board, and step 15.** run-04a166e09845: 0.0264 s, again inside step 11's range. On the box a first touch of a page of the log is cheap (no virtual machine's nested page tables), so `main`'s 96 boundary searches cost little there; the 2 ms seen on the laptop was the laptop's. Step 15 is step 11's code, two lines shorter for the same time. What the box rewards on this track is the user-mode work of the parse and the hour phase.
 
-**Steps 16 and 17: measuring the phases on the box.** The laptop's split of the time has misled more than once (its virtual machine makes page faults and the address-space lock dearer than the box's bare metal), so the box itself is asked: a build that does one phase twice, keeping one result, produces the same output, and its extra time is that phase's cost there. Step 16 doubles the hour phase (on the laptop +222M user instructions, +95M cycles); step 17 will double the parse.
+**Steps 16 and 17: measuring the phases on the box.** The laptop's split of the time has misled more than once (its virtual machine makes page faults and the address-space lock dearer than the box's bare metal), so the box itself is asked: a build that does one phase twice, keeping one result, produces the same output, and its extra time is that phase's cost there. Step 16 doubles the hour phase (on the laptop +222M user instructions, +95M cycles); step 17 will double the parse. Step 16 on the board (run-7f4f12386a23): 0.0315 s against about 0.0262 s, so the hour phase costs about 5.2 ms there, a fifth of the run. Step 17 on the laptop: +412M user instructions (133 a line) and about +215M cycles.
 
 ## Tried and kept out
 
