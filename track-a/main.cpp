@@ -298,14 +298,12 @@ int main() {
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
         parsers[t].map(size);
-        // Diagnostic for the board: each piece is parsed once more first, into
-        // a parser that is then dropped, so the run's extra time is the parse's
-        // cost on the box.
-        Parser shadow;
-        shadow.map(size);
         for (int k; (k = claim_piece++) < pieces;) {
-            shadow.run(log + cut[k], log + cut[k + 1]);
             parsers[t].run(log + cut[k], log + cut[k + 1]);
+            // The piece is not read again: its pages are unmapped now, by this
+            // thread, instead of all of the log's at exit by one.
+            uintptr_t from = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095), to = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
+            if (to > from) madvise((void*)from, to - from, MADV_DONTNEED);
         }
         ranked.arrive_and_wait();
 
