@@ -243,16 +243,12 @@ int main() {
     auto* log = (char*)mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (size && mmap(log, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED) return perror("mmap"), 1;
     // Line-aligned pieces, eight per thread, claimed in order: a thread that
-    // starts late or shares its core takes fewer. Piece k starts at the first
-    // line that starts at or after k/pieces of the log; the thread that claims
-    // it finds both ends (so no one thread first touches the log 96 times).
+    // starts late or shares its core takes fewer.
     const int pieces = 8 * nt;
-    auto cut = [&](int k) -> const char* {
-        size_t at = size * k / pieces;
-        if (at == 0 || at >= size) return log + at;
-        auto* nl = static_cast<const char*>(memchr(log + at - 1, '\n', size - at + 1));
-        return nl ? nl + 1 : log + size;
-    };
+    std::vector<size_t> cut(pieces + 1, size);
+    cut[0] = 0;
+    for (int k = 1; k < pieces; ++k)
+        for (cut[k] = std::max(cut[k - 1], size * k / pieces); cut[k] < size && log[cut[k] - 1] != '\n';) ++cut[k];
     std::atomic<int> claim_piece{0};
 
     // Between the phases, endpoints are ranked in unsigned byte order (a
@@ -302,7 +298,7 @@ int main() {
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
         parsers[t].map(size);
-        for (int k; (k = claim_piece++) < pieces;) parsers[t].run(cut(k), cut(k + 1));
+        for (int k; (k = claim_piece++) < pieces;) parsers[t].run(log + cut[k], log + cut[k + 1]);
         ranked.arrive_and_wait();
 
         {  // the scratch goes before the text phase, where the output counts
