@@ -7,9 +7,10 @@
 //  2. Each thread fills its slice of a direct table region_id -> country index.
 //  3. records.csv is split at CRLFs: the generator never writes a CR inside
 //     quotes, so the byte after a CRLF always starts a record. Each record is
-//     read field by field: a short number's comma is found in one 8-byte word,
-//     and a quoted field's end by jumping from quote to quote (a "" pair is an
-//     escape), so commas and LFs inside quotes cost nothing. Numbers are decoded
+//     read field by field: the id's comma is found in one 8-byte word, a quoted
+//     field's end by stepping through the bit mask of its quotes (a "" pair is
+//     an escape), so commas and LFs inside quotes cost nothing, and the region's
+//     comma and the LF in one 32-byte compare each. Numbers are decoded
 //     eight digits at a time. Sums go to the thread's own per-country totals. Names
 //     go through a shared lock-free intern table to dense ids, which are marked
 //     in one bitset per country; both steps are prefetched records ahead. A
@@ -136,9 +137,26 @@ struct Text {
         p = find(s, ',') + 1;
         return {s, u32(p - 1 - s), u32(p - 1 - s)};
     }
+    // The quotes after the opening one, 64 bytes at a time, are stepped
+    // through on their bit mask: a quote followed by another is a "" pair,
+    // the first one that is not closes the field.
     u32 pairs = 0;
     const char* q = s + 1;
-    for (; (q = find(q, '"'))[1] == '"'; q += 2) ++pairs;
+    for (u64 m = match32(q, '"') | u64(match32(q + 32, '"')) << 32;;) {
+        u32 i = m ? __builtin_ctzll(m) : 64;
+        if (i >= 63) {  // none, or the byte after it is out of view: move on
+            q += i;
+            m = match32(q, '"') | u64(match32(q + 32, '"')) << 32;
+            continue;
+        }
+        if (!(m >> (i + 1) & 1)) {
+            q += i;
+            break;
+        }
+        ++pairs;
+        m &= m - 1;
+        m &= m - 1;
+    }
     p = q + 2;
     return {s + 1, u32(q - s - 1), u32(q - s - 1 - pairs)};
 }
@@ -266,12 +284,14 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         u64 id = digits(p, f1);
         p = f1 + 1;
         Text name = text(p), note = text(p);
-        const char* f4 = comma_after(p);
+        // The region (at most 7 digits) and the amount (at most 9 bytes) end
+        // within the 32 bytes at p, so one load gives both the comma and the
+        // LF, if any.
+        u32 lf = match32(p, '\n');
+        const char* f4 = p + __builtin_ctz(match32(p, ','));
         u64 region = digits(p, f4);
-        // The amount is at most 10 bytes: its LF, if any, is in the next 32.
         const char* amount = f4 + 1;
-        u32 lf = match32(amount, '\n');
-        const char* eol = lf ? amount + __builtin_ctz(lf) : file_end;
+        const char* eol = lf ? p + __builtin_ctz(lf) : file_end;
         const char* amount_end = eol - (eol[-1] == '\r');
         bool negative = *amount == '-';
         i64 cents = money(amount + negative, amount_end);
