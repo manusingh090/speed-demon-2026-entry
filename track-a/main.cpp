@@ -47,7 +47,7 @@ constexpr int HOURS = 72; // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
 // 5xx flag. Latencies of 2^19 us or more (about 3% of lines) do not fit and go
 // to a side list with their key instead.
 constexpr u32 KEY_BITS = 13, ERR = 1u << 12, ID_MASK = ERR - 1,
-              PACKED_MAX = 1u << 19;
+              PACKED_MAX = (1u << 19) - 1, SPARE = ~0u;
 
 // Bit i is set when byte i of the 32 at p equals c.
 inline u32 eq32(const char *p, char c) {
@@ -189,24 +189,20 @@ struct Names {
 };
 static Names endpoints;
 
-// One hour's records from one thread, in a chain of 16 KB chunks carved in
-// order from a region the thread maps up front.
-struct Chunk {
-  static constexpr u32 CAP = (16384 - 16) / 4;
-  Chunk *prev;
-  u32 n, hour, rec[CAP];
-};
+// Hour h's records sit together from records + h * per_hour, filled by every
+// thread in 4 KB blocks claimed with one atomic add; a thread's last block in
+// an hour is padded with SPARE, which no record can equal (a latency field of
+// all ones goes to the side list). An hour is handed back with one call once
+// its records are copied out.
+constexpr u32 BLOCK = 1024;
+static u32 *records;
+static size_t per_hour;
+static std::atomic<u32> filled[HOURS];
 
 struct Parser {
-  Chunk *last[HOURS] = {}, *next = nullptr, *kept = nullptr;
+  u32 *cur[HOURS] = {}, *stop[HOURS] = {};
   int h = 0;
   std::vector<std::pair<u32, u32>> wide[HOURS];
-
-  void map(size_t size) {
-    size_t bytes = (size / 40 / Chunk::CAP + 1 + HOURS) * sizeof(Chunk);
-    next = kept =
-        (Chunk *)mmap(nullptr, bytes, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  }
 
   // Lines arrive in about clock order, so the hour index is worked out only
   // when the line's "MM-DDTHH" bytes differ from the line before's.
@@ -245,32 +241,17 @@ struct Parser {
         wide[h].push_back({lat, key});
         continue;
       }
-      Chunk *&c = last[h];
-      if (!c || c->n == Chunk::CAP)
-        next->prev = c, next->n = 0, next->hour = h, c = next++;
-      c->rec[c->n++] = lat << KEY_BITS | key;
+      u32 *&c = cur[h];
+      if (c == stop[h])
+        c = records + h * per_hour + filled[h].fetch_add(BLOCK),
+        stop[h] = c + BLOCK;
+      *c++ = lat << KEY_BITS | key;
     }
   }
 
-  // The log is in arrival order, so chunks are carved roughly hour by hour and
-  // hours finish in the same order. The run of chunks at the front whose hours
-  // are all finished is handed back in 64 KB batches, before the output's
-  // pages start to count.
-  void release(const std::atomic<bool> *done) {
-    Chunk *c = kept;
-    while (c < next && done[c->hour])
-      ++c;
-    if (c - kept >= 4 || (c == next && c > kept))
-      madvise(kept, (c - kept) * sizeof(Chunk), MADV_DONTNEED), kept = c;
-  }
-
-  // Calls f(endpoint id, 5xx flag, latency) for every record of hour h.
-  template <class F> void each(int h, F &&f) const {
-    for (const Chunk *c = last[h]; c; c = c->prev)
-      for (u32 i = 0; i < c->n; ++i)
-        f(c->rec[i] & ID_MASK, c->rec[i] & ERR, c->rec[i] >> KEY_BITS);
-    for (auto [lat, key] : wide[h])
-      f(key & ID_MASK, key & ERR, lat);
+  void seal() {
+    for (int h = 0; h < HOURS; ++h)
+      std::fill(cur[h], stop[h], SPARE);
   }
 };
 
@@ -288,6 +269,11 @@ int main() {
   if (size && mmap(log, size, 1, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED)
     return perror("mmap"), 1;
 
+  // An hour holds at most every line (one is at least 39 bytes) plus a part
+  // block per thread; only the pages written are ever backed.
+  per_hour = (size / 39 / BLOCK + nt + 1) * BLOCK;
+  records = (u32 *)mmap(nullptr, HOURS * per_hour * 4, 3,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   const int pieces = 8 * nt;
   std::vector<size_t> cut(pieces + 1, size);
   cut[0] = 0;
@@ -301,13 +287,20 @@ int main() {
   std::vector<std::string_view> names;
   std::vector<u32> by_rank;
   u32 most = 0;
+  struct Line {
+    u32 e, n, p50, p95, p99, errors;
+  };
+  // Hour h's count[h] lines sit from lines + h * hour_bytes, each hour on
+  // whole pages of its own, handed back once the hour's text is written
+  // (freed vectors would stay resident while the output's pages fill).
+  char *lines = nullptr;
+  size_t hour_bytes = 0;
+  std::vector<u32> count(HOURS);
   // Endpoints ranked in unsigned byte order, the order of an hour's lines.
   // The first thread out of pieces ranks the names seen so far while the
   // others finish theirs, and the barrier ranks again only if a name was
-  // added since (on the full log, never). Each thread adds its own hours'
-  // sizes before it arrives, while its chunks are still in its cache.
+  // added since (on the full log, never).
   std::atomic_flag ranking;
-  std::vector<std::atomic<u32>> count(HOURS);
   auto rank_names = [&] {
     std::vector<std::pair<std::string_view, u32>> by_name;
     for (u32 i = 0; i < Names::SLOTS; ++i)
@@ -318,26 +311,42 @@ int main() {
     for (auto [name, id] : by_name)
       by_rank.push_back(id), names.push_back(name);
   };
+  // Hours are claimed smallest first. Each is handed back on its own, so the
+  // order is free: the first twelve, whose sort scratch is touched while
+  // every record is still held, are then the smallest, and the threads still
+  // finish close together (the largest hours, which come last in clock order
+  // too, are spread over all of them).
+  std::vector<int> order(HOURS);
   std::barrier ranked(nt, [&]() noexcept {
-    for (auto &n : count)
-      most = std::max(most, n.load());
+    for (int h = 0; h < HOURS; ++h) {
+      u32 n = filled[h];
+      for (auto &ps : parsers)
+        n += ps.wide[h].size();
+      most = std::max(most, n), order[h] = h;
+    }
+    std::sort(order.begin(), order.end(),
+              [](int a, int b) { return filled[a] < filled[b]; });
     if (names.size() != endpoints.count)
       rank_names();
+    hour_bytes = (names.size() * sizeof(Line) + 4095) & ~size_t(4095);
+    lines = (char *)mmap(nullptr, HOURS * hour_bytes, 3,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   });
 
-  std::vector<std::atomic<bool>> finished(HOURS);
-  std::atomic_flag releasing;
-  struct Line {
-    u32 e, n, p50, p95, p99, errors;
+  // Calls f(endpoint id, 5xx flag, latency) for every record of hour h.
+  auto each = [&](int h, auto &&f) {
+    for (u32 *r = records + h * per_hour, *e = r + filled[h]; r < e; ++r)
+      if (*r != SPARE)
+        f(*r & ID_MASK, *r & ERR, *r >> KEY_BITS);
+    for (auto &ps : parsers)
+      for (auto [lat, key] : ps.wide[h])
+        f(key & ID_MASK, key & ERR, lat);
   };
   auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
-  std::vector<std::vector<Line>> lines(HOURS);
   std::vector<u64> at(HOURS + 1);
   char *text = nullptr;
   // Every hour is sized: offsets, then the output mapped at its final size.
   std::barrier sized(nt, [&]() noexcept {
-    for (auto &ps : parsers)
-      ps.release(finished.data());
     u64 total = 0;
     for (int h = 0; h < HOURS; ++h)
       total += std::exchange(at[h], total);
@@ -353,7 +362,6 @@ int main() {
   std::vector<std::thread> pool;
   for (int t = 0; t < nt; ++t)
     pool.emplace_back([&, t] {
-      parsers[t].map(size);
       for (int k; (k = claim_piece++) < pieces;) {
         parsers[t].run(log + cut[k], log + cut[k + 1]);
         uintptr_t a = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095),
@@ -363,37 +371,27 @@ int main() {
       }
       if (!ranking.test_and_set())
         rank_names();
-      for (int h = 0; h < HOURS; ++h) {
-        count[h] += parsers[t].wide[h].size();
-        for (const Chunk *c = parsers[t].last[h]; c; c = c->prev)
-          count[h] += c->n;
-      }
+      parsers[t].seal();
       ranked.arrive_and_wait();
       {
         const u32 ne = names.size(), ids = endpoints.next_id;
         std::vector<u32> start(ids), errors(ids), cursor(ids);
         std::unique_ptr<u32[]> latency(new u32[most]);
-        for (int h; (h = claim++) < HOURS;) {
+        for (int i; (i = claim++) < HOURS;) {
+          int h = order[i];
           std::fill(start.begin(), start.end(), 0);
           std::fill(errors.begin(), errors.end(), 0);
           // Counting sort of the hour's latencies, counted and placed by
           // endpoint id with the groups laid out in rank order.
-          for (auto &ps : parsers)
-            ps.each(h, [&](u32 id, u32 err, u32) {
-              ++start[id], errors[id] += err != 0;
-            });
+          each(h, [&](u32 id, u32 err, u32) {
+            ++start[id], errors[id] += err != 0;
+          });
           for (u32 e = 0, at = 0; e < ne; ++e) {
             u32 id = by_rank[e];
             cursor[id] = at, at += start[id], start[id] = cursor[id];
           }
-          for (auto &ps : parsers)
-            ps.each(h, [&](u32 id, u32, u32 l) { latency[cursor[id]++] = l; });
-          finished[h] = true;
-          if (!releasing.test_and_set()) {
-            for (auto &ps : parsers)
-              ps.release(finished.data());
-            releasing.clear();
-          }
+          each(h, [&](u32 id, u32, u32 l) { latency[cursor[id]++] = l; });
+          madvise(records + h * per_hour, filled[h] * 4, MADV_DONTNEED);
           u64 sz = 0;
           for (u32 e = 0; e < ne; ++e) {
             u32 id = by_rank[e], n = cursor[id] - start[id];
@@ -406,8 +404,8 @@ int main() {
             for (u32 from = 0; u32 r : {r50, r95, r99})
               if (r >= from)
                 select(a + from, n - from, r - from), from = r + 1;
-            const Line &l =
-                lines[h].emplace_back(e, n, a[r50], a[r95], a[r99], errors[id]);
+            Line &l = ((Line *)(lines + h * hour_bytes))[count[h]++];
+            l = {e, n, a[r50], a[r95], a[r99], errors[id]};
             sz += 28 + names[e].size();
             for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
               sz += width(x);
@@ -422,14 +420,15 @@ int main() {
         snprintf(label, 32, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
                  day < 2 ? 30 + day : day - 1, (h + 18) % 24);
         char *o = text + at[h];
-        for (const Line &l : lines[h]) {
+        for (u32 i = 0; i < count[h]; ++i) {
+          const Line &l = ((Line *)(lines + h * hour_bytes))[i];
           o = std::copy_n(label, 21, o);
           o = std::copy(names[l.e].begin(), names[l.e].end(), o);
           for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
             *o = ' ', o += 1 + width(x), put(o, x);
           *o++ = '\n';
         }
-        std::vector<Line>().swap(lines[h]);
+        madvise(lines + h * hour_bytes, hour_bytes, MADV_DONTNEED);
       }
     });
   for (auto &th : pool)
