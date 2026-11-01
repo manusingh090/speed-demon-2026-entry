@@ -220,42 +220,54 @@ struct Numbers {
            u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)))) << 32;
 }
 
-// Parse every record that starts in [p, end). A record's region row and name
-// slot are prefetched when it is parsed; LAG records later its country is
-// read, its sums go to totals, its name is looked up and that name's bitset
-// word prefetched; LAG records after that the name is marked. So each of the
-// three random reads (region table, name table, bitsets) has a steady lead.
+// One record's fields, as parsed, and then its country and name id.
+struct Parsed {
+    u64 name;  // the key
+    u32 region, id, name_bytes, note_bytes;
+    i64 cents;
+};
+
+struct Mark {
+    u32 country, id;
+};
+
+// The records of a chunk, in three stages: parsed (its region's country and
+// name's slot prefetched), looked up (sums added, name found, its bitset word
+// prefetched), marked. A chunk is looked up while the next is parsed and
+// marked while the one after is: each prefetch leads its use by a chunk, about
+// 67 records, and each loop is short enough to keep its values in registers.
+struct Batch {
+    static constexpr u32 MAX = 64 * 64 / 5 + 2;  // a record has five separators
+    u32 n = 0;
+    Parsed rec[MAX];
+    Mark mark[MAX];
+};
+
+[[gnu::always_inline]] inline void look_up(Batch& b, const u8* country_of, NameTable names, NamesSeen seen, Totals* totals) {
+    for (u32 j = 0; j < b.n; ++j) {
+        const Parsed& r = b.rec[j];
+        u32 c = country_of[r.region];
+        Totals& t = totals[c];
+        ++t.count;
+        t.id_sum += r.id;
+        t.amount_sum += r.cents;
+        t.amount_min = std::min(t.amount_min, r.cents);
+        t.amount_max = std::max(t.amount_max, r.cents);
+        t.name_bytes += r.name_bytes;
+        t.note_bytes += r.note_bytes;
+        u32 id = names.id(r.name);
+        b.mark[j] = {c, id};
+        seen.prefetch(c, id);
+    }
+}
+
+[[gnu::always_inline]] inline void mark_all(const Batch& b, NamesSeen seen, Totals* totals) {
+    for (u32 j = 0; j < b.n; ++j) totals[b.mark[j].country].distinct += seen.mark(b.mark[j].country, b.mark[j].id);
+}
+
+// Parse every record that starts in [p, end).
 void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
                    size_t regions, NameTable names, NamesSeen seen, Totals* totals) {
-    constexpr u64 LAG = 16;
-    struct Pending {
-        u64 name;
-        u32 region, id, name_bytes, note_bytes;
-        i64 cents;
-    } pending[LAG];
-    struct Mark {
-        u32 country, id;
-    } marks[LAG];
-    u64 n = 0, last = UINT64_MAX;  // records started; all of them once known
-    auto advance = [&]() __attribute__((always_inline)) {  // retire ring slot n % LAG
-        u32 k = n % LAG;
-        if (n >= 2 * LAG && n - 2 * LAG < last) totals[marks[k].country].distinct += seen.mark(marks[k].country, marks[k].id);
-        if (n >= LAG && n - LAG < last) {
-            const Pending& old = pending[k];
-            u32 c = old.region < regions ? country_of[old.region] : 0;
-            Totals& t = totals[c];
-            ++t.count;
-            t.id_sum += old.id;
-            t.amount_sum += old.cents;
-            t.amount_min = std::min(t.amount_min, old.cents);
-            t.amount_max = std::max(t.amount_max, old.cents);
-            t.name_bytes += old.name_bytes;
-            t.note_bytes += old.note_bytes;
-            marks[k] = {c, names.id(old.name)};
-            seen.prefetch(c, marks[k].id);
-        }
-    };
-
     // The file is read a chunk of 64-byte blocks at a time, each chunk from
     // a record's start. A block is classified at once: a bit mask each of
     // quotes, commas and LFs; the bytes inside quotes are those after an odd
@@ -272,7 +284,8 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
     u32 at[CHUNK * 64 + 9];  // separator offsets from the chunk's start
     u64 qmask[CHUNK];
     u32 qbefore[CHUNK];
-    while (p < end) {
+    Batch batches[3];
+    for (u32 k = 0; p < end; ++k) {
         const u32 blocks = std::min<u64>(CHUNK, (end - p + 63) / 64);
         u32 seps = 0, quotes = 0;
         u64 inside = 0;
@@ -297,6 +310,8 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         if (p + 64 * blocks >= file_end) at[seps++] = file_end - p;
         auto quotes_before = [&](u32 x) { return qbefore[x / 64] + __builtin_popcountll(_bzhi_u64(qmask[x / 64], x % 64)); };
         const char* chunk = p;
+        Batch& batch = batches[k % 3];
+        u32 nrec = 0;
         for (u32 i = 0; i + 5 <= seps && p < end; i += 5) {
             if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
             const char *f1 = chunk + at[i], *f2 = chunk + at[i + 1], *f3 = chunk + at[i + 2];
@@ -313,20 +328,26 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
             const char* amount_end = eol - (eol[-1] == '\r');
             bool negative = *amount == '-';
             Numbers num = numbers(p, f1, f3 + 1, f4, amount + negative, amount_end);
-            u64 id = num.id, region = num.region;
             i64 cents = negative ? -i64(num.cents) : i64(num.cents);
 
-            // Region ids are below 10^7 (fit u32); one past the table means none.
-            u32 r = region < regions ? u32(region) : u32(regions);
+            // Region ids are below 10^7 (fit u32); the table's end (an id no
+            // region has, country 0) stands for any id past it.
+            u32 r = num.region < regions ? num.region : u32(regions);
             _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
-            advance();
             u64 key = NameTable::key(name_at, name_raw);
-            pending[n++ % LAG] = {key, r, u32(id), name_length, note_length, cents};
             names.prefetch(key);
+            batch.rec[nrec++] = {key, r, num.id, name_length, note_length, cents};
             p = eol + 1;
         }
+        batch.n = nrec;
+        if (k >= 1) look_up(batches[(k - 1) % 3], country_of, names, seen, totals);
+        if (k >= 2) mark_all(batches[(k - 2) % 3], seen, totals);
+        if (p >= end) {  // the last chunk: finish the two before it and this one
+            if (k >= 1) mark_all(batches[(k - 1) % 3], seen, totals);
+            look_up(batch, country_of, names, seen, totals);
+            mark_all(batch, seen, totals);
+        }
     }
-    for (last = n; n < last + 2 * LAG; ++n) advance();
 }
 
 // 15-bit code of a three-letter country; numeric order is alphabetical order.
@@ -391,7 +412,7 @@ int main() {
     // the last line holds the largest id.
     const char* last = static_cast<const char*>(memrchr(regions, '\n', rsize - 1)) + 1;
     const size_t nregions = atoll(last) + 1;
-    u8* country_of = zeroed<u8>(nregions);  // 0 = no such region
+    u8* country_of = zeroed<u8>(nregions + 1);  // 0 = no such region
     std::vector<size_t> rcut = split(regions, strchr(regions, '\n') - regions + 1, rsize, nthreads, "\n");
     std::vector<std::atomic<u8>> present(1 << 15);
     std::array<u8, 1 << 15> index_of{};
