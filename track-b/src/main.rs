@@ -62,13 +62,16 @@ fn number(text: &[u8], i: usize) -> u32 {
 }
 
 unsafe fn hash(p: *const u8, len: usize) -> u64 {
-    static KEEP: [u128; 4] = [!0, !0, 0, 0];
-    let mask = _mm256_loadu_si256(KEEP.as_ptr().cast::<u8>().add(32 - len).cast());
-    let v = _mm256_or_si256(_mm256_loadu_si256(p.cast()), _mm256_set1_epi8(0x20));
-    let w: [u64; 4] = std::mem::transmute(_mm256_and_si256(v, mask));
-    let a = (w[0] ^ w[2].rotate_left(23)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let b = (w[1] ^ w[3].rotate_left(23)).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-    let h = a ^ b.rotate_left(29);
+    let load = |i| p.add(i).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020;
+    let (b, w0) = (len as u32 * 8, _bzhi_u64(load(0), len as u32 * 8));
+    let w1 = if len > 8 { _bzhi_u64(load(8), b - 64) } else { 0 };
+    let mut h = (w0 ^ len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ w1.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    if len > 16 {
+        let w2 = _bzhi_u64(load(16), b - 128);
+        let w3 = if len > 24 { _bzhi_u64(load(24), b - 192) } else { 0 };
+        h ^= w2.wrapping_mul(0x1656_67B1_9E37_79F9) ^ w3.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    }
     (h ^ h >> 31).wrapping_mul(0xD6E8_FEB8_6659_FD93)
 }
 
@@ -141,9 +144,9 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
         let mut m = word & ((1u128 << stop) - 1) as u64;
         let mut next = 64;
         while m != 0 {
-            let s = m.trailing_zeros();
-            let mut len = (!(m >> s)).trailing_zeros();
-            if s + len == 64 && nl == 0 {
+            let (s, e) = (m.trailing_zeros(), m.wrapping_add(m & m.wrapping_neg()));
+            let mut len = e.trailing_zeros() - s;
+            if e == 0 && nl == 0 {
                 if s != 0 {
                     next = s;
                     break;
@@ -153,7 +156,7 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
                 }
                 len = next;
             }
-            m &= m.wrapping_add(m & m.wrapping_neg());
+            m &= e;
             let h = if len <= 32 { hash(p.add(s as usize), len as usize) } else { 0 };
             _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h as usize & mask).cast());
             if n >= LAG {
@@ -468,7 +471,7 @@ fn main() {
                     *anchors.get_unchecked_mut(na) = at;
                     na += (i.wrapping_sub(a0) < nkeep - a0) as usize;
                     let new = std::mem::replace(last.get_unchecked_mut(i), mark) != mark;
-                    *pending.get_unchecked_mut(i.min(nbits)) |= (i < nbits) as u64 * bit;
+                    *pending.get_unchecked_mut(i.min(nbits)) |= bit;
                     *kept.get_unchecked_mut(n) = i as u32;
                     n += (new & (i.wrapping_sub(nbits) < lists - nbits)) as usize;
                 }
