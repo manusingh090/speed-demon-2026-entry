@@ -20,6 +20,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 13 | No prefetch (step 11's parse); an output left by an earlier run is deleted by one thread while the others parse, and the file is created once its size is known | run-4746252bf871 | 0.0263 s | 18.1 MiB | 82.16 |
 | 14 | Step 13's output handling undone; each piece's line-aligned ends found by the thread that claims it instead of all 96 by `main` before the threads start | run-04a166e09845 | 0.0264 s | 18.5 MiB | 82.01 |
 | 15 | Back to step 11's code | pending | | | |
+| 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | pending | | | |
 
 ## Local measurements
 
@@ -75,6 +76,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 13 on the board, and step 14.** run-4746252bf871: 0.0263 s, inside step 11's usual 0.0257 to 0.027 s, so each timed run evidently starts with an empty `/out` and the old file's truncation never happens there; the change goes again. The rest of the 2.4 ms before the threads start was `main` finding the 96 piece boundaries, each a first touch of a new page of the log (0.5 to 1.8 ms on the laptop). A boundary is just the first line start at or after k/96 of the log, so the thread that claims piece k finds both its ends with `memchr`, and adjacent pieces agree without coordinating. Setup now 0.1 ms; `cmp.ps1` (21 runs each, fresh containers) median 22 against 24 ms, best 18 against 20 ms, 19 MB both. Same hash on all six datasets. 324 formatted lines against 322.
 
 **Step 14 on the board, and step 15.** run-04a166e09845: 0.0264 s, again inside step 11's range. On the box a first touch of a page of the log is cheap (no virtual machine's nested page tables), so `main`'s 96 boundary searches cost little there; the 2 ms seen on the laptop was the laptop's. Step 15 is step 11's code, two lines shorter for the same time. What the box rewards on this track is the user-mode work of the parse and the hour phase.
+
+**Steps 16 and 17: measuring the phases on the box.** The laptop's split of the time has misled more than once (its virtual machine makes page faults and the address-space lock dearer than the box's bare metal), so the box itself is asked: a build that does one phase twice, keeping one result, produces the same output, and its extra time is that phase's cost there. Step 16 doubles the hour phase (on the laptop +222M user instructions, +95M cycles); step 17 will double the parse.
 
 ## Tried and kept out
 
