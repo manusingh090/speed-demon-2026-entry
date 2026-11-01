@@ -14,7 +14,9 @@
 //!    cuts the road network into compact blobs of 512 nodes grown by BFS, and
 //!    the graph is copied into that numbering, then reversed.
 //! 4. Bidirectional Dijkstra per query, with 4-ary heaps and distances kept in
-//!    pages handed out on first touch. A target with no in-edge is -1 at once.
+//!    pages handed out on first touch, as u32 unless the answer may not fit.
+//!    A target with no in-edge is -1 at once. The graph's pages are handed
+//!    back on every thread at the end, so the exit has little left to free.
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
@@ -25,6 +27,8 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 
 const INF: u64 = u64::MAX;
@@ -62,6 +66,21 @@ fn map(path: &str) -> &'static [u8] {
         assert!(p as isize != -1 && ok, "mmap {path}");
         std::slice::from_raw_parts(p as *const u8, len)
     }
+}
+
+/// Hands the whole pages inside bufs back to the kernel, each thread a share
+/// of them. MADV_DONTNEED only takes the address-space lock for reading, so
+/// the threads free pages in parallel, where a free or the exit would do it
+/// on one thread. The buffers must not be read afterwards, only dropped.
+fn release(nt: usize, bufs: &[&[u32]]) {
+    on_threads(nt, |t| {
+        for b in bufs {
+            let lo = (b.as_ptr() as usize).next_multiple_of(4096);
+            let hi = (b.as_ptr() as usize + b.len() * 4) & !4095;
+            let r = share(hi.saturating_sub(lo) / 4096, t, nt);
+            unsafe { madvise((lo + r.start * 4096) as *mut c_void, r.len() * 4096, 4) };
+        }
+    });
 }
 
 /// The number at text[*i..], leaving *i past the one byte that ends it.
@@ -141,13 +160,26 @@ fn share(n: usize, t: usize, nt: usize) -> std::ops::Range<usize> {
     n * t / nt..n * (t + 1) / nt
 }
 
+/// A distance as a search stores it. Searches keep u32, which halves the
+/// memory they touch, and a query whose answer may not fit is run again
+/// with u64.
+trait Len: Copy + Ord + Default + From<u32> + Into<u64> + TryFrom<u64> {
+    const MAX: Self; // marks a node not reached
+}
+impl Len for u32 {
+    const MAX: Self = u32::MAX;
+}
+impl Len for u64 {
+    const MAX: Self = u64::MAX;
+}
+
 /// A 4-ary min-heap of (key, node): it only ever holds the live frontier, so
 /// it stays small, and four children share one cache line.
 #[derive(Default)]
-struct Heap(Vec<(u64, u32)>);
+struct Heap<T>(Vec<(T, u32)>);
 
-impl Heap {
-    fn push(&mut self, k: u64, u: u32) {
+impl<T: Len> Heap<T> {
+    fn push(&mut self, k: T, u: u32) {
         let h = &mut self.0;
         let mut i = h.len();
         h.push((k, u));
@@ -159,7 +191,7 @@ impl Heap {
     }
     /// The smallest entry (the heap must not be empty). The last entry sifts
     /// down from the root, unchecked: every index read is below n.
-    fn pop(&mut self) -> (u64, u32) {
+    fn pop(&mut self) -> (T, u32) {
         let x = self.0.pop().unwrap();
         let Some(&top) = self.0.first() else { return x };
         let (h, n, mut i) = (self.0.as_mut_ptr(), self.0.len(), 0);
@@ -180,13 +212,13 @@ impl Heap {
 
 /// Tentative distances in pages of 512, handed out on first touch and taken
 /// back after each query, so a thread's memory follows its largest search.
-struct Dist {
+struct Dist<T> {
     tab: Vec<u16>,
     used: Vec<u32>,
-    pool: Vec<u64>,
+    pool: Vec<T>,
 }
 
-impl Dist {
+impl<T: Len> Dist<T> {
     fn new(n: usize) -> Self {
         Dist { tab: vec![0; n / PAGE + 1], used: Vec::new(), pool: Vec::new() }
     }
@@ -194,17 +226,20 @@ impl Dist {
     fn get(&self, v: u32) -> u64 {
         match unsafe { *self.tab.get_unchecked(v as usize / PAGE) } as usize {
             0 => INF,
-            pg => unsafe { *self.pool.get_unchecked((pg - 1) * PAGE + v as usize % PAGE) },
+            pg => match unsafe { *self.pool.get_unchecked((pg - 1) * PAGE + v as usize % PAGE) } {
+                d if d == T::MAX => INF,
+                d => d.into(),
+            },
         }
     }
-    fn at(&mut self, v: u32) -> &mut u64 {
+    fn at(&mut self, v: u32) -> &mut T {
         let i = v as usize / PAGE;
         if unsafe { *self.tab.get_unchecked(i) } == 0 {
             self.used.push(i as u32);
             self.tab[i] = self.used.len() as u16;
             let s = (self.used.len() - 1) * PAGE;
-            self.pool.resize(self.pool.len().max(s + PAGE), INF);
-            self.pool[s..s + PAGE].fill(INF);
+            self.pool.resize(self.pool.len().max(s + PAGE), T::MAX);
+            self.pool[s..s + PAGE].fill(T::MAX);
         }
         let k = (self.tab[i] as usize - 1) * PAGE + v as usize % PAGE;
         unsafe { self.pool.get_unchecked_mut(k) }
@@ -213,6 +248,86 @@ impl Dist {
         self.used.iter().for_each(|&i| self.tab[i as usize] = 0);
         self.used.clear();
     }
+}
+
+/// One direction's graph: offsets, packed edge words, heavy weights, and the
+/// bits an edge word gives the head.
+type Graph<'a> = (&'a [u32], &'a [u32], &'a [(u32, u32)], u32);
+
+/// One side of a search, with distances stored as T.
+struct Side<T> {
+    dist: Dist<T>,
+    queue: Heap<T>,
+}
+
+impl<T: Len> Side<T> {
+    fn new(n: usize) -> Self {
+        Side { dist: Dist::new(n), queue: Heap::default() }
+    }
+
+    /// Settles the next queued node and relaxes its edges; returns the best
+    /// length of a path through a node the other side has reached. A length
+    /// that does not fit T is dropped and *over set.
+    fn settle(&mut self, g: Graph, other: &Dist<T>, mut best: u64, over: &mut bool) -> u64 {
+        let (off, adj, heavy, hb) = g;
+        let (hmask, big) = ((1 << hb) - 1, u32::MAX >> hb);
+        let (d, u) = self.queue.pop();
+        let d: u64 = d.into();
+        if d > self.dist.get(u) {
+            return best;
+        }
+        let lo = unsafe { *off.get_unchecked(u as usize) };
+        let hi = unsafe { *off.get_unchecked(u as usize + 1) };
+        for e in lo..hi {
+            let x = unsafe { *adj.get_unchecked(e as usize) };
+            let (v, w) = (x & hmask, x >> hb);
+            let w = if w == big { heavy_weight(heavy, e) } else { w };
+            let nd = d + w as u64;
+            if nd < best {
+                let Some(nt) = T::try_from(nd).ok().filter(|&x| x != T::MAX) else {
+                    *over = true;
+                    continue;
+                };
+                let slot = self.dist.at(v);
+                if nt < *slot {
+                    *slot = nt;
+                    self.queue.push(nt, v);
+                    prefetch(off.as_ptr().wrapping_add(v as usize));
+                    best = best.min(nd.saturating_add(other.get(v)));
+                }
+            }
+        }
+        best
+    }
+}
+
+/// Bidirectional Dijkstra from s to t over g (forward, reverse): grow the
+/// side with the smaller queue, record the best length where the sides meet,
+/// and stop once the two smallest queued keys add up to at least that. A side
+/// that runs dry has reached every node it can, so the best meeting seen is
+/// the answer. Also says whether a length too large for T was dropped; the
+/// answer is exact all the same if it is below T::MAX.
+fn search<T: Len>(side: &mut [Side<T>; 2], g: [Graph; 2], s: u32, t: u32) -> (u64, bool) {
+    let (mut best, mut over) = (INF, false);
+    for (x, v) in side.iter_mut().zip([s, t]) {
+        *x.dist.at(v) = 0.into();
+        x.queue.push(0.into(), v);
+    }
+    while let (Some(a), Some(b)) = (side[0].queue.0.first(), side[1].queue.0.first()) {
+        if a.0.into() + b.0.into() >= best {
+            break;
+        }
+        let [f, r] = &mut *side;
+        best = match r.queue.0.len() < f.queue.0.len() {
+            true => r.settle(g[1], &f.dist, best, &mut over),
+            false => f.settle(g[0], &r.dist, best, &mut over),
+        };
+    }
+    for x in side.iter_mut() {
+        x.queue.0.clear();
+        x.dist.reset();
+    }
+    (best, over)
 }
 
 /// One thread's parse output. A record (the tail's offset in its part, the
@@ -489,18 +604,17 @@ fn main() {
     // 4. Queries sorted so neighbouring searches share cached pages.
     let mut order: Vec<usize> = (0..ends.len()).collect();
     order.sort_unstable_by_key(|&q| ends[q]);
-    // Each direction: offsets, packed edge words, heavy weights.
-    let sides = [(&off[..], &adj[..], &heavy2[..]), (&roff[..], &radj[..], &rheavy[..])];
+    let graphs = [(&off[..], &adj[..], &heavy2[..], hb), (&roff[..], &radj[..], &rheavy[..], hb)];
     let mut ans = vec![INF; ends.len()];
     let ansr = Raw::of(&mut ans);
     let next = AtomicUsize::new(0);
-    // Bidirectional Dijkstra: grow the side with the smaller queue, record the
-    // best length where the sides meet, and stop once the two smallest queued
-    // keys add up to at least that. A side that runs dry has reached every node
-    // it can, so the best meeting seen is the answer.
-    on_threads(nt, |_| {
-        let mut dist = [Dist::new(n), Dist::new(n)];
-        let mut queue = [Heap::default(), Heap::default()];
+    on_threads(nt, |t| {
+        if t == 0 {
+            // graph.txt is read no more, and no other thread faults pages in now.
+            unsafe { munmap(text.as_ptr() as *mut c_void, text.len() + 4096) };
+        }
+        let mut narrow: [Side<u32>; 2] = [Side::new(n), Side::new(n)];
+        let mut wide: [Side<u64>; 2] = [Side::new(n), Side::new(n)];
         loop {
             let q = next.fetch_add(1, Relaxed);
             let Some(&i) = order.get(q) else { return };
@@ -512,46 +626,15 @@ fn main() {
             if roff[t as usize + 1] == roff[t as usize] {
                 continue; // no in-edge: unreachable
             }
-            let mut best = INF;
-            *dist[0].at(s) = 0;
-            queue[0].push(0, s);
-            *dist[1].at(t) = 0;
-            queue[1].push(0, t);
-            while let (Some(a), Some(b)) = (queue[0].0.first(), queue[1].0.first()) {
-                if a.0 + b.0 >= best {
-                    break;
-                }
-                let k = (queue[1].0.len() < queue[0].0.len()) as usize;
-                let (go, ga, gh) = sides[k];
-                let (a, b) = dist.split_at_mut(1);
-                let (mine, other) = if k == 0 { (a, b) } else { (b, a) };
-                let (d, u) = queue[k].pop();
-                if d > mine[0].get(u) {
-                    continue;
-                }
-                let lo = unsafe { *go.get_unchecked(u as usize) };
-                let hi = unsafe { *go.get_unchecked(u as usize + 1) };
-                for e in lo..hi {
-                    let x = unsafe { *ga.get_unchecked(e as usize) };
-                    let (v, w) = (x & hmask, x >> hb);
-                    let w = if w == big { heavy_weight(gh, e) } else { w };
-                    let nd = d + w as u64;
-                    if nd < best {
-                        let slot = mine[0].at(v);
-                        if nd < *slot {
-                            *slot = nd;
-                            queue[k].push(nd, v);
-                            prefetch(go.as_ptr().wrapping_add(v as usize));
-                            best = best.min(nd.saturating_add(other[0].get(v)));
-                        }
-                    }
-                }
+            let mut best = search(&mut narrow, graphs, s, t);
+            if best.1 && best.0 >= u32::MAX as u64 {
+                best = search(&mut wide, graphs, s, t); // the answer may not fit u32
             }
-            unsafe { *ansr.at(i) = best };
-            queue.iter_mut().for_each(|q| q.0.clear());
-            dist.iter_mut().for_each(Dist::reset);
+            unsafe { *ansr.at(i) = best.0 };
         }
     });
+    // Free the graph on every thread at once rather than at exit on one.
+    release(nt, &[off, adj, &roff, &radj]);
 
     // INF prints as -1 (u64::MAX as i64); every real distance is below 2^63.
     let out: String = ans.iter().map(|&a| format!("{}\n", a as i64)).collect();

@@ -36,7 +36,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 14 | 4-ary heaps instead of radix heaps; every node may seed a blob, so no serial pass for unreached nodes; the old graph freed on a side thread | run-71cc7da0e392 | 0.196 | 67 | 67.45 |
 | 15 | One pool of threads for every phase; parse output in 6-byte records, filed in chunks from one arena per thread; parts of 16,384 nodes | run-92e934101917 | 0.172 | 67 | 68.58 |
 | 16 | Each thread unmaps (`MADV_DONTNEED`) the part of graph.txt it parsed as soon as it is done, instead of the whole 92 MB being torn down at exit by one thread | run-beecc52de687 | 0.190 s | 66.7 MiB | 67.47 |
-| 17 | Back to step 15's code | pending | | | |
+| 17 | Back to step 15's code | run-6891f144a066 | 0.182 s | 66.5 MiB | 68.04 |
+| 18 | Distances stored as u32 (u64 rerun when the answer may not fit); graph pages released on all threads after the searches; graph.txt unmapped during them | pending | | | |
 
 ## What the profile said, step by step
 
@@ -87,6 +88,16 @@ Also measured and kept out at this step: dense per-thread distance arrays (no fa
 **Step 15 to 16.** Found on Track A by measuring its phases on the box: much of the time outside its two phases was the process exit tearing down the mapping of its 239 MB input on one thread, and unmapping each piece as its thread finished took that track from 0.026 to 0.0215 s (run-1bfda4424f2e). graph.txt is 92 MB, about 23,000 page table entries, so each parse thread now unmaps its range when it is done with it. Same hash on all seven datasets, three runs each.
 
 **Step 16 on the board, and step 17.** run-beecc52de687: 0.190 s against 0.167 to 0.172 s, slower. Here the parse threads all finish together and the unmapping lands while the next phase's threads fault their own new pages in, so it competes with them rather than with an idle exit; the 92 MB mapping's teardown at exit is the cheaper place for it. Step 17 is step 15's code again.
+
+**Step 17 on the board.** run-6891f144a066 (commit 19872d7, Track D unchanged since step 15): 0.182 s, 66.5 MiB, 68.04 points. With run-92e934101917 (0.172 s) and run-6779065e4aee (0.168 s), the same code spans 0.168 to 0.190 s on the box.
+
+**Step 17 to 18.** Timers around `main` showed the process spending 10 to 17 ms after `main` returned, almost as long as the parse: the exit tore down the 92 MB graph.txt mapping (about 5 ms on one thread, measured by unmapping it on a side thread) and the 54 MB graph, page by page on one thread. Unmapping graph.txt at the start of the search phase (no other thread faults pages in then) and handing the graph's pages back with `MADV_DONTNEED` on all twelve threads after the searches (the call takes the address-space lock only for reading, so the threads free in parallel; 2.4 ms) took the exit from about 13 ms to under 2 ms.
+
+The search was then profiled on one thread (an `SNT` switch in a scratch copy) to separate its own cost from contention: 128 ns per settled node alone against about 170 ns of CPU per node on twelve threads; per settled node about 640 instructions, 2.7 branch misses and 0.86 last-level cache misses. Halving what a search touches was the lever: distances are now stored as u32, so a 512-node page is 2 KB, and heap entries are 8 bytes. A length that does not fit u32 is dropped and noted. Dropping it cannot change an answer below 2^32 - 1, because every node on a shorter path has a smaller distance on both sides; if a query drops one and its answer comes out at 2^32 - 1 or more (or unreachable), it runs again with u64 distances, the same generic code. On seed 1 that is the handful of island, maximum-weight and no-in-node queries. Twelve-thread search 105 to 91 ms (median of 8), single-thread 775 to 690 ms; peak 67 to 64 MB. The search lives in a `Side` with a `settle` method rather than in one closure indexing both sides by k: written the second way the generic code ran 370 million more instructions and lost the gain.
+
+Measured and dropped on the way: growing the side with the smaller top key instead of the smaller queue doubles the settled nodes (14.3 million against 7.1 million); balancing by settled count changes nothing (7.16 million); a branch-free 4-ary heap of packed 64-bit keys was 15% slower single-threaded (the selects serialise each level, where the branchy version speculates through it); a `Side` method alone, without the u32 change, made no difference.
+
+Four interleaved `perf stat -r 5` rounds: 0.167 to 0.170 s against 0.197 to 0.229 s for step 17, 300 ms less CPU; 21 alternating container runs: median 213 against 220 ms, best 152 against 168 ms (other sessions were building on the laptop). 569 rustfmt lines against 508. Same hash on full, sample, tiny, the worked example, seeds 7, 9 and 13 at sample scale and seeds 2, 3, 4, 5 and 21 at tiny scale (the tiny ones checked against the reference).
 
 ## Tried and kept out
 
