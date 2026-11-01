@@ -355,6 +355,10 @@ int main() {
     pool.emplace_back([&, t] {
       parsers[t].map(size);
       for (int k; (k = claim_piece++) < pieces;) {
+        // The piece's pages mapped in one call instead of a fault per 64 KB.
+        uintptr_t lo = uintptr_t(log + cut[k]) & ~uintptr_t(4095);
+        madvise((void *)lo, uintptr_t(log + cut[k + 1]) - lo,
+                MADV_POPULATE_READ);
         parsers[t].run(log + cut[k], log + cut[k + 1]);
         uintptr_t a = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095),
                   b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
@@ -422,6 +426,10 @@ int main() {
         snprintf(label, 32, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
                  day < 2 ? 30 + day : day - 1, (h + 18) % 24);
         char *o = text + at[h];
+        // The hour's output pages allocated in one call, not one fault each.
+        uintptr_t lo = uintptr_t(o) & ~uintptr_t(4095);
+        madvise((void *)lo, uintptr_t(text + at[h + 1]) - lo,
+                MADV_POPULATE_WRITE);
         for (const Line &l : lines[h]) {
           o = std::copy_n(label, 21, o);
           o = std::copy(names[l.e].begin(), names[l.e].end(), o);
