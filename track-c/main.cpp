@@ -249,7 +249,7 @@ struct NamesSeen {
 // three random reads (region table, name table, bitsets) has a steady lead.
 void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
                    size_t regions, NameTable& names, NamesSeen& seen, Totals* totals) {
-    constexpr u64 LAG = 32;
+    constexpr u64 LAG = 16;
     struct Pending {
         u64 name;
         u32 region, id, name_bytes, note_bytes;
@@ -386,11 +386,11 @@ int main() {
         if (codes.size() > 255) { fputs("too many countries\n", stderr); _exit(1); }
     };
 
-    // records.csv: skip the BOM and header, then split after CRLFs into four
+    // records.csv: skip the BOM and header, then split after CRLFs into eight
     // pieces per thread, claimed in turn, so a thread whose pieces are slow
     // (more first sightings of names) is evened out by the others.
     size_t start = size ? static_cast<const char*>(memchr(records, '\n', size)) - records + 1 : 0;
-    const int pieces = 4 * nthreads;
+    const int pieces = 8 * nthreads;
     std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
     std::vector<std::array<Totals, 256>> totals(nthreads);
     NameTable names;
