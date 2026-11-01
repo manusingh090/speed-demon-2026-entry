@@ -61,7 +61,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 54 | The tokenizer prefetches the corpus 2 KB ahead of each 64-byte window | run-ba21b3893a3a | 0.172 | 45.3 | 73.33 |
 | 55 | The tokenizer looks a token up 16 tokens after prefetching its slot instead of 8 | run-4620f81ed553 | 0.174 | 45.6 | 73.19 |
 | 56 | Back to step 54's code | pending | | | |
-| 57 | A tighter rewrite of step 54: 64-bit hash folded from two products, the sample's marks in 16 bits, phases on one barrier-gated pool, the process ends with `_exit` (no destructors) | pending | | | |
+| 57 | A tighter rewrite of step 54: 64-bit hash folded from two products, the sample's marks in 16 bits, phases on one barrier-gated pool, the process ends with `_exit` (no destructors) | run-ae1b4119d492 | 0.168 | 43.8 | 73.95 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -245,7 +245,7 @@ Measured and kept out this session:
 
 **Step 54 on the board, and after.** run-ba21b3893a3a: 0.172 s, 45.3 MiB, the best Track B run so far at 73.33. An instruction profile of the tokenizer then put 39% of its samples on the instruction after the prefetch into the slot table: the prefetches queue for the core's miss buffers. Two fixes for those misses were measured and kept out. Half the slot table (1 MB, more probes) cost 2.5% more instructions for no fewer cycles. A 128 KB filter (a bit per term at 20 hash bits) that sends a token which is surely no term to a spare empty slot in cache, chosen without a branch, cost 10% more instructions and 3 to 7% more cycles in three interleaved rounds: the misses are not mostly the two tokens in five that are no term. The token hash built from two scalar words read straight from the text (OR 0x20, then `bzhi` to the token's length) instead of a 32-byte vector key split into words: the same 6.57G instructions and cycles within noise, so the compiler had already made the vector path as cheap.
 
-**Step 57.** A tighter rewrite of step 54. As first written its pool workers called the job while still holding the job's mutex (a temporary guard lives to the end of its statement), so the eleven workers ran one after another: correct output in 985 ms. Taking the job out of the lock first fixes it. Laptop: 6.26G user instructions against 6.57G, 2 to 6% fewer cycles in three interleaved rounds, `cmp.ps1` (11 runs) median 170 against 163 ms and best 148 against 146 ms, within noise, 44 against 45 MB at peak, 553 non-blank lines against 580 before rustfmt. Same hash on all six datasets, 15 repeated full runs gave one hash.
+**Step 57.** A tighter rewrite of step 54. As first written its pool workers called the job while still holding the job's mutex (a temporary guard lives to the end of its statement), so the eleven workers ran one after another: correct output in 985 ms. Taking the job out of the lock first fixes it. Laptop: 6.26G user instructions against 6.57G, 2 to 6% fewer cycles in three interleaved rounds, `cmp.ps1` (11 runs) median 170 against 163 ms and best 148 against 146 ms, within noise, 44 against 45 MB at peak, 553 non-blank lines against 580 before rustfmt. Same hash on all six datasets, 15 repeated full runs gave one hash. On the board (run-ae1b4119d492): 0.1677 s against 0.1721 s, 43.8 MiB, 577 counted lines against 612, the best Track B run so far at 73.95.
 
 ## What the profile said, step by step
 
