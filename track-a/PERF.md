@@ -50,7 +50,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | Back to step 40's code | pending | | | |
 | 44 | Each hour's records in one region filled by every thread in 4 KB blocks and handed back with one call once copied into the sort scratch; hours' lines in one mapping handed back hour by hour; hours claimed smallest first | run-545cc82ae638 | 0.0229 s | 17.7 MiB | 83.60 |
 | 44b | Step 44's code again in later runs (best) | run-a5cbcba2db02 | 0.0203 s | 18.1 MiB | 84.84 |
-| 45 | New program: hours closed while the log is parsed, text written as soon as earlier hours are sized, redo with every hour open if any line is too late | pending | | | |
+| 45 | New program: hours closed while the log is parsed, text written as soon as earlier hours are sized, redo with every hour open if any line is too late | run-768708337db7 | 0.0220 s | 18.5 MiB | 83.48 |
+| 46 | Back to step 44's code | pending | | | |
 
 ## Local measurements
 
@@ -170,6 +171,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 44's best run.** Later pushes for other tracks ran step 44's code again: run-a5cbcba2db02 (commit ad04ba8) took **0.0203 s at 18.1 MiB, 344 lines, 84.84 points**, the best Track A run so far (the previous best was step 25's run-38c8b98f7941, 0.0209 s and 84.75), and run-35b66d0323a7 (commit f0ac06e) reached 17.5 MiB, the lowest memory so far.
 
 **Step 45: a new program, hours closed while the log is parsed.** A literature pass (about 45 sources: Leis et al. on morsel-driven parallelism, Müller et al. "Cache-Efficient Aggregation: Hashing Is Sorting", the 1BRC write-ups, Polychroniou et al. on vertical SIMD, djbsort and vqsort, the memcg charge-batch patches) pointed at one architecture change the earlier steps had not tried on the box: never holding the whole log's records. The pieces are claimed in order; each piece's first line gives its hour, and an hour is closed as soon as every piece starting less than two hours after it is parsed (the log is in about clock order; the full log has 1,054 hour changes, 491 of them backwards, all within minutes). The closing thread counting-sorts the hour's records while they are still in cache, hands the hour's region back, selects the percentiles and sizes the text; the output file is mapped up front at a size it cannot reach (a group's line is under three times its log line) and cut to size at the end, so each hour's text is written as soon as every earlier hour is sized. Names are ranked when an hour closes, again only when a name was added. Correctness does not depend on the order: a line found in a piece that starts two hours or more after its hour is not stored, and the run is redone with every hour held open to the end. Same hash on all six datasets and on two hand-made logs that force that path (the sample with its first 1,000 lines moved to the end, and the sample shuffled). On the laptop it loses: 38.9 ms and 19.1 MB against 30.2 ms and 18.1 MB for step 44, because a descheduled thread there holds the parsed prefix back for 20 to 40 ms and the open hours' records pile up (the same effect the streaming attempts after step 11 met). The box gives every thread a core of its own, so this is a box measurement. 384 counted lines against 337.
+
+**Step 45 on the board, and step 46.** run-768708337db7: 0.0220 s, 18.5 MiB, 391 lines, 83.48 points, in a normal run (Track C's unchanged code at its usual 0.0284 s). The box agreed with the laptop: memory did not fall, since the closing of each hour still waits for the earliest pieces and the output's pages fill while the open hours' records are held, and the extra 47 lines cost on top. Step 46 is step 44's code again.
 
 ## Tried and kept out
 
