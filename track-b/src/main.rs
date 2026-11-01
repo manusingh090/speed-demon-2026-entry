@@ -96,7 +96,7 @@ impl Terms {
                 let m = _mm256_movemask_pd(_mm256_castsi256_pd(found)) as usize;
                 if m != 0 {
                     let s = *self.slot.get_unchecked(i + m.trailing_zeros() as usize);
-                    return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32);
+                    return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32 + (i as u32 & 60));
                 }
                 i = (i + 4) & mask;
             }
@@ -138,17 +138,13 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 
 // The ids of the document at p, appended to ids after LAG throwaway ones.
 const LAG: usize = 8;
-unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
+unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>) -> *const u8 {
     let mut ring = [0u64; LAG];
     let (mut n, mut out, mask) = (0usize, ids.len(), t.slot.len() - 1);
     loop {
-        (ids.set_len(out), ids.reserve(32 + LAG));
+        (ids.set_len(out), ids.reserve(32 + 2 * LAG));
         let buf = ids.as_mut_ptr();
-        let mut look = |&h: &u64| {
-            let id = t.find(h);
-            _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast());
-            (*buf.add(out), out) = (id, out + 1);
-        };
+        let mut look = |&h: &u64| (*buf.add(out), out) = (t.find(h), out + 1);
         _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(2048).cast());
         let (word, nl) = classes(p);
         let stop = nl.trailing_zeros();
@@ -175,6 +171,7 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
         }
         if nl != 0 {
             (n..n + LAG).for_each(|i| look(&ring[i % LAG]));
+            std::ptr::write_bytes(buf.add(out), 0, LAG);
             ids.set_len(out);
             return p.add(stop as usize + 1);
         }
@@ -318,7 +315,7 @@ fn line(out: &mut String, docs: &Docs) {
     out.push('\n');
 }
 
-fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32, &[u32])) -> u32 {
+fn walk(s: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, &[u32])) -> u32 {
     let (mut p, end) = (s.as_ptr(), s.as_ptr_range().end);
     let (mut doc, mut ids) = (first, Vec::with_capacity(1 << 12));
     while p < end {
@@ -327,7 +324,7 @@ fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32,
                 p = p.add(1);
             }
             ids.clear();
-            p = tokens(p, t, &mut ids, pre);
+            p = tokens(p, t, &mut ids);
         }
         (f(doc, &ids[LAG..]), doc += 1);
     }
@@ -375,7 +372,6 @@ impl Units {
 }
 
 fn main() {
-    let t0 = std::time::Instant::now();
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
@@ -392,7 +388,7 @@ fn main() {
         std::slice::from_raw_parts_mut(p.cast(), n)
     };
     let mut terms = Terms { slot, n: 0 };
-    let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
+    let (mut spans, mut ids, mut ops) = (Vec::with_capacity(64 << 10), Vec::with_capacity(192 << 10), Vec::with_capacity(192 << 10));
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
         let (phrase, from) = (q[0] == b'P', ids.len() as u32);
         let start = if phrase { 8 } else { 5 };
@@ -435,9 +431,9 @@ fn main() {
             ids[from as usize..to as usize].iter().for_each(|&id| in_bool[id as usize] = true);
         }
         let samples = on_threads(|t| {
-            let (mut df, mut last) = (vec![0u32; nterms + 1], vec![0u16; nterms + 1]);
+            let (mut df, mut last) = (vec![0u32; nterms + 64], vec![0u16; nterms + 64]);
             let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 64];
-            let n = walk(sample, 0, &terms, last.as_ptr(), |doc, toks| {
+            let n = walk(sample, 0, &terms, |doc, toks| {
                 let mark = (doc + 1) as u16;
                 for &id in toks {
                     if std::mem::replace(&mut last[id as usize], mark) != mark {
@@ -448,16 +444,16 @@ fn main() {
             (n as usize, df)
         });
         let sampled: usize = samples.iter().map(|s| s.0).sum();
-        let mut df = vec![0u32; nterms + 1];
+        let mut df = vec![0u32; nterms + 64];
         for (_, d) in samples {
             df.iter_mut().zip(d).for_each(|(a, b)| *a += b);
         }
-        let (mut anchored, mut anchor) = (vec![], vec![false; nterms]);
+        let (mut raw_anc, mut anchor) = (Vec::with_capacity(spans.len() / 2), vec![false; nterms]);
         for (q, &(_, from, to)) in spans.iter().enumerate().filter(|s| s.1 .0) {
             let rarity = |&j: &u32| df[ids[j as usize] as usize];
             let j = (from..to).min_by_key(rarity).unwrap();
             let a = ids[j as usize];
-            (anchored.push((a, q as u32, j - from)), anchor[a as usize] = true);
+            (raw_anc.push((a, q as u32, (j - from) as u16)), anchor[a as usize] = true);
         }
         let class = |i: usize| match (in_bool[i], anchor[i]) {
             (true, false) => (df[i] as usize * 32 <= sampled) as usize,
@@ -476,70 +472,79 @@ fn main() {
         }
         terms.renumber(&new);
         ids.iter_mut().for_each(|id| *id = new[*id as usize]);
-        anchored.iter_mut().for_each(|a| a.0 = new[a.0 as usize]);
+        let mut anchored: Vec<_> = raw_anc
+            .into_iter()
+            .map(|(a, q, j)| {
+                let (_, from, to) = spans[q as usize];
+                let e = if j == 0 { (to - from - 1) as u16 } else { 0 };
+                (new[a as usize], ids[(from + e as u32) as usize], q, j, e)
+            })
+            .collect();
         anchored.sort_unstable();
         let first_of = |i: usize| anchored.partition_point(|a| (a.0 as usize) < i);
         let astart: Vec<usize> = (a0..=nkeep).map(first_of).collect();
         (nbits, a0, lists, nkeep, anchored, astart)
     };
 
-    let before_scan = t0.elapsed();
     let words = ndocs.div_ceil(256) * 4;
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
     let found = Mutex::new(vec![]);
     let scans = on_threads(|t| {
-        let (mut count, mut last) = (vec![0u16; nkeep + 1], vec![0u16; nkeep + 1]);
+        let (mut count, mut last) = (vec![0u16; lists], vec![0u16; nterms + 64]);
         let (mut mine, mut kept, mut anchors) = (vec![], vec![0; 1 << 12], vec![0; 1 << 12]);
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
         let first = firsts[t];
-        let (mut pending, mut block) = (vec![0u64; nbits + 1], first as usize / 64);
+        let (mut pending, mut block) = (vec![0u64; nbits], first as usize / 64);
         let flush = |pending: &mut [u64], w: usize| {
-            for (b, x) in pending[..nbits].iter_mut().enumerate() {
+            for (b, x) in pending.iter_mut().enumerate() {
                 if *x != 0 {
                     bits[b * words + w].fetch_or(std::mem::take(x), Relaxed);
                 }
             }
         };
-        let (share, pre) = (&text[cut[t]..cut[t + 1]], last.as_ptr());
-        walk(share, first, &terms, pre, |doc, toks| {
+        let share = &text[cut[t]..cut[t + 1]];
+        walk(share, first, &terms, |doc, toks| {
             if doc as usize / 64 != block {
                 let w = std::mem::replace(&mut block, doc as usize / 64);
                 flush(&mut pending, w);
             }
-            let (mark, bit) = ((doc - first + 1) as u16, 1u64 << (doc % 64));
-            let (nkeep, a0, nbits, lists, off) = (nkeep, a0, nbits, lists, doc - first);
-            let (last, pending) = (&mut last[..=nkeep], &mut pending[..=nbits]);
+            let (mark, bit, off) = ((doc - first + 1) as u16, 1u64 << (doc % 64), doc - first);
             kept.resize(kept.len().max(toks.len()), 0);
             anchors.resize(anchors.len().max(toks.len()), 0);
             let (mut n, mut na) = (0, 0);
             for (at, &id) in toks.iter().enumerate() {
-                let i = (id as usize).min(nkeep);
+                let i = id as usize;
                 unsafe {
+                    _mm_prefetch::<_MM_HINT_T0>(last.as_ptr().add(*toks.as_ptr().add(at + LAG) as usize).cast());
                     *anchors.get_unchecked_mut(na) = at;
                     na += (i.wrapping_sub(a0) < nkeep - a0) as usize;
                     let new = std::mem::replace(last.get_unchecked_mut(i), mark) != mark;
-                    *pending.get_unchecked_mut(i.min(nbits)) |= bit;
                     *kept.get_unchecked_mut(n) = i as u32;
-                    n += (new & (i.wrapping_sub(nbits) < lists - nbits)) as usize;
+                    n += (new & (i < lists)) as usize;
                 }
             }
             for &at in &anchors[..na] {
-                let k = (toks[at] as usize).min(nkeep) - a0;
-                for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
-                    let span = spans[q as usize];
-                    let phrase = &ids[span.1 as usize..span.2 as usize];
-                    // One term other than the anchor is compared first, so most
-                    // windows are turned down without the slice compare's call.
-                    let (s, e) = (at.wrapping_sub(j as usize), if j == 0 { phrase.len() - 1 } else { 0 });
-                    let near = toks.get(s.wrapping_add(e)) == phrase.get(e);
-                    if near && toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
-                        mine.push((q, doc));
+                let k = toks[at] as usize - a0;
+                for &(_, nei, q, j, e) in &anchored[astart[k]..astart[k + 1]] {
+                    let s = at.wrapping_sub(j as usize);
+                    // Endpoint token ID is inlined in anchored, rejecting >99.5% of
+                    // windows before touching spans[q] or ids[from..to].
+                    if toks.get(s.wrapping_add(e as usize)) == Some(&nei) {
+                        let (_, from, to) = spans[q as usize];
+                        let phrase = &ids[from as usize..to as usize];
+                        if toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
+                            mine.push((q, doc));
+                        }
                     }
                 }
             }
             for &i in &kept[..n] {
-                buckets[i as usize % BUCKETS].add(i / BUCKETS as u32, off);
-                count[i as usize] += 1;
+                if (i as usize) < nbits {
+                    unsafe { *pending.get_unchecked_mut(i as usize) |= bit };
+                } else {
+                    buckets[i as usize % BUCKETS].add(i / BUCKETS as u32, off);
+                    count[i as usize] += 1;
+                }
             }
         });
         flush(&mut pending, block);
@@ -636,8 +641,5 @@ fn main() {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
     std::io::Write::flush(&mut out).unwrap();
-    // Measurement only: wait twice as long as everything before the scan took.
-    let until = std::time::Instant::now() + before_scan * 2;
-    while std::time::Instant::now() < until {}
     unsafe { _exit(0) };
 }

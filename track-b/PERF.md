@@ -88,7 +88,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 81 | Measurement only: after the scan, wait as long as its threads ended apart | run-3ad72b5c123d | 0.144 | 45.0 | 75.13 |
 | 82 | Measurement only: before exiting, wait as long as everything before the scan took | run-13662d2445f0 | 0.201 | 44.1 | 71.59 |
 | 83 | Measurement only: before exiting, wait ten times as long as mapping the term table took | run-02ebeca44f3b | 0.143 | 44.7 | 75.24 |
-| 84 | Measurement only: before exiting, wait twice as long as everything before the scan took | pending | | | |
+| 84 | Measurement only: before exiting, wait twice as long as everything before the scan took | run-9c03805108ff | 0.177 | 44.9 | 72.88 |
+| 85 | Non-terms spread over 16 spare ids, `last` prefetched 8 tokens ahead in the callback, phrase windows checked on an end term kept in the anchor's entry, bitmap bits set once per document | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -335,6 +336,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 82 on the board, and step 83.** run-13662d2445f0: 0.2012 s against about 0.142 s, so everything before the scan takes 55 to 59 ms on the box (Track C's run of the same commit was 6% slow). On a warm laptop it takes 17 to 21 ms: splitting and hashing the queries 4.6 to 6.6, the inserts 1.9 to 3.0, the sample (with starting the threads) 5.4 to 13.7, then merging the samples, the anchors, packing, sorting, renumbering and remapping 5 to 7 ms on one thread. The box's slower clock accounts for perhaps 35 ms of it. One thing the box may do that the laptop does not: find a free 2 MB page for the term table (step 67) by compacting memory, which a box whose memory is full of page cache may need to; on the laptop mapping it takes 0.2 ms. Step 83 waits ten times as long as mapping the table took, so a cost of milliseconds there shows tenfold.
 
 **Step 83 on the board, and step 84.** run-02ebeca44f3b: 0.1431 s, no rise at all, so the huge page costs nothing to get. Step 82's 55 to 59 ms is three times the laptop's 17 to 21, more than the clocks explain, and came from one run in a slow minute; step 84 repeats it with the wait doubled, so the rise should be about 110 ms if it holds.
+
+**Step 84 on the board, and step 85.** run-9c03805108ff: 0.1774 s against about 0.142 s, so twice the time before the scan is about 35 ms and the time itself about 17 ms, near what the laptop shows; step 82's single run was the outlier. Step 85 is a version written by hand from step 80: tokens that are no term are given one of 16 spare ids past the last term (`n + (i & 60)`) instead of one, so their marks do not all land on one word; the callback prefetches `last` for the token 8 ahead (the ids are followed by 8 zeros); each phrase anchor's entry carries the term at the window's other end, compared before the phrase is read; and a bitmap term's bit is set once per document, in the loop over new terms, instead of for every occurrence. As first written its posting streams grew in 16 KB chunks, below the 64 KB at which malloc maps blocks of their own, so the freed stream memory stayed in malloc's heap and the peak was 66 MB; with 64 KB chunks it is 47 MB as before. On the laptop it runs 133M fewer instructions but twice the mispredictions (the bitmap-or-list branch per new term), and cycles within noise of step 80. Same hash on all six datasets, 5 repeated full runs gave one hash.
 
 ## What the profile said, step by step
 
