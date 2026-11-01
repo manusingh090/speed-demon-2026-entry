@@ -1,3 +1,27 @@
+// Speed Demon 2026, Track A (Ingest).
+//
+// One pool of threads does everything in three phases.
+//
+// Parse. The log is memory-mapped and cut into line-aligned pieces, eight per
+// thread, claimed in turn. The timestamp is always 27 bytes and the 72-hour
+// span is fixed, so a line's hour comes from its day and hour digits alone.
+// One 64-byte scan after the timestamp finds the endpoint's ends and the
+// line's end. Endpoints are interned in one lock-free table shared by all
+// threads, and each line files a 4-byte record (latency, endpoint id, 5xx
+// flag) under its hour. A thread unmaps each piece once parsed, so the exit
+// does not tear the whole mapping down on one thread.
+//
+// Between the phases the last thread to arrive sorts the names, so each
+// endpoint id gets its rank in output order.
+//
+// Hours. Threads claim hours. An hour's latencies are counting-sorted by
+// endpoint rank into per-thread scratch, and three selections per group give
+// the percentiles. Each group keeps its numbers along with the exact size its
+// line will take, since a number's width is known without formatting it.
+//
+// Text. The last thread into the second barrier turns the sizes into offsets
+// and maps the output file at its final size; then every thread formats its
+// hours straight into it.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -18,23 +42,31 @@
 
 using u32 = uint32_t;
 using u64 = uint64_t;
-constexpr int HOURS = 72;
+constexpr int HOURS = 72; // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
+// A record packs the latency above a 13-bit key: a 12-bit endpoint id and the
+// 5xx flag. Latencies of 2^19 us or more (about 3% of lines) do not fit and go
+// to a side list with their key instead.
 constexpr u32 KEY_BITS = 13, ERR = 1u << 12, ID_MASK = ERR - 1,
               PACKED_MAX = 1u << 19;
 
+// Bit i is set when byte i of the 32 at p equals c.
 inline u32 eq32(const char *p, char c) {
   __m256i v = _mm256_loadu_si256((const __m256i *)p);
   return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
 }
 
+// The number of decimal digits in x, from its bit length.
 inline u32 width(u32 x) {
-  static constexpr u32 p10[] = {1,         10,        100,       1000,
-                                10000,     100000,    1000000,   10000000,
+  static constexpr u32 p10[] = {1,         10,        100,     1000,
+                                10000,     100000,    1000000, 10000000,
                                 100000000, 1000000000};
   u32 t = (32 - __builtin_clz(x | 1)) * 1233 >> 12;
   return t + ((x | 1) >= p10[t]);
 }
 
+// The value of the len (1 to 10) digits ending just before end, with no loop:
+// the 16 bytes before end, less '0' and with the bytes ahead of the number
+// zeroed, combined 2, 4 and then 8 digits at a time.
 inline u32 decode(const char *end, u32 len) {
   __m128i v = _mm_subs_epu8(_mm_loadu_si128((const __m128i *)(end - 16)),
                             _mm_set1_epi8('0'));
@@ -48,26 +80,26 @@ inline u32 decode(const char *end, u32 len) {
          u32(_mm_extract_epi32(v, 1));
 }
 
+// Puts the k-th smallest of a[0, n) at a[k], the smaller ones before it,
+// without a branch on the data: each round partitions around the median of
+// three with an unconditional swap. Many equal values could shrink a round by
+// one only, so after 40 rounds the library's selection finishes.
 inline void select(u32 *a, u32 n, u32 k) {
   for (int round = 0; n > 1; ++round) {
-    if (k == 0)
-      return std::iter_swap(a, std::min_element(a, a + n));
-    if (k + 1 == n)
-      return std::iter_swap(a + k, std::max_element(a, a + n));
     if (round == 40)
       return std::nth_element(a, a + k, a + n);
-    u32 m = n / 2, x = a[0], y = a[m], z = a[n - 1];
-    if (y < x)
-      std::swap(x, y);
-    if (z < y)
-      std::swap(y, z);
-    if (y < x)
-      std::swap(x, y);
-    a[0] = x, a[m] = z, a[n - 1] = y;
-    u32 lt = 0;
+    u32 m = n / 2;
+    if (a[m] < a[0])
+      std::swap(a[m], a[0]);
+    if (a[n - 1] < a[m])
+      std::swap(a[n - 1], a[m]);
+    if (a[m] < a[0])
+      std::swap(a[m], a[0]);
+    std::swap(a[m], a[n - 1]);
+    u32 pivot = a[n - 1], lt = 0;
     for (u32 i = 0; i + 1 < n; ++i) {
-      u32 v = a[i];
-      a[i] = a[lt], a[lt] = v, lt += v < y;
+      u32 x = a[i];
+      a[i] = a[lt], a[lt] = x, lt += x < pivot;
     }
     std::swap(a[lt], a[n - 1]);
     if (k == lt)
@@ -79,27 +111,37 @@ inline void select(u32 *a, u32 n, u32 k) {
   }
 }
 
+// The first c at or after s; one is known to follow.
 inline const char *next_byte(const char *s, char c) {
   for (;; s += 32)
     if (u32 m = eq32(s, c))
       return s + __builtin_ctz(m);
 }
 
+// Endpoint names to dense ids, one table for all threads. Open addressing on
+// a CRC of the name's first and last eight bytes. A slot holds 20 bits of the
+// hash, the id, the length and the name's offset in the arena, so a probe
+// compares names only when hash bits and length agree. A new name is copied
+// into the arena and published with one compare-and-swap; a thread that loses
+// the race compares against the winner's name.
 struct Names {
-  static constexpr u32 SLOTS = 1 << 12, ARENA = 1 << 19;
+  static constexpr u32 SLOTS = 1 << 13, ARENA = 1 << 19;
   std::atomic<u64> slot[SLOTS];
-  std::atomic<u32> used{0};
+  std::atomic<u32> used{0}, next_id{0};
   char arena[ARENA + 64];
 
   std::string_view name(u64 v) const {
     return {arena + (v & 0xFFFFF), size_t((v >> 20) & 0xFFF)};
   }
 
-  [[gnu::noinline, gnu::cold]] bool insert(u32 j, u64 &v, u64 tag,
-                                           std::string_view s) {
-    u32 at = used.fetch_add(s.size());
+  // A new name is rare (a few thousand in millions of lines), so its path is
+  // kept out of the lookup loop.
+  [[gnu::noinline, gnu::cold]] int insert(u32 j, u64 &v, u64 tag,
+                                          std::string_view s) {
+    u32 at = used.fetch_add(s.size()), id = next_id.fetch_add(1);
     memcpy(arena + at, s.data(), s.size());
-    return slot[j].compare_exchange_strong(v, tag | at);
+    return slot[j].compare_exchange_strong(v, tag | u64(id) << 32 | at) ? id
+                                                                        : -1;
   }
 
   u32 operator()(std::string_view s) {
@@ -109,33 +151,37 @@ struct Names {
       memcpy(&b, s.data() + n - 8, 8);
     else
       a &= (u64(1) << 8 * n) - 1;
-    u64 h = _mm_crc32_u64(_mm_crc32_u64(n, a), b), tag = h << 32 | (n << 20);
+    u64 h = _mm_crc32_u64(_mm_crc32_u64(n, a), b),
+        tag = u64(h >> 12) << 44 | n << 20;
     for (u32 i = h;; ++i) {
       u32 j = i % SLOTS;
       u64 v = slot[j].load(std::memory_order_acquire);
-      if (__builtin_expect(!v, 0) && insert(j, v, tag, s))
-        return j;
-      if ((v & ~0xFFFFFull) == tag && same(arena + (v & 0xFFFFF), s))
-        return j;
+      if (__builtin_expect(!v, 0))
+        if (int id = insert(j, v, tag, s); id >= 0)
+          return id;
+      if ((v & ~0xFFF000FFFFFull) == tag && same(name(v), s))
+        return u32(v >> 32) & 0xFFF;
     }
   }
 
-  static bool same(const char *x, std::string_view s) {
-    auto eq = [&](size_t i) {
-      __m256i a = _mm256_loadu_si256((const __m256i *)(x + i));
+  // 64 bytes can always be read from either name (the rest of the line and
+  // the spare page follow one, the arena's spare bytes the other), so a name
+  // of up to 64 bytes is compared in two steps.
+  static bool same(std::string_view x, std::string_view s) {
+    if (s.size() > 64)
+      return x == s;
+    auto eq = [&](int i) {
+      __m256i a = _mm256_loadu_si256((const __m256i *)(x.data() + i));
       __m256i b = _mm256_loadu_si256((const __m256i *)(s.data() + i));
       return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)));
     };
-    if (__builtin_expect(s.size() <= 64, 1))
-      return (~(eq(0) | u64(eq(32)) << 32) & (~u64(0) >> (64 - s.size()))) == 0;
-    for (size_t i = 0; i < s.size(); i += 32)
-      if (~eq(i) & (s.size() - i >= 32 ? ~0u : (1u << (s.size() - i)) - 1))
-        return false;
-    return true;
+    return (~(eq(0) | u64(eq(32)) << 32) & (~u64(0) >> (64 - s.size()))) == 0;
   }
 };
 static Names endpoints;
 
+// One hour's records from one thread, in a chain of 16 KB chunks carved in
+// order from a region the thread maps up front.
 struct Chunk {
   static constexpr u32 CAP = (16384 - 16) / 4;
   Chunk *prev;
@@ -156,13 +202,13 @@ struct Parser {
     while (p < end) {
       int day = (p[8] - '0') * 10 + p[9] - '0',
           hr = (p[11] - '0') * 10 + p[12] - '0',
-          h = (day + (p[6] - '0') * 31 - 30) * 24 + hr - 18;
+          h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18;
       const char *m = p + 28;
       u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
       u64 nl = eq32(m, '\n') | u64(eq32(m + 32, '\n')) << 32;
       const char *name = m + __builtin_ctzll(sp) + 1;
-      const char *ne = nl ? m + __builtin_ctzll(sp & (sp - 1))
-                          : next_byte(name, ' ');
+      const char *ne =
+          nl ? m + __builtin_ctzll(sp & (sp - 1)) : next_byte(name, ' ');
       const char *eol = nl ? m + __builtin_ctzll(nl) : next_byte(ne + 5, '\n');
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
       u32 lat = decode(eol, eol - ne - 5);
@@ -178,6 +224,10 @@ struct Parser {
     }
   }
 
+  // The log is in arrival order, so chunks are carved roughly hour by hour and
+  // hours finish in the same order. The run of chunks at the front whose hours
+  // are all finished is handed back in 64 KB batches, before the output's
+  // pages start to count.
   void release(const std::atomic<bool> *done) {
     Chunk *c = kept;
     while (c < next && done[c->hour])
@@ -186,6 +236,7 @@ struct Parser {
       madvise(kept, (c - kept) * sizeof(Chunk), MADV_DONTNEED), kept = c;
   }
 
+  // Calls f(endpoint rank, 5xx flag, latency) for every record of hour h.
   template <class F> void each(int h, const u32 *rank, F &&f) const {
     for (const Chunk *c = last[h]; c; c = c->prev)
       for (u32 i = 0; i < c->n; ++i)
@@ -220,8 +271,9 @@ int main() {
 
   std::vector<Parser> parsers(nt);
   std::vector<std::string_view> names;
-  std::vector<u32> rank(Names::SLOTS);
+  std::vector<u32> rank(1 << 12);
   u32 most = 0;
+  // Endpoints ranked in unsigned byte order, the order of an hour's lines.
   std::barrier ranked(nt, [&]() noexcept {
     for (int h = 0; h < HOURS; ++h) {
       u32 n = 0;
@@ -232,7 +284,7 @@ int main() {
     std::vector<std::pair<std::string_view, u32>> by_name;
     for (u32 i = 0; i < Names::SLOTS; ++i)
       if (u64 v = endpoints.slot[i])
-        by_name.push_back({endpoints.name(v), i});
+        by_name.push_back({endpoints.name(v), u32(v >> 32) & 0xFFF});
     std::sort(by_name.begin(), by_name.end());
     for (auto [name, id] : by_name)
       rank[id] = names.size(), names.push_back(name);
@@ -243,12 +295,11 @@ int main() {
   struct Line {
     u32 e, n, p50, p95, p99, errors;
   };
-  auto ppm = [](const Line &l) {
-    return l.errors ? u32(u64(l.errors) * 1000000 / l.n) : 0;
-  };
+  auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
   std::vector<std::vector<Line>> lines(HOURS);
   std::vector<u64> at(HOURS + 1);
   char *text = nullptr;
+  // Every hour is sized: offsets, then the output mapped at its final size.
   std::barrier sized(nt, [&]() noexcept {
     for (auto &ps : parsers)
       ps.release(finished.data());
@@ -283,6 +334,7 @@ int main() {
         for (int h; (h = claim++) < HOURS;) {
           std::fill(start.begin(), start.end(), 0);
           std::fill(errors.begin(), errors.end(), 0);
+          // Counting sort of the hour's latencies by endpoint rank.
           for (auto &ps : parsers)
             ps.each(h, rank.data(), [&](u32 e, u32 err, u32) {
               ++start[e + 1], errors[e] += err != 0;
@@ -303,6 +355,8 @@ int main() {
             u32 n = start[e + 1] - start[e];
             if (!n)
               continue;
+            // Nearest rank p is index ceil(p * n / 100) - 1; each higher rank
+            // is selected among the values left after the one before.
             u32 *a = latency.get() + start[e], r50 = (50 * n + 99) / 100 - 1,
                 r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
             for (u32 from = 0; u32 r : {r50, r95, r99})

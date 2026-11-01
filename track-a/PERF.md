@@ -34,6 +34,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 27 | Back to step 25's code | pending | | | |
 | 28 | Slot index as the endpoint id (no id counter), table of 4,096 slots instead of 8,192, full CRC32 as the tag, selection with min/max shortcuts; comments dropped | run-9e40422cd8dd | 0.0214 s | 18.4 MiB | 84.48 |
 | 29 | Back to step 25's code | pending | | | |
+| 30 | Step 28's slot-index design with the new-name path in a cold function and the tag and length checked in one compare | run-ca5c5bb4e74e | 0.0249 s | 18.1 MiB | 82.81 |
+| 31 | Step 25's code with the new-name path in a cold function and the tag and length checked in one compare | pending | | | |
 
 ## Local measurements
 
@@ -115,6 +117,10 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 26 on the board, and step 27.** run-028f1cfc1335: 0.0227 s and 21.7 MiB, 83.14, below step 25's code, which a later push ran again in 0.0209 s (run-38c8b98f7941, 84.75, the best Track A run so far). Step 27 is step 25's code again.
 
 **Step 28 on the board, and step 29.** Three small changes against step 24's design: the slot index as the endpoint id instead of a dense id from a counter, a table of 4,096 slots instead of 8,192, and min/max shortcuts in the selection. Correct on full, sample, tiny, the worked example, an empty log, two other seeds and a hand-made edge log, with the same hash on 50 repeated runs. Locally it lost before it was pushed: 2 to 3% slower in two rounds of 1,000 alternating pairs on mains power and 0.5 to 1% slower in four rounds on battery, each with an interval that excludes a tie, with peak memory level at 19.27 MiB over 60 pairs and 2 more counted lines. The board agreed: run-9e40422cd8dd, 0.0214 s, 18.4 MiB and 317 lines, K 48.93 and 84.48 points, against 0.0209 s, 18.3 MiB, 315 lines, K 49.53 and 84.75 for step 25's best run and K 49.27 for its latest. Step 29 is step 25's code again.
+
+**Steps 30 and 31.** Step 30 was step 28's design (the slot index as the id, 4,096 slots, min/max shortcuts in the selection) with two more changes: the path that adds a new name moved into a separate cold function, so the lookup loop stays small, and the hash tag and the name's length checked with one masked compare. Same hash on all six datasets. Locally it ran 4% fewer user instructions (684M against 715M) and 3 to 7% fewer user cycles in six interleaved `perf stat -r 10` rounds. The board did not agree: run-ca5c5bb4e74e, 0.0249 s, 18.1 MiB and 324 lines, 82.81 points. That run was slow for every track (Track D's unchanged code took 0.185 s against its best of 0.168 s), but A lost 19%, and with step 28 this is the second board loss for slot-index ids. Step 31 puts back step 25's dense ids and keeps only the cold insert path and the single compare: same hash on all six datasets, 1 to 3% fewer user cycles than step 25 in three `perf stat` rounds, 311 counted lines against 308.
+
+Also measured for this session and kept out, all with the same hash: (1) each hour's lines in one anonymous mapping with the hour's pages dropped once its text is written (end-of-run memory 18.3 to 14.8 MB, but the peak is set earlier, at the start of the hour phase, and did not move); (2) on top of that, each hour's record chunks dropped as soon as they are copied into the sort scratch instead of the prefix release (peak 18.3 to 17.8 MB locally, 2 to 3 ms slower in 15 alternating runs); (3) two line cursors per parsed piece stepped in turn, so two lines' lookups overlap (1% more instructions, cycles level, 2 ms slower in 31 alternating runs).
 
 ## Tried and kept out
 
