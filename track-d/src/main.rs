@@ -185,16 +185,18 @@ impl Offs {
     fn at(&self, v: usize) -> u32 {
         unsafe { *self.base.get_unchecked(v >> self.gb) + *self.rel.get_unchecked(v) as u32 }
     }
-    /// Packs plain offsets, each thread a share of the nodes.
+    /// Packs plain offsets, each thread a share of the groups. Offsets only
+    /// grow, so a group fits a byte if its last one is under 256 past its first.
     fn pack(nt: usize, v: &[u32]) -> Self {
         let n = v.len() - 1;
-        let fits = on_threads(nt, |t| share(n + 1, t, nt).all(|i| v[i] - v[i & !7] < 256));
+        let fits = on_threads(nt, |t| share(n / 8 + 1, t, nt).all(|g| v[(8 * g + 7).min(n)] - v[8 * g] < 256));
         let mut o = Offs::new(n, if fits.iter().all(|&f| f) { 3 } else { 0 });
         let (gb, b, r) = (o.gb, Raw::of(&mut o.base), Raw::of(&mut o.rel));
         on_threads(nt, |t| {
-            for i in share(n + 1, t, nt) {
-                let g = i >> gb << gb;
-                unsafe { (*b.at(i >> gb), *r.at(i)) = (v[g], (v[i] - v[g]) as u8) };
+            for g in share((n >> gb) + 1, t, nt) {
+                let (lo, hi) = (g << gb, ((g + 1) << gb).min(n + 1));
+                unsafe { *b.at(g) = v[lo] };
+                v[lo..hi].iter().zip(lo..).for_each(|(&x, i)| unsafe { *r.at(i) = (x - v[lo]) as u8 });
             }
         });
         o
@@ -273,17 +275,23 @@ impl<T: Len> Dist<T> {
             },
         }
     }
+    #[inline(always)]
     fn at(&mut self, v: u32) -> &mut T {
         let i = v as usize / PAGE;
         if unsafe { *self.tab.get_unchecked(i) } == 0 {
-            self.used.push(i as u32);
-            self.tab[i] = self.used.len() as u16;
-            let s = (self.used.len() - 1) * PAGE;
-            self.pool.resize(self.pool.len().max(s + PAGE), T::MAX);
-            self.pool[s..s + PAGE].fill(T::MAX);
+            self.page(i);
         }
-        let k = (self.tab[i] as usize - 1) * PAGE + v as usize % PAGE;
+        let k = (unsafe { *self.tab.get_unchecked(i) } as usize - 1) * PAGE + v as usize % PAGE;
         unsafe { self.pool.get_unchecked_mut(k) }
+    }
+    /// Hands out a page for nodes i * PAGE.. on their first touch.
+    #[cold]
+    fn page(&mut self, i: usize) {
+        self.used.push(i as u32);
+        self.tab[i] = self.used.len() as u16;
+        let s = (self.used.len() - 1) * PAGE;
+        self.pool.resize(self.pool.len().max(s + PAGE), T::MAX);
+        self.pool[s..s + PAGE].fill(T::MAX);
     }
     fn reset(&mut self) {
         self.used.iter().for_each(|&i| self.tab[i as usize] = 0);

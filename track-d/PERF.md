@@ -51,6 +51,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 27 | Back to step 26's code | pending | | | |
 | 28 | Reverse graph counted and placed with plain increments, each thread owning its share's nodes; edges into another share handed over | run-62ef9877e352 | 0.159 s | 55 MiB | 69.41 |
 | 29 | Back to step 26's code | pending | | | |
+| 30 | Offsets packed group by group; the distance lookup's fast path inlined, the page hand-out out of line | pending | | | |
 
 ## What the profile said, step by step
 
@@ -153,6 +154,8 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Measured after step 28 and kept out: longest queries first.** Per-thread end times showed a tail of 5 to 6 ms at the end of the searches (the first thread out of queries at 60 ms, the last done at 66). The distance between a query's ends in the blob order ranks its work well (Spearman 0.74 against settled nodes over the 2,000 queries; the top 10% of queries do 74% of the work), so the queries were sorted by it, longest first. The tail shrank to 0.4 to 1.7 ms, but the searches got slower overall (median 69.7 against 64.2 ms over eight interleaved runs, eight of eight): sorted by (source, target), queries running at the same moment on different threads share their forward balls in the L3 cache, and that is worth more than the tail. Putting only the longest 10% or 20% first, each group in (source, target) order, measured the same as plain sorting (65.5 and 65.9 against 65.2 ms).
 
 **Step 28 on the board, and step 29.** run-62ef9877e352: 0.159 s against 0.157 s for step 26, 675 lines, 69.41 points: the box did not see the gain the laptop measured, and the 26 extra lines cost more than any time it saved. Step 29 is step 26's code again.
+
+**Step 29 to 30: counting instructions.** Twice now (steps 18, 22 and 28) the laptop's wall-clock gains did not appear on the box. A likely reason: the box runs at a fixed 2.5 GHz, where a memory miss costs about half as many cycles as on this laptop's 5 GHz cores, so instructions weigh relatively more there. `perf record -e instructions` (deterministic, unlike time here) splits step 26's 7.03 billion instructions: the search's settle 35% (plus 4% in the distance lookup and 3% in heap pushes), the blob BFS 12.8% (about 520 per node), the parse 7.3%, the offset packing 5.9% and the renumbering 5.7%. The packing at about 60 instructions per offset was plainly wasteful: it now works group by group, writes the group's u32 once and checks a group's fit by its last offset only (offsets only grow). The distance lookup was a call on every relaxation; its fast path is now inlined and the page hand-out kept out of line. Instructions 6.99 to 6.37 billion (minus 9%), three `perf stat -r 5` rounds all faster (0.142 to 0.150 s against 0.145 to 0.198 s). Same hash on all thirty datasets.
 
 ## Tried and kept out
 
