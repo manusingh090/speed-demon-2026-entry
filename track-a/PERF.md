@@ -26,6 +26,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 19 | Sixteen pieces per thread instead of eight | run-df667e59ec60 | 0.0246 s | 18.9 MiB | 82.67 |
 | 20 | Four pieces per thread | run-47a955df5a0a | 0.0257 s | 18.1 MiB | 82.37 |
 | 21 | Back to step 18's code (eight pieces) | pending | | | |
+| 22 | Endpoint table probed four slots at a time with AVX2 on a 44-bit tag (CRC32 of the first, middle and last eight bytes, and the length); per-hour counts kept during the parse instead of walking the chunks for the largest hour; a claim-and-count phase helper in place of `std::barrier`; all hours' lines in one block | pending | | | |
 
 ## Local measurements
 
@@ -93,6 +94,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 19 on the board, and step 20.** run-df667e59ec60: 0.0246 s against 0.0215 s, slower: since step 18 each piece ends in an unmapping call, and twice the calls means twice the page-table work landing while other threads still fault the log in. Step 20 goes the other way, to four pieces a thread.
 
 **Step 20 on the board, and step 21.** run-47a955df5a0a: 0.0257 s, slower too, so eight pieces a thread (step 18) stay: fewer pieces leave a longer tail at the barrier, more put more unmapping calls among other threads' page faults.
+
+**Step 21 to 22.** A rework of step 18 tried on the board. Laptop: 709M user instructions against 685M, the same cycles, `cmp.ps1` (15 runs) medians 29 against 30 ms, 19 against 20 MB at peak, 337 counted lines against 327. Same hash on all six datasets, 20 repeated full runs gave one hash.
 
 ## Tried and kept out
 
