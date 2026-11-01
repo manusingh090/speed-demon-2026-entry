@@ -386,11 +386,11 @@ int main() {
         if (codes.size() > 255) { fputs("too many countries\n", stderr); _exit(1); }
     };
 
-    // records.csv: skip the BOM and header, then split after CRLFs into eight
+    // records.csv: skip the BOM and header, then split after CRLFs into 16
     // pieces per thread, claimed in turn, so a thread whose pieces are slow
     // (more first sightings of names) is evened out by the others.
     size_t start = size ? static_cast<const char*>(memchr(records, '\n', size)) - records + 1 : 0;
-    const int pieces = 8 * nthreads;
+    const int pieces = 16 * nthreads;
     std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
     std::vector<std::array<Totals, 256>> totals(nthreads);
     NameTable names;
