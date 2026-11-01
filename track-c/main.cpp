@@ -224,16 +224,7 @@ struct Totals {
 // by all threads. Most marks are first sightings, so they are atomic ORs.
 struct NamesSeen {
     static constexpr u32 WORDS = NameTable::SLOTS / 64;
-    // The marks land all over the 4 MB of bitsets; on 4 KB pages most of them
-    // would first miss the TLB, so they take two 2 MB pages, populated here
-    // (before huge pages are turned off for the rest of the process).
-    std::atomic<u64>* bits = [] {
-        constexpr size_t BYTES = 256 * WORDS * 8, HUGE = 1 << 21;
-        auto* p = reinterpret_cast<char*>((uintptr_t(zeroed<char>(BYTES + HUGE)) + HUGE - 1) & ~(HUGE - 1));
-        madvise(p, BYTES, MADV_HUGEPAGE);
-        madvise(p, BYTES, MADV_POPULATE_WRITE);
-        return reinterpret_cast<std::atomic<u64>*>(p);
-    }();
+    std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS);
 
     std::atomic<u64>& word(u32 c, u32 name) { return bits[c * WORDS + name / 64]; }
 
@@ -371,6 +362,9 @@ void put_money(std::string& out, i64 cents) {
 }
 
 int main() {
+    // With transparent huge pages, a block written only in part can be backed
+    // by a whole 2 MB page; plain pages keep memory to what is written.
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
@@ -401,9 +395,6 @@ int main() {
     std::vector<std::array<Totals, 256>> totals(nthreads);
     NameTable names;
     NamesSeen seen;
-    // From here on, transparent huge pages are off: a block written only in
-    // part (a thread's stack, say) could be backed by a whole 2 MB page.
-    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
 
     // Populate tables and flag countries; populate bitsets and fill the region
     // table; parse records.
@@ -419,6 +410,7 @@ int main() {
             });
             std::call_once(numbered, number_countries);
             fill.run([&](int k) {
+                populate_share(seen.bits, (codes.size() + 1) * NamesSeen::WORDS, k, nthreads);
                 for (const char* p = regions + rcut[k]; p < regions + rcut[k + 1];) {
                     auto [id, c] = region_line(p);
                     country_of[id] = index_of[c];
