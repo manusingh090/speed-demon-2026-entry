@@ -19,7 +19,6 @@ const GAP: u32 = 15;
 const ID_BITS: u32 = 18;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const BIG: usize = 768;
-const PARTS: usize = 64;
 
 fn map(path: &str) -> &'static [u8] {
     let file = std::fs::File::open(path).expect(path);
@@ -82,16 +81,14 @@ struct Terms {
 }
 
 impl Terms {
-    // A probe stays inside its slot's partition (one of PARTS equal ranges),
-    // so different threads can fill different partitions at once.
     fn find(&self, h: u64) -> u32 {
-        let (sub, mut i) = (self.slot.len() / PARTS - 1, h as usize & (self.slot.len() - 1));
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 1));
         loop {
             let s = unsafe { *self.slot.get_unchecked(i) };
             if s == 0 || s >> ID_BITS == h >> ID_BITS {
                 return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32);
             }
-            i = (i & !sub) | ((i + 1) & sub);
+            i = (i + 1) & mask;
         }
     }
 
@@ -101,31 +98,18 @@ impl Terms {
         }
     }
 
-}
-
-// Adds hash h to one partition's slots unless it is there: the n terms
-// already in it are numbered 1 to n, and the new count is returned.
-fn insert(slot: &mut [u64], h: u64, n: u32) -> u32 {
-    let mut i = h as usize & (slot.len() - 1);
-    while slot[i] != 0 {
-        if slot[i] >> ID_BITS == h >> ID_BITS {
-            return n;
+    fn insert(&mut self, term: &[u8]) -> u32 {
+        let h = unsafe { hash(term.as_ptr(), term.len()) };
+        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 1));
+        while self.slot[i] != 0 {
+            if self.slot[i] >> ID_BITS == h >> ID_BITS {
+                return (self.slot[i] & ID_MASK) as u32 - 1;
+            }
+            i = (i + 1) & mask;
         }
-        i = (i + 1) & (slot.len() - 1);
+        (self.n += 1, self.slot[i] = (h & !ID_MASK) | self.n as u64);
+        self.n as u32 - 1
     }
-    slot[i] = (h & !ID_MASK) | (n + 1) as u64;
-    n + 1
-}
-
-// THREADS + 1 offsets cutting text into line-aligned pieces.
-fn cuts(text: &[u8]) -> Vec<usize> {
-    let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
-    for c in &mut cut[1..THREADS] {
-        while *c < text.len() && text[*c - 1] != b'\n' {
-            *c += 1;
-        }
-    }
-    cut
 }
 
 unsafe fn classes(p: *const u8) -> (u64, u64) {
@@ -369,56 +353,28 @@ impl Units {
 fn main() {
     unsafe { (mallopt(-3, 1 << 16), prctl(41, 1u64, 0u64, 0u64, 0u64)) };
     let qtext = map("/data/queries.txt");
-    let slot = vec![0; (qtext.len() / 8).next_power_of_two().max(PARTS << 6)];
+    let slot = vec![0; (qtext.len() / 16).next_power_of_two()];
     let mut terms = Terms { slot, n: 0 };
-    let (sub, qcut) = (terms.slot.len() / PARTS, cuts(qtext));
-    // Each thread parses its piece of the queries into term hashes; then each
-    // partition of the table is filled by one thread, in query order.
-    let parsed = on_threads(|t| {
-        let (mut spans, mut hashes, mut ops) = (vec![], vec![], vec![]);
-        let piece = &qtext[qcut[t]..qcut[t + 1]];
-        for q in piece.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
-            let (phrase, from) = (q[0] == b'P', ops.len() as u32);
-            let words = &q[if phrase { 8 } else { 5 }..q.len() - phrase as usize];
-            for (k, word) in words.split(|&b| b == b' ').enumerate() {
-                if !phrase && k % 2 == 1 {
-                    *ops.last_mut().unwrap() = word[0];
-                } else {
-                    hashes.push(unsafe { hash(word.as_ptr(), word.len()) });
-                    ops.push(0);
-                }
+    let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
+    for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
+        let (phrase, from) = (q[0] == b'P', ids.len() as u32);
+        let start = if phrase { 8 } else { 5 };
+        for (k, word) in q[start..q.len() - phrase as usize].split(|&b| b == b' ').enumerate() {
+            match !phrase && k % 2 == 1 {
+                true => *ops.last_mut().unwrap() = word[0],
+                false => (ids.push(terms.insert(word)), ops.push(0)).1,
             }
-            spans.push((phrase, from, ops.len() as u32));
         }
-        (spans, hashes, ops)
-    });
-    let (next, all) = (AtomicUsize::new(0), || parsed.iter().flat_map(|p| &p.1));
-    let slices: Vec<_> = terms.slot.chunks_mut(sub).map(Mutex::new).collect();
-    let sizes = on_threads(|_| {
-        let mut done = vec![];
-        while let p @ 0..PARTS = next.fetch_add(1, Relaxed) {
-            let mut slot = slices[p].lock().unwrap();
-            let mine = all().filter(|&&h| h as usize / sub % PARTS == p);
-            done.push((p, mine.fold(0, |n, &h| insert(&mut slot, h, n))));
-        }
-        done
-    });
-    let mut size = [0; PARTS];
-    sizes.into_iter().flatten().for_each(|(p, n)| size[p] = n as usize);
-    for (part, n) in terms.slot.chunks_mut(sub).zip(size) {
-        part.iter_mut().filter(|s| **s != 0).for_each(|s| *s += terms.n as u64);
-        terms.n += n;
+        spans.push((phrase, from, ids.len() as u32));
     }
-    let ids = on_threads(|t| parsed[t].1.iter().map(|&h| terms.find(h)).collect::<Vec<_>>());
-    let (mut spans, mut ops) = (vec![], vec![]);
-    for (s, _, o) in parsed {
-        let off = ops.len() as u32;
-        spans.extend(s.into_iter().map(|(p, from, to)| (p, from + off, to + off)));
-        ops.extend(o);
-    }
-    let (mut ids, nterms) = (ids.concat(), terms.n);
+    let nterms = terms.n;
     let text = map("/data/docs.txt");
-    let cut = cuts(text);
+    let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
+    for c in &mut cut[1..THREADS] {
+        while *c < text.len() && text[*c - 1] != b'\n' {
+            *c += 1;
+        }
+    }
     let mut last_line = text.len().saturating_sub(1);
     while last_line > 0 && text[last_line - 1] != b'\n' {
         last_line -= 1;
