@@ -186,7 +186,7 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 /// window. Each token's slot is prefetched and the token looked up LAG tokens
 /// later, so the misses overlap.
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
-    const LAG: usize = 16;
+    const LAG: usize = 8;
     let mut ring = [0u64; LAG];
     let (mut n, mut out) = (0usize, ids.len());
     loop {
