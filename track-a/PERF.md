@@ -22,7 +22,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | Back to step 11's code | pending | | | |
 | 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | run-7f4f12386a23 | 0.0315 s | 19.1 MiB | 79.75 |
 | 17 | Diagnostic: each piece parsed twice, the first time into a parser that is then dropped (same output) | run-f846b47b55e9 | 0.0395 s | 32.6 MiB | 75.15 |
-| 18 | Step 11's code, and each parsed piece's log pages unmapped (`MADV_DONTNEED`) by the thread that parsed it | pending | | | |
+| 18 | Step 11's code, and each parsed piece's log pages unmapped (`MADV_DONTNEED`) by the thread that parsed it | run-1bfda4424f2e | 0.0215 s | 18.1 MiB | 84.30 |
 
 ## Local measurements
 
@@ -82,6 +82,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Steps 16 and 17: measuring the phases on the box.** The laptop's split of the time has misled more than once (its virtual machine makes page faults and the address-space lock dearer than the box's bare metal), so the box itself is asked: a build that does one phase twice, keeping one result, produces the same output, and its extra time is that phase's cost there. Step 16 doubles the hour phase (on the laptop +222M user instructions, +95M cycles); step 17 will double the parse. Step 16 on the board (run-7f4f12386a23): 0.0315 s against about 0.0262 s, so the hour phase costs about 5.2 ms there, a fifth of the run. Step 17 on the laptop: +412M user instructions (133 a line) and about +215M cycles.
 
 **Step 17 on the board, and step 18.** run-f846b47b55e9: 0.0395 s, so the parse costs 12 to 13 ms of the box's 26 (some of that the throwaway parser's own page faults), the hour phase 5.2 ms, and about 8 ms is everything else: starting threads, the two barriers, writing 7 MB of text and exiting. Exit alone tears down the 239 MB mapping of the log, about 58,000 page table entries, on one thread. The log is not read again after the parse, so step 18 has each thread unmap the pages of every piece it finishes, spreading that work over the threads and leaving exit little to do. On the laptop it costs kernel time (188 to 194M kernel cycles against 135 to 140M), as the virtual machine's page tables make it dear there; the board decides. Same hash on all six datasets.
+
+**Step 18 on the board.** run-1bfda4424f2e: 0.0215 s against about 0.026 s, 18% faster and the best so far at 84.30 points. Most of the 8 ms outside the two phases was the exit's teardown of the log's mapping on one thread.
 
 ## Tried and kept out
 

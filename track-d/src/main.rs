@@ -25,6 +25,7 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 
 const INF: u64 = u64::MAX;
@@ -294,6 +295,12 @@ fn main() {
             }
             (f.offs[at[p]], f.words[at[p]]) = ((u & ((1 << sh) - 1)) as u16, v | w << hb);
             (at[p], f.len[p]) = (at[p] + 1, f.len[p] + 1);
+        }
+        // The range is not read again: its pages are unmapped now, by this
+        // thread, instead of all of the file's at exit by one (MADV_DONTNEED).
+        let (from, to) = ((text.as_ptr() as usize + cut[t] + 4095) & !4095, (text.as_ptr() as usize + cut[t + 1]) & !4095);
+        if to > from {
+            unsafe { madvise(from as *mut c_void, to - from, 4) };
         }
         f
     });
