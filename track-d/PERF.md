@@ -37,7 +37,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 15 | One pool of threads for every phase; parse output in 6-byte records, filed in chunks from one arena per thread; parts of 16,384 nodes | run-92e934101917 | 0.172 | 67 | 68.58 |
 | 16 | Each thread unmaps (`MADV_DONTNEED`) the part of graph.txt it parsed as soon as it is done, instead of the whole 92 MB being torn down at exit by one thread | run-beecc52de687 | 0.190 s | 66.7 MiB | 67.47 |
 | 17 | Back to step 15's code | run-6891f144a066 | 0.182 s | 66.5 MiB | 68.04 |
-| 18 | Distances stored as u32 (u64 rerun when the answer may not fit); graph pages released on all threads after the searches; graph.txt unmapped during them | pending | | | |
+| 18 | Distances stored as u32 (u64 rerun when the answer may not fit); graph pages released on all threads after the searches; graph.txt unmapped during them | run-c466ddb7873a | 0.193 s | 63.6 MiB | 67.21 |
+| 19 | graph.txt's pages dropped by each thread as it runs out of queries (`MADV_DONTNEED`), instead of one unmap at the start of the searches | pending | | | |
 
 ## What the profile said, step by step
 
@@ -98,6 +99,10 @@ The search was then profiled on one thread (an `SNT` switch in a scratch copy) t
 Measured and dropped on the way: growing the side with the smaller top key instead of the smaller queue doubles the settled nodes (14.3 million against 7.1 million); balancing by settled count changes nothing (7.16 million); a branch-free 4-ary heap of packed 64-bit keys was 15% slower single-threaded (the selects serialise each level, where the branchy version speculates through it); a `Side` method alone, without the u32 change, made no difference.
 
 Four interleaved `perf stat -r 5` rounds: 0.167 to 0.170 s against 0.197 to 0.229 s for step 17, 300 ms less CPU; 21 alternating container runs: median 213 against 220 ms, best 152 against 168 ms (other sessions were building on the laptop). 569 rustfmt lines against 508. Same hash on full, sample, tiny, the worked example, seeds 7, 9 and 13 at sample scale and seeds 2, 3, 4, 5 and 21 at tiny scale (the tiny ones checked against the reference).
+
+**Step 18 on the board.** run-c466ddb7873a: 0.193 s, 63.6 MiB (from 66.5), 577 counted lines, 67.21 points. The other tracks ran at their usual speed in the same run (A 0.0219 s, B 0.1439 s, C 0.0282 s), so this is not a slow box. The likely cause is the one step 16 ran into: unmapping graph.txt takes the address-space lock for writing, and at the start of the searches every thread is faulting in its first distance pages and heap, so they all waited behind the unmap.
+
+**Step 18 to 19.** graph.txt's pages are now dropped with `MADV_DONTNEED` (the lock taken for reading, so page faults go on) by each thread for its share once it finds no query left, which is the tail of the search phase, when threads are idle anyway. Locally in three `perf stat -r 5` rounds: 0.151, 0.156 and 0.171 s against 0.214, 0.171 and 0.176 s for step 18. Same hash on all twelve datasets.
 
 ## Tried and kept out
 

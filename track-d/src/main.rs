@@ -27,7 +27,6 @@ extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
     fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
-    fn munmap(addr: *mut c_void, len: usize) -> i32;
     fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
 }
 
@@ -68,19 +67,15 @@ fn map(path: &str) -> &'static [u8] {
     }
 }
 
-/// Hands the whole pages inside bufs back to the kernel, each thread a share
-/// of them. MADV_DONTNEED only takes the address-space lock for reading, so
-/// the threads free pages in parallel, where a free or the exit would do it
-/// on one thread. The buffers must not be read afterwards, only dropped.
-fn release(nt: usize, bufs: &[&[u32]]) {
-    on_threads(nt, |t| {
-        for b in bufs {
-            let lo = (b.as_ptr() as usize).next_multiple_of(4096);
-            let hi = (b.as_ptr() as usize + b.len() * 4) & !4095;
-            let r = share(hi.saturating_sub(lo) / 4096, t, nt);
-            unsafe { madvise((lo + r.start * 4096) as *mut c_void, r.len() * 4096, 4) };
-        }
-    });
+/// Hands thread t's share of the whole pages inside b back to the kernel.
+/// MADV_DONTNEED only takes the address-space lock for reading, so threads
+/// free pages in parallel and alongside page faults, where a free or the exit
+/// would do it on one thread. b must not be read afterwards, only dropped.
+fn drop_pages<T>(b: &[T], t: usize, nt: usize) {
+    let lo = (b.as_ptr() as usize).next_multiple_of(4096);
+    let hi = (b.as_ptr() as usize + std::mem::size_of_val(b)) & !4095;
+    let r = share(hi.saturating_sub(lo) / 4096, t, nt);
+    unsafe { madvise((lo + r.start * 4096) as *mut c_void, r.len() * 4096, 4) };
 }
 
 /// The number at text[*i..], leaving *i past the one byte that ends it.
@@ -608,16 +603,14 @@ fn main() {
     let mut ans = vec![INF; ends.len()];
     let ansr = Raw::of(&mut ans);
     let next = AtomicUsize::new(0);
-    on_threads(nt, |t| {
-        if t == 0 {
-            // graph.txt is read no more, and no other thread faults pages in now.
-            unsafe { munmap(text.as_ptr() as *mut c_void, text.len() + 4096) };
-        }
+    on_threads(nt, |th| {
         let mut narrow: [Side<u32>; 2] = [Side::new(n), Side::new(n)];
         let mut wide: [Side<u64>; 2] = [Side::new(n), Side::new(n)];
         loop {
             let q = next.fetch_add(1, Relaxed);
-            let Some(&i) = order.get(q) else { return };
+            let Some(&i) = order.get(q) else {
+                return drop_pages(text, th, nt); // while the last searches run
+            };
             let ((s0, t0), (s, t)) = (queries[i], ends[i]);
             if s0 == t0 {
                 unsafe { *ansr.at(i) = 0 };
@@ -634,7 +627,7 @@ fn main() {
         }
     });
     // Free the graph on every thread at once rather than at exit on one.
-    release(nt, &[off, adj, &roff, &radj]);
+    on_threads(nt, |t| [off, adj, &roff, &radj].iter().for_each(|b| drop_pages(b, t, nt)));
 
     // INF prints as -1 (u64::MAX as i64); every real distance is below 2^63.
     let out: String = ans.iter().map(|&a| format!("{}\n", a as i64)).collect();
