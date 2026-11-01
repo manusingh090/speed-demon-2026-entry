@@ -52,7 +52,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 44b | Step 44's code again in later runs (best) | run-a5cbcba2db02 | 0.0203 s | 18.1 MiB | 84.84 |
 | 45 | New program: hours closed while the log is parsed, text written as soon as earlier hours are sized, redo with every hour open if any line is too late | run-768708337db7 | 0.0220 s | 18.5 MiB | 83.48 |
 | 46 | Back to step 44's code | pending | | | |
-| 47 | Step 44 with the SIMD latency decoder dropped: latencies of 8 or more digits (rare) read digit by digit | pending | | | |
+| 47 | Step 44 with the SIMD latency decoder dropped: latencies of 8 or more digits (rare) read digit by digit | run-23037798f1c8 | 0.0226 s | 17.6 MiB | 83.92 |
+| 48 | Diagnostic: step 47 with the time from main's start to the end of the parse reported through M (one page per 4 us, touched after the output is complete) | pending | | | |
 
 ## Local measurements
 
@@ -176,6 +177,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 45 on the board, and step 46.** run-768708337db7: 0.0220 s, 18.5 MiB, 391 lines, 83.48 points, in a normal run (Track C's unchanged code at its usual 0.0284 s). The box agreed with the laptop: memory did not fall, since the closing of each hour still waits for the earliest pieces and the output's pages fill while the open hours' records are held, and the extra 47 lines cost on top. Step 46 is step 44's code again.
 
 **Step 46 to 47.** Two more ideas from the literature pass, measured. (1) The memcg charge batch (each CPU that faults memory pre-charges up to 64 pages): a test build that touched every record page from one thread before the workers started, so no worker faulted any, peaked at 17.9 MB against 18.1 MB, so at our peak the batches cost little and the idea goes. (2) Since step 40 the 64-bit word decodes every latency of up to 7 digits, so the SIMD decoder only ever saw latencies of 10 seconds or more. Those are now read digit by digit, and the decoder's 12 lines go. Same hash on all six datasets and 10 repeated full runs; three `perf stat` rounds: 662M user instructions against 668M, cycles 371 to 380M against 380 to 393M. 325 counted lines against 337.
+
+**Step 47 on the board, and step 48.** run-23037798f1c8: 0.0226 s, 17.6 MiB, 332 lines, 83.92 points, in a run about 10% slow for every track (Track C's unchanged code took 0.0314 s against its usual 0.0284 s). Measured and dropped since: (1) a group's three ranks by a 19-comparator sorting network for 8 or fewer values and by one windowed pass for over 128 (a sorted sample of 64 brackets each rank; values inside each bracket are copied and selected among): correct, but 65M more instructions and more cycles than the chained quickselects; (2) a 4,096-slot endpoint table, half the size, to fit the L1 cache: cycles level, 0.2M more branch misses from collisions. An instruction profile of the parse puts the largest stall (17% of its samples) just after the table slot load and 7% after the first load of each line, at about 1.7 instructions per cycle, so the parse waits on memory more than it lacks instructions. Step 48 measures the parse's share on the box with the memory clock of step 37.
 
 ## Tried and kept out
 
