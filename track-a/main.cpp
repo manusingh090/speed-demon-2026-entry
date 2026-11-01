@@ -239,15 +239,7 @@ struct Parser {
   }
 };
 
-#include <time.h>
-static long now_us() {
-  timespec t;
-  clock_gettime(CLOCK_MONOTONIC, &t);
-  return t.tv_sec * 1000000L + t.tv_nsec / 1000;
-}
 int main() {
-  const long t0 = now_us();
-  long t_hours = 0;
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
   int in = open("/data/requests.log", O_RDONLY);
@@ -310,7 +302,6 @@ int main() {
   // too, are spread over all of them).
   std::vector<int> order(HOURS);
   std::barrier ranked(nt, [&]() noexcept {
-    t_hours = now_us() - t0;
     for (int h = 0; h < HOURS; ++h) {
       u32 n = filled[h];
       for (auto &ps : parsers)
@@ -427,10 +418,4 @@ int main() {
   for (auto &th : pool)
     th.join();
   close(out);
-  // Diagnostic only: M grows by one page per 4 us from main's start to the end of the parse.
-  long pages = t_hours / 4;
-  char *pad = (char *)mmap(nullptr, pages * 4096 + 4096, 3,
-                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  for (long i = 0; i < pages; ++i)
-    pad[i * 4096] = 1;
 }
