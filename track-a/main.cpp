@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <memory>
+#include <numeric>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -274,6 +275,9 @@ int main() {
   // sizes before it arrives, while its chunks are still in its cache.
   std::atomic_flag ranking;
   std::vector<std::atomic<u32>> count(HOURS);
+  // Hours are claimed in clock order, so their chunks go back in order, but
+  // the last day's, the largest, go largest first so none of them starts last.
+  std::vector<int> order(HOURS);
   auto rank_names = [&] {
     std::vector<std::pair<std::string_view, u32>> by_name;
     for (u32 i = 0; i < Names::SLOTS; ++i)
@@ -287,6 +291,9 @@ int main() {
   std::barrier ranked(nt, [&]() noexcept {
     for (auto &n : count)
       most = std::max(most, n.load());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.end() - 24, order.end(),
+              [&](int a, int b) { return count[a] > count[b]; });
     if (names.size() != endpoints.count)
       rank_names();
   });
@@ -339,7 +346,8 @@ int main() {
         const u32 ne = names.size();
         std::vector<u32> start(ne + 1), errors(ne), cursor(ne);
         std::unique_ptr<u32[]> latency(new u32[most]);
-        for (int h; (h = claim++) < HOURS;) {
+        for (int i; (i = claim++) < HOURS;) {
+          int h = order[i];
           std::fill(start.begin(), start.end(), 0);
           std::fill(errors.begin(), errors.end(), 0);
           // Counting sort of the hour's latencies by endpoint rank.
