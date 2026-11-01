@@ -6,15 +6,15 @@
 //     sees. Countries get indices 1..N in code order (0 is _UNMATCHED).
 //  2. Each thread fills its slice of a direct table region_id -> country index.
 //  3. records.csv is split at CRLFs: the generator never writes a CR inside
-//     quotes, so the byte after a CRLF always starts a record. Each record is
-//     read field by field: the id's comma is found in one 8-byte word, a quoted
-//     field's end by stepping through the bit mask of its quotes (a "" pair is
-//     an escape), so commas and LFs inside quotes cost nothing, and the region's
-//     comma and the LF in one 32-byte compare each. Numbers are decoded
-//     eight digits at a time. Sums go to the thread's own per-country totals. Names
-//     go through a shared lock-free intern table to dense ids, which are marked
-//     in one bitset per country; both steps are prefetched records ahead. A
-//     mark that sets a new bit adds one to the country's distinct names.
+//     quotes, so the byte after a CRLF always starts a record. The file is
+//     classified 64 bytes at a time into masks of quotes and of the commas and
+//     LFs outside quotes, and the separators listed a chunk at a time; each
+//     record then takes five of them. A text field's length comes from its
+//     quote count, and the id, region and amount are decoded together in one
+//     vector. Sums go to the thread's own per-country totals. Names go through
+//     a shared lock-free intern table to ids, which are marked in one bitset
+//     per country; both steps are prefetched records ahead. A mark that sets a
+//     new bit adds one to the country's distinct names.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -81,13 +81,6 @@ u64 load8(const char* p) {
     return v;
 }
 
-// Bit i is set when byte i of the 32 at p equals c.
-u32 match32(const char* p, char c) {
-    __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-    return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
-}
-
-
 // The value of the last n (1 to 8) of the eight digit bytes in v (the first
 // byte is the lowest): reduced to digit values, the bytes before them masked
 // to leading zeros, then folded in pairs, quads and halves.
@@ -100,66 +93,6 @@ u64 fold(u64 v, size_t n) {
 
 // The value of the 1 to 8 decimal digits in [s, e).
 u64 digits(const char* s, const char* e) { return fold(load8(e - 8), e - s); }
-
-// An amount's value in cents, from its digits [s, e) with the dot third from
-// the end: at most 7 digits (99999.99), so the eight bytes ending at e, with
-// the dot's byte dropped, are one number.
-u64 money(const char* s, const char* e) {
-    u64 w = load8(e - 8);
-    return fold((w & 0xFFFFFFFFFF) << 8 | (w & 0xFFFF000000000000), e - s - 1);
-}
-
-// The first c at or after p (one is known to follow). 64 bytes at a time:
-// a note is often longer than 32, and the loop's exit is then predictable.
-[[gnu::always_inline]] inline const char* find(const char* p, char c) {
-    for (;; p += 64)
-        if (u64 m = match32(p, c) | u64(match32(p + 32, c)) << 32) return p + __builtin_ctzll(m);
-}
-
-// The comma after a number of at most 7 digits starting at p: the lowest zero
-// byte of the 8 bytes at p XOR ','.
-const char* comma_after(const char* p) {
-    u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2C;
-    return p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
-}
-
-// The text field (name or note) at p, moving p past its comma: its raw bytes
-// (between the quotes, if quoted) and its value's length (one byte less per
-// "" pair).
-struct Text {
-    const char* at;
-    u32 raw, length;
-};
-
-[[gnu::always_inline]] inline Text text(const char*& p) {
-    const char* s = p;
-    if (*s != '"') {
-        p = find(s, ',') + 1;
-        return {s, u32(p - 1 - s), u32(p - 1 - s)};
-    }
-    // The quotes after the opening one, 64 bytes at a time, are stepped
-    // through on their bit mask: a quote followed by another is a "" pair,
-    // the first one that is not closes the field.
-    u32 pairs = 0;
-    const char* q = s + 1;
-    for (u64 m = match32(q, '"') | u64(match32(q + 32, '"')) << 32;;) {
-        u32 i = m ? __builtin_ctzll(m) : 64;
-        if (i >= 63) {  // none, or the byte after it is out of view: move on
-            q += i;
-            m = match32(q, '"') | u64(match32(q + 32, '"')) << 32;
-            continue;
-        }
-        if (!(m >> (i + 1) & 1)) {
-            q += i;
-            break;
-        }
-        ++pairs;
-        m &= m - 1;
-        m &= m - 1;
-    }
-    p = q + 2;
-    return {s + 1, u32(q - s - 1), u32(q - s - 1 - pairs)};
-}
 
 // Names, interned by their raw bytes between the quotes. Escaping is one to
 // one, so equal raw bytes mean equal values (and the empty name is one value
@@ -244,6 +177,39 @@ struct NamesSeen {
     }
 };
 
+// The id, region and amount of a record at once, from the eight bytes ending
+// at each: one 64-bit lane each, the bytes before the number (the low ones)
+// masked off so they read as leading zeros, then digit pairs, quads and
+// halves folded with multiply-adds. The amount's dot is dropped first: at
+// most 7 digits (99999.99), so its eight bytes less the dot are one number.
+struct Numbers {
+    u32 id, region, cents;
+};
+
+[[gnu::always_inline]] inline Numbers numbers(const char* id_at, const char* id_end, const char* region_at,
+                                              const char* region_end, const char* amount_at, const char* amount_end) {
+    u64 w = load8(amount_end - 8);
+    u64 amount = (w & 0xFFFFFFFFFF) << 8 | (w & 0xFFFF000000000000);
+    __m256i v = _mm256_set_epi64x(0, amount, load8(region_end - 8), load8(id_end - 8));
+    __m256i shift = _mm256_set_epi64x(64, 8 * (9 - (amount_end - amount_at)), 8 * (8 - (region_end - region_at)),
+                                      8 * (8 - (id_end - id_at)));
+    v = _mm256_and_si256(v, _mm256_sllv_epi64(_mm256_set1_epi8(0x0F), shift));
+    v = _mm256_maddubs_epi16(v, _mm256_set1_epi16(0x010A));        // 10 * first + second
+    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x00010064));        // 100 * first + second
+    v = _mm256_packus_epi32(v, v);                                  // the quads as 16-bit words
+    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x00012710));        // 10000 * first + second
+    __m128i lo = _mm256_castsi256_si128(v);
+    return {u32(_mm_cvtsi128_si32(lo)), u32(_mm_extract_epi32(lo, 1)),
+            u32(_mm_cvtsi128_si32(_mm256_extracti128_si256(v, 1)))};
+}
+
+// Bit i is set when byte i of the 64 at p equals c.
+[[gnu::always_inline]] inline u64 mask64(__m256i a, __m256i b, char c) {
+    __m256i v = _mm256_set1_epi8(c);
+    return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, v))) |
+           u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)))) << 32;
+}
+
 // Parse every record that starts in [p, end). A record's region row and name
 // slot are prefetched when it is parsed; LAG records later its country is
 // read, its sums go to totals, its name is looked up and that name's bitset
@@ -280,36 +246,75 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         }
     };
 
+    // The file is read a chunk of 64-byte blocks at a time, each chunk from
+    // a record's start. A block is classified at once: a bit mask each of
+    // quotes, commas and LFs; the bytes inside quotes are those after an odd
+    // number of quotes, the prefix XOR of the quote mask (a carry-less
+    // multiply by all ones), carried from block to block (a "" pair turns
+    // quoting off and on again, so it needs no care). The separators, the
+    // commas and LFs outside quotes, go to an array in order, eight written
+    // per block whether there are that many or not; then the chunk's whole
+    // records are read from it, five separators each, and the next chunk
+    // starts at the first record not whole. A field's value is its bytes
+    // less one per quote pair, less the outer quotes of a quoted one: it has
+    // 2 + 2k quotes for k escapes, or none.
+    constexpr u32 CHUNK = 64;
+    u32 at[CHUNK * 64 + 9];  // separator offsets from the chunk's start
+    u64 qmask[CHUNK];
+    u32 qbefore[CHUNK];
     while (p < end) {
-        // The file's pages are scattered in memory, and the hardware prefetcher
-        // stops at each 4 KB page; this reaches into the next one in time.
-        _mm_prefetch(p + 2048, _MM_HINT_T0);
-        if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
-        const char* f1 = comma_after(p);
-        u64 id = digits(p, f1);
-        p = f1 + 1;
-        Text name = text(p), note = text(p);
-        // The region (at most 7 digits) and the amount (at most 9 bytes) end
-        // within the 32 bytes at p, so one load gives both the comma and the
-        // LF, if any.
-        u32 lf = match32(p, '\n');
-        const char* f4 = p + __builtin_ctz(match32(p, ','));
-        u64 region = digits(p, f4);
-        const char* amount = f4 + 1;
-        const char* eol = lf ? p + __builtin_ctz(lf) : file_end;
-        const char* amount_end = eol - (eol[-1] == '\r');
-        bool negative = *amount == '-';
-        i64 cents = money(amount + negative, amount_end);
-        if (negative) cents = -cents;
+        const u32 blocks = std::min<u64>(CHUNK, (end - p + 63) / 64);
+        u32 seps = 0, quotes = 0;
+        u64 inside = 0;
+        for (u32 b = 0; b < blocks; ++b) {
+            const char* block = p + 64 * b;
+            _mm_prefetch(block + 2048, _MM_HINT_T0);
+            __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
+            __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block + 32));
+            u64 q = mask64(lo, hi, '"');
+            u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0)) ^ inside;
+            inside = u64(i64(in) >> 63);
+            u64 m = (mask64(lo, hi, ',') | mask64(lo, hi, '\n')) & ~in;
+            qmask[b] = q;
+            qbefore[b] = quotes;
+            quotes += __builtin_popcountll(q);
+            u32 count = __builtin_popcountll(m), *out = at + seps;
+            for (int k = 0; k < 8; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
+            for (int k = 8; m; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
+            seps += count;
+        }
+        // The final record may end at end of file without a terminator.
+        if (p + 64 * blocks >= file_end) at[seps++] = file_end - p;
+        auto quotes_before = [&](u32 x) { return qbefore[x / 64] + __builtin_popcountll(_bzhi_u64(qmask[x / 64], x % 64)); };
+        const char* chunk = p;
+        for (u32 i = 0; i + 5 <= seps && p < end; i += 5) {
+            if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
+            const char *f1 = chunk + at[i], *f2 = chunk + at[i + 1], *f3 = chunk + at[i + 2];
+            const char *f4 = chunk + at[i + 3], *eol = chunk + at[i + 4];
+            u32 q1 = quotes_before(at[i]), q2 = quotes_before(at[i + 1]), q3 = quotes_before(at[i + 2]);
+            u32 qname = q2 - q1, qnote = q3 - q2;
+            u32 name_field = f2 - f1 - 1, note_field = f3 - f2 - 1;
+            u32 quoted = qname != 0;
+            const char* name_at = f1 + 1 + quoted;
+            u32 name_raw = name_field - 2 * quoted;
+            u32 name_length = name_field - qname / 2 - quoted;
+            u32 note_length = note_field - qnote / 2 - (qnote != 0);
+            const char* amount = f4 + 1;
+            const char* amount_end = eol - (eol[-1] == '\r');
+            bool negative = *amount == '-';
+            Numbers num = numbers(p, f1, f3 + 1, f4, amount + negative, amount_end);
+            u64 id = num.id, region = num.region;
+            i64 cents = negative ? -i64(num.cents) : i64(num.cents);
 
-        // Region ids are below 10^7 (fit u32); one past the table means none.
-        u32 r = region < regions ? u32(region) : u32(regions);
-        _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
-        advance();
-        u64 key = NameTable::key(name.at, name.raw);
-        pending[n++ % LAG] = {key, r, u32(id), name.length, note.length, cents};
-        names.prefetch(key);
-        p = eol + 1;
+            // Region ids are below 10^7 (fit u32); one past the table means none.
+            u32 r = region < regions ? u32(region) : u32(regions);
+            _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
+            advance();
+            u64 key = NameTable::key(name_at, name_raw);
+            pending[n++ % LAG] = {key, r, u32(id), name_length, note_length, cents};
+            names.prefetch(key);
+            p = eol + 1;
+        }
     }
     for (last = n; n < last + 2 * LAG; ++n) advance();
 }
