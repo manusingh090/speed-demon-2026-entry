@@ -210,7 +210,7 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>) -> *const u8 {
                 }
                 len = next;
             }
-            m &= (!0u64).checked_shl(s + len).unwrap_or(0); // the tokens after this one
+            m &= m.wrapping_add(m & m.wrapping_neg()); // clears this token's run of bits
             let k = match len {
                 ..=32 => key(p.add(s as usize), len as usize),
                 _ => _mm256_setzero_si256(), // no term, but it still parts its neighbours
@@ -459,8 +459,9 @@ fn main() {
     let nterms = terms.keys.len();
     assert!(nterms <= BUCKETS << 12, "too many terms"); // a unit's index has 12 bits
     let mut in_bool = vec![false; nterms];
-    for &(phrase, from, to) in spans.iter().filter(|s| !s.0) {
-        ids[from as usize..to as usize].iter().for_each(|&id| in_bool[id as usize] = !phrase);
+    for &(_, from, to) in spans.iter().filter(|s| !s.0) {
+        let r = from as usize..to as usize;
+        ids[r].iter().for_each(|&id| in_bool[id as usize] = true);
     }
 
     let text = map("/data/docs.txt");
@@ -499,7 +500,8 @@ fn main() {
     // Each phrase's anchor, its rarest term: (anchor, query, position).
     let (mut anchored, mut anchor) = (vec![], vec![false; nterms]);
     for (q, &(_, from, to)) in spans.iter().enumerate().filter(|s| s.1 .0) {
-        let j = (from..to).min_by_key(|&j| df[ids[j as usize] as usize]).unwrap();
+        let rarity = |j: &u32| df[ids[*j as usize] as usize];
+        let j = (from..to).min_by_key(rarity).unwrap();
         anchored.push((ids[j as usize], q as u32, j - from));
         anchor[ids[j as usize] as usize] = true;
     }
@@ -614,7 +616,7 @@ fn main() {
     let (mut seg, mut start, mut end) = (vec![0u16; lists * THREADS], vec![0u32; lists], 0);
     for i in (0..BUCKETS).flat_map(|b| (b..lists).step_by(BUCKETS)) {
         let s = &mut seg[i * THREADS..][..THREADS];
-        s.iter_mut().zip(&scans).for_each(|(n, scan)| *n = scan.0[i]);
+        s.iter_mut().zip(&scans).for_each(|(n, c)| *n = c.0[i]);
         (start[i], end) = (end, end + s.iter().map(|&n| n as u32).sum::<u32>());
     }
     // Written by every thread at its own positions; relaxed stores are plain stores.
@@ -681,8 +683,8 @@ fn main() {
                 let end = at + found[at..].partition_point(|m| m.0 == q as u32);
                 Docs::List(found[at..end].iter().map(|m| m.1).collect())
             } else {
-                let cur = docs(tids[0]);
-                ops.iter().zip(&tids[1..]).fold(cur, |cur, (&op, &id)| match &cur {
+                let (cur, steps) = (docs(tids[0]), ops.iter().zip(&tids[1..]));
+                steps.fold(cur, |cur, (&op, &id)| match &cur {
                     Docs::List(v) if v.is_empty() && op != b'O' => cur, // nothing left to narrow
                     _ => apply(cur, op, docs(id), words),
                 })

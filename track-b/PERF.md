@@ -46,7 +46,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 39 | The frequency sample reads the first 1/64 of each thread's share instead of 1/32 | run-b3fbbbcbb03a | 0.216 | 48.4 | 70.53 |
 | 40 | Count and position sum of a bitmap answer with AVX2, four words at a time; the sample back to 1/32 | run-393a2f308eda (with 41) | | | |
 | 41 | OR of two lists totalling over 2,048 documents goes into a bitmap | run-393a2f308eda | 0.178 | 47.1 | 72.52 |
-| 42 | The same code in 602 counted lines instead of 671: bitmaps padded to whole vectors, and long chains and tuples split where rustfmt would wrap them | pending | | | |
+| 42 | The same code in 602 counted lines instead of 671: bitmaps padded to whole vectors, and long chains and tuples split where rustfmt would wrap them | run-74dca041f2ff | 0.178 | 47.1 | 72.84 |
+| 43 | Six more statements that rustfmt would wrap, written short (596 lines) | pending (with 44) | | | |
+| 44 | A token's bits cleared from the window mask by adding its lowest bit (`m & (m + (m & -m))`) instead of a checked shift | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -185,10 +187,18 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 
 **Step 42.** A local count now matches the board exactly (rustfmt 1.10, then `scc` over the source and the Dockerfile: 620 for step 38, 671 for step 41). rustfmt's default heuristics split a method chain over 60 characters, a struct literal over 18 and an `if`/`else` over 50, which added 66 lines at 28 places. The bitmaps are now padded to whole 4-word vectors (so `bit_sums` needs no scalar tail), its masks come from one formula and its table is 16 bytes, and fifteen long chains and tuples became two short statements each. 602 lines, same hashes, same instructions to within 1%.
 
+**Step 42 on the board.** run-74dca041f2ff: 0.1782 s, 47.1 MiB, 602 lines, K 28.62 and 72.84 points, the best Track B run so far.
+
+**Measuring in this VM.** Sampled profiles here capture only a few percent of the retired instructions and attribute them unevenly between threads, so they were misleading twice (the per-document handler closure looked like the scatter). Phase costs now come from switching parts off and counting user cycles, and the scan alone from per-thread CPU clocks summed over threads: about 1,050 ms of CPU, of which tokenizing and lookups are about 550, the bitmap bits about 120, the last-document marks about 170, and anchors with their phrase checks about 170.
+
+**Step 44.** Adding a word's lowest set bit carries through the token's run of bits, so `m & (m + lowest)` clears exactly that token, with no special case when it reaches bit 63. 2.5% fewer instructions, no new lines.
+
 Measured and kept out this session (from step 36 on):
 - OR of two long lists into a bitmap (over 1,024 or 4,096 documents): more cycles, since the bitmap results cost more to count and sum.
 - A 1 MB slot table instead of 2 MB: longer probes, 3% more cycles.
 - A second prefetch stage for the term key (the slot of the token four back has arrived by then): same cycles. The tokenizer is limited by how many misses can be in flight, not by any one miss.
+- The token's end taken from the same carry (trailing zeros of `m + lowest`): 0.24% fewer instructions for 4 more lines.
+- Phrase windows compared inline, stopping at the first other term, instead of a slice compare that calls `bcmp`: same scan time.
 - A per-document bitset of the list terms seen (7.5 KB, in L1) instead of the 150 KB last-document marks: 6% more instructions, same cycles.
 
 Measured and kept out this session:
