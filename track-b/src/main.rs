@@ -127,13 +127,15 @@ struct Terms {
 impl Terms {
     fn find(&self, k: __m256i, h: usize) -> u32 {
         let mask = self.slot.len() - 1;
+        let key = |s: u64| unsafe { *self.keys.get_unchecked(s as u32 as usize - 1) };
         let mut i = h & mask;
         loop {
-            match self.slot[i] {
-                0 => return self.keys.len() as u32,
-                s if s >> 32 == h as u64 >> 32 && same(self.keys[s as u32 as usize - 1], k) => return s as u32 - 1,
-                _ => i = (i + 1) & mask,
+            // i is masked, and a slot holds 0 or the id + 1 of a stored key.
+            let s = unsafe { *self.slot.get_unchecked(i) };
+            if s == 0 || s >> 32 == h as u64 >> 32 && same(key(s), k) {
+                return (s as u32).wrapping_sub(1).min(self.keys.len() as u32);
             }
+            i = (i + 1) & mask;
         }
     }
 
@@ -190,13 +192,16 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
     const LAG: usize = 8;
     let mut ring = [(_mm256_setzero_si256(), 0); LAG];
-    let mut look = |r: &(__m256i, usize)| {
-        let id = t.find(r.0, r.1);
-        _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
-        ids.push(id);
-    };
-    let mut n = 0usize;
+    let (mut n, mut out) = (0usize, ids.len());
     loop {
+        // A window adds at most 32 ids, and the document's end LAG more.
+        (ids.set_len(out), ids.reserve(32 + LAG));
+        let buf = ids.as_mut_ptr();
+        let mut look = |r: &(__m256i, usize)| {
+            let id = t.find(r.0, r.1);
+            _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
+            (*buf.add(out), out) = (id, out + 1);
+        };
         let (word, nl) = classes(p);
         let stop = if nl != 0 { nl.trailing_zeros() } else { 64 }; // the window's bytes in this document
         let mut m = word & ((1u128 << stop) - 1) as u64;
@@ -228,6 +233,7 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
         }
         if nl != 0 {
             (n.saturating_sub(LAG)..n).for_each(|i| look(&ring[i % LAG]));
+            ids.set_len(out);
             return p.add(stop as usize + 1);
         }
         p = p.add(next as usize);
