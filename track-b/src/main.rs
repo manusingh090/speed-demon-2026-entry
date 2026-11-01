@@ -7,6 +7,7 @@ use std::sync::{Barrier, Mutex, OnceLock};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
     fn _exit(status: i32) -> !;
@@ -137,7 +138,7 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 }
 
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
-    const LAG: usize = 8;
+    const LAG: usize = 16;
     let mut ring = [0u64; LAG];
     let (mut n, mut out, mask) = (0usize, ids.len(), t.slot.len() - 1);
     loop {
@@ -364,9 +365,8 @@ fn main() {
     unsafe { (mallopt(-3, 1 << 16), prctl(41, 1u64, 0u64, 0u64, 0u64)) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
-    let raw = vec![0u64; n + 8].leak();
-    let at = raw.as_ptr().align_offset(64);
-    let slot = &mut raw[at..][..n];
+    // Mapped on its own, so it is page aligned and can be handed back after the scan.
+    let slot = unsafe { std::slice::from_raw_parts_mut(mmap(std::ptr::null_mut(), n * 8, 3, 0x22, -1, 0).cast(), n) };
     let mut terms = Terms { slot, n: 0 };
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
@@ -510,7 +510,7 @@ fn main() {
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
     });
-    drop(terms);
+    unsafe { munmap(terms.slot.as_mut_ptr().cast(), terms.slot.len() * 8) };
 
     let (mut seg, mut start, mut end) = (vec![0u16; lists * THREADS], vec![0u32; lists], 0);
     for i in (0..BUCKETS).flat_map(|b| (b..lists).step_by(BUCKETS)) {
