@@ -235,6 +235,10 @@ struct Parser {
             hr = (p[11] - '0') * 10 + p[12] - '0';
         h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18, stamp = at;
       }
+      // The log streams through once; fetching it 1 KB ahead with the
+      // non-temporal hint keeps it from pushing the endpoint table and the
+      // names out of the core's caches.
+      _mm_prefetch(p + 1024, _MM_HINT_NTA);
       const char *m = p + 28;
       u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
       const char *name = m + __builtin_ctzll(sp) + 1;
