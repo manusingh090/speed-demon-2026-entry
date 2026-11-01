@@ -53,7 +53,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 46 | Term lookup without bounds checks; token ids written into room reserved once per 64-byte window | pending | | | |
 | 47 | All threads unmap (`MADV_DONTNEED`) their share of docs.txt right after the scan, instead of the whole 254 MB being torn down at exit by one thread | run-47fab754c7f7 | 0.174 | 47.3 | 72.97 |
 | 48 | Diagnostic: step 46's code with every query answered twice, the first answers overwritten (same output), so the extra time is the answer phase's cost on the box | run-4cf5b8934429 | 0.193 | 47.4 | 71.87 |
-| 49 | Diagnostic: the query parse done twice, the first time into tables that are then dropped (same output) | pending | | | |
+| 49 | Diagnostic: the query parse done twice, the first time into tables that are then dropped (same output) | run-6b36d19e3be3 | 0.189 | 47.2 | 72.06 |
+| 50 | Queries parsed on all threads, in line-aligned pieces joined in order, into a lock-free term table | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -226,6 +227,8 @@ Measured and kept out this session:
 **Step 47 on the board, and step 48.** run-47fab754c7f7: 0.174 s against 0.172 s, no gain here, so it goes. Step 48 measures the phases on the box instead, as on Track A: one phase done twice with the same output, the extra time being that phase's cost there. On the laptop the answer phase is 11 to 17 ms of 178.
 
 **Step 48 on the board, and step 49.** run-4cf5b8934429: 0.193 s against 0.172 s, so answering costs about 21 ms on the box, 12% of the run. Phase timers on the laptop then showed how much is serial: parsing the 50,000 queries into the term table 10 to 24 ms on one thread, the frequency sample 6 to 14 ms (parallel), sorting and renumbering the terms 7 to 10 ms on one thread, then the scan 85 to 140 ms, the scatter 14 to 30 ms and the answers 15 to 21 ms. Within the scan the twelve fixed shares end unevenly (fastest 129 ms, slowest 155 ms in one run): the slowest share sets the end for all. Step 49 measures the serial query parse on the box.
+
+**Step 49 on the board, and step 50.** run-6b36d19e3be3: 0.189 s against 0.172 s, so the query parse costs about 17 ms on the box, all of it on one thread while eleven wait. Now the queries file is cut into twelve line-aligned pieces, one per thread, and each thread's spans, ids and operators are joined in order afterwards (query numbers are unchanged). The term table is shared: a free slot is claimed with a compare-and-swap to a busy mark, the next id comes from an atomic counter, its key is written into room reserved up front (pages charged only as written) and the slot is then published; a thread that meets a busy slot waits for it, so a key is never inserted twice and ids stay dense. Ids now depend on timing, but only the layout follows from them: terms are renumbered by class and frequency before the scan, and no answer depends on an id. Same hash on all six datasets; 20 repeated runs each on full and sample gave one hash. Laptop phase timers: queries 10 to 13 ms against 12 to 24 (the rest is the pool's start and the table's first page faults), whole run 148 to 165 ms against 157 to 276 over five runs each.
 
 ## What the profile said, step by step
 
