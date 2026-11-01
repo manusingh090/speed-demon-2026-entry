@@ -49,6 +49,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 26 | Edge offsets packed: a u32 per 8 nodes and a byte per node (plain u32s if a group overflows a byte), for the old, new and reverse graphs | run-388cd0d32097 | 0.157 s | 55 MiB | 69.68 |
 | 26d | Diagnostic: time to the end of the parse reported through M | run-806bba02eb3c | (0.246 s) | (222 MiB) | |
 | 27 | Back to step 26's code | pending | | | |
+| 28 | Reverse graph counted and placed with plain increments, each thread owning its share's nodes; edges into another share handed over | pending | | | |
 
 ## What the profile said, step by step
 
@@ -145,6 +146,8 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Steps 24 to 26 on the board.** Step 24, run-0a2518f20cca: 0.158 s, 63 MiB, 69.27 points. Step 25, run-c59f249b924d: 0.161 s, 61 MiB, 69.15. Step 26, run-388cd0d32097: 0.157 s, 55 MiB (from 61, as measured locally), 649 lines, 69.68 points, the best so far.
 
 **Second diagnostic.** The same trick with the mark at the end of the parse: run-806bba02eb3c reported 233,181,184 bytes, so on the box the parse (with exec and reading the queries) ends about 18 ms in. With the first diagnostic, the box's 0.157 s is about 18 ms of parse, about 67 ms from the parse to the first search (part build, blob order, ids, renumbering, reverse graph) and about 70 ms of searches, release and exit. Step 27 is step 26's code again.
+
+**Step 27 to 28.** Single-CPU phase costs (one thread doing everything, the steadiest measure on this laptop), in ms: parse 95, part build 40, blob order 135, ids 14, renumbering 100, reverse count 23, reverse placement 42, packing 5, searches 600. The reverse graph's 65 ms were mostly its 10 million locked read-modify-writes (an atomic add per edge to count, an atomic fetch-add per edge as the cursor). In blob order nearly every edge's head lies in the same thread's share of nodes as its tail, so each thread now counts and places the in-edges of its own share with plain increments, and an edge into another share is handed to that share's thread in a second short pass; no counter is ever touched by two threads. Reverse phase single-CPU 83 to 64 ms; six twelve-thread rounds: median 0.142 against 0.148 s, 60 ms less CPU. Same hash on all thirty datasets.
 
 ## Tried and kept out
 
