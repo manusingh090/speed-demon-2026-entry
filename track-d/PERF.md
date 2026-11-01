@@ -39,7 +39,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 17 | Back to step 15's code | run-6891f144a066 | 0.182 s | 66.5 MiB | 68.04 |
 | 18 | Distances stored as u32 (u64 rerun when the answer may not fit); graph pages released on all threads after the searches; graph.txt unmapped during them | run-c466ddb7873a | 0.193 s | 63.6 MiB | 67.21 |
 | 19 | graph.txt's pages dropped by each thread as it runs out of queries (`MADV_DONTNEED`), instead of one unmap at the start of the searches | run-f7b046478181 | 0.171 s | 63.4 MiB | 68.60 |
-| 20 | Out-degrees recorded while the blobs grow, so new ids and new offsets come from one pass (no degree scatter, no serial prefix sum); parse arenas dropped in parallel; claim flags prefetched in the blob BFS | pending | | | |
+| 20 | Out-degrees recorded while the blobs grow, so new ids and new offsets come from one pass (no degree scatter, no serial prefix sum); parse arenas dropped in parallel; claim flags prefetched in the blob BFS | run-a8aa780ac7a5 | 0.163 s | 63.4 MiB | 69.03 |
+| 21 | After each pop, the edge list of the node now on top of that side's queue is prefetched | pending | | | |
 
 ## What the profile said, step by step
 
@@ -108,6 +109,10 @@ Four interleaved `perf stat -r 5` rounds: 0.167 to 0.170 s against 0.197 to 0.22
 **Step 19 on the board.** run-f7b046478181: 0.171 s, 63.4 MiB, 575 counted lines, 68.60 points, in a run where Track A's unchanged code measured 0.0236 s against its best of 0.0209 s (a slow box). So step 18's 0.193 s was the unmap at the start of the searches, and the u32 distances and the parallel release are kept.
 
 **Step 19 to 20.** Phase timers (medians of 9, ms): parse 22.4, part build 6.9, dropping the parse arenas 3.8 (one thread, between phases), blobs 20.5, new ids 3.6, degree scatter 2.4, prefix sum 1.2 (serial), renumbering 18.4, reverse count 3.8, its prefix sum 1.6, reverse fill 6.5, searches 82, release 2.6. Every node's edges are read once while the blobs grow, so the blob phase now records each node's out-degree next to it in the chain; the pass that numbers the chains writes the new offsets from those as it goes (a chain's first edge is the sum of the degrees in the chains before it), which removes the degree scatter and the serial prefix sum. Each thread also drops its own parse arena with `MADV_DONTNEED` at the start of the blob phase, instead of one thread unmapping all twelve after the build, and the BFS prefetches the claim flags of the heads two queue entries ahead (their edge lists were fetched two entries before). Peak memory is unchanged: the degree lists (7 MB) live only through the blob and id phases, where the build holds about 57 MB against 61 MB in the renumbering. From the end of the part build to the end of the renumbering, 44.1 to 41.3 ms; whole run 170 to 163 ms (medians of 9); four `perf stat -r 5` rounds 0.158 to 0.172 s against 0.179 to 0.220 s, 130 ms less CPU. 573 rustfmt lines against 567. Same hash on all twelve datasets.
+
+**Step 20 on the board.** run-a8aa780ac7a5: 0.163 s, 63.4 MiB, 581 counted lines, 69.03 points, the best Track D run so far, in a run where Track B and Track C's unchanged code were 6% and 11% over their best.
+
+**Step 20 to 21.** With the search at u32, the single-thread profile still put the largest stall on the first load of a settled node's edge list. A node's offsets are fetched when it is queued, so after each pop the edge list of the node now on top of the same queue (the next one this side settles) can be fetched while the current node's edges are relaxed. Single-thread search 700 to 815 ms down to 580 to 600; twelve threads, median of 8, 102 to 91 ms. Also fetching the edge lists of the top's four children (the candidates after that) was 3% faster on one thread but slower on twelve (median 72 against 68 ms over 10 runs), where the extra traffic competes, so only the top is fetched. Four `perf stat -r 5` rounds: faster than step 20 in each pair (0.162 to 0.218 s against 0.174 to 0.263 s on a busy laptop). Same hash on all twelve datasets; 4 more lines.
 
 ## Tried and kept out
 

@@ -267,6 +267,10 @@ impl<T: Len> Side<T> {
         let (off, adj, heavy, hb) = g;
         let (hmask, big) = ((1 << hb) - 1, u32::MAX >> hb);
         let (d, u) = self.queue.pop();
+        if let Some(&(_, next)) = self.queue.0.first() {
+            // Its offsets were fetched when it was queued; start on its edges.
+            prefetch(adj.as_ptr().wrapping_add(unsafe { *off.get_unchecked(next as usize) } as usize));
+        }
         let d: u64 = d.into();
         if d > self.dist.get(u) {
             return best;
