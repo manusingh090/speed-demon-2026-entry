@@ -79,7 +79,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 72 | Each bucket's lists written by one thread, from all twelve threads' streams of it | run-84779df0255b | 0.144 | 48.8 | 74.90 |
 | 73 | Back to step 67's code | (no run of its own) | | | |
 | 74 | Each anchor's phrases stored inline in one run of records, compared term by term without a call | run-31ee1537fce3 | 0.189 | 46.3 | 72.05 |
-| 75 | Step 67's code, each thread dropping its share of docs.txt's pages after the scan | pending | | | |
+| 75 | Step 67's code, each thread dropping its share of docs.txt's pages after the scan | run-20ca46853c3d | 0.141 | 45.3 | 75.37 |
+| 76 | Measurement only: step 75 with the answers computed twice | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -306,6 +307,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 74.** A profile by source line of step 67 puts a surprising share of the scan callback on the phrase checks: `spans[q]`, a random read of the query table for each phrase anchored at a term every time that term occurs, 3.6% of all cycles, then the phrase's ids elsewhere, then the comparison, a call to `bcmp` (libc's compare was 4.8% of all cycles, called from the scan). Some anchors are common words (a phrase made only of common words, or the spec's repeated runs), so these checks are many. Each anchor's phrases are now one run of records (query, anchor offset and length, the phrase's terms), read in sequence, and a window is compared term by term with an AND of the comparisons, which compiles to no call. On the laptop, busy with other work this hour, about 2% fewer cycles in two of three rounds. Same hash on all six datasets, 5 repeated full runs gave one hash.
 
 **Step 74 on the board, and step 75.** run-31ee1537fce3 (commit 4ff775e): 0.1893 s against 0.1437 s. Track C's run of the same commit was 5% slower than its best, so the box was a little slow then, but not by this much: the records lose, and with 20 more counted lines. Step 75 goes back to step 67's code and tries again what Tracks A and C gained 10 to 15% from on the box: each thread drops its share of the mapped docs.txt (`MADV_DONTNEED`) as soon as its scan ends, so the process's exit does not tear down the whole 254 MB mapping on one thread. Step 47 tried this with older code and saw no gain (0.174 against 0.172 s); the code around it has changed since. Same hash on all six datasets, 5 repeated full runs gave one hash.
+
+**Step 75 on the board, and step 76.** run-20ca46853c3d: 0.1412 s against 0.1437 s, the best Track B run so far at 75.37 even with 13 more counted lines (Track C's run of the same commit was at its usual time, so the box was not fast that minute). Step 76 measures the answer phase on the box as step 48 did for older code: the queries are answered twice and the first answers thrown away, so the rise in T is the phase's cost there.
 
 ## What the profile said, step by step
 

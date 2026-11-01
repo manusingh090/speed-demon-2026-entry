@@ -590,6 +590,8 @@ fn main() {
     let n = spans.len().div_ceil(64);
     let chunks: Vec<Mutex<String>> = (0..n).map(|_| Mutex::default()).collect();
     let next = AtomicUsize::new(0);
+    for _ in 0..2 {
+    next.store(0, Relaxed);
     on_threads(|_| loop {
         let k = next.fetch_add(1, Relaxed);
         let Some(chunk) = chunks.get(k) else { return };
@@ -612,6 +614,7 @@ fn main() {
         }
         *chunk.lock().unwrap() = out;
     });
+    }
     let file = std::fs::File::create("/out/results.txt").expect("/out/results.txt");
     let mut out = std::io::BufWriter::new(file);
     for c in chunks {
