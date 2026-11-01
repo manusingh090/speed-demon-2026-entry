@@ -78,6 +78,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 71 | Back to step 67's code | run-ef7dd1e26c7e | 0.144 | 44.7 | 75.30 |
 | 72 | Each bucket's lists written by one thread, from all twelve threads' streams of it | run-84779df0255b | 0.144 | 48.8 | 74.90 |
 | 73 | Back to step 67's code | pending | | | |
+| 74 | Each anchor's phrases stored inline in one run of records, compared term by term without a call | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -300,6 +301,8 @@ Measured and kept out this session:
 **Steps 71 and 72 on the board, a rewrite, and step 73.** run-ef7dd1e26c7e (commit 86582ce, step 67's code): 0.1437 s at 44.7 MiB, the best Track B run so far at 75.30. run-84779df0255b, the bucket-by-bucket scatter: 0.1439 s, the same time, at 48.8 MiB, so lines shared between threads are not what the scatter waits on, and it goes.
 
 A rewrite without posting lists was then built and measured, as the leader's 26 MB suggested one. Documents are taken 64 at a time; a BOOL term present in the block gets a 64-bit word with a bit per document holding it, and at the end of the block every BOOL query covered by a present term is evaluated on those words, left to right, its count, id sum (popcounts against six position masks) and first ten ids updated in place. A query can only match a document holding one of its cover terms (the first term; for `AND t` the rarer of the cover so far and t; for `OR t` both; for `NOT t` the cover), so only queries covered by a present term are evaluated: 18.7M evaluations at full scale against 53M for any term present. There are no lists, no scatter and no answer phase, and the peak fell to 33 MB. It gave the published hash on all six datasets on its first build, but ran in 330 ms on the laptop against 163: each evaluation reads several scattered words (the terms absent from the block are cold) and costs about two mispredictions, some 150 to 200 cycles in all even after the queries were copied into each cover term's list, deduplicated with a 4 KB bitset and folded without branches. 16.2M of the 18.7M evaluations come from queries whose covers are of middle frequency, so taking the commonest terms back to bitmaps would not have saved them. Kept out; step 73 is step 67's code again.
+
+**Step 74.** A profile by source line of step 67 puts a surprising share of the scan callback on the phrase checks: `spans[q]`, a random read of the query table for each phrase anchored at a term every time that term occurs, 3.6% of all cycles, then the phrase's ids elsewhere, then the comparison, a call to `bcmp` (libc's compare was 4.8% of all cycles, called from the scan). Some anchors are common words (a phrase made only of common words, or the spec's repeated runs), so these checks are many. Each anchor's phrases are now one run of records (query, anchor offset and length, the phrase's terms), read in sequence, and a window is compared term by term with an AND of the comparisons, which compiles to no call. On the laptop, busy with other work this hour, about 2% fewer cycles in two of three rounds. Same hash on all six datasets, 5 repeated full runs gave one hash.
 
 ## What the profile said, step by step
 
