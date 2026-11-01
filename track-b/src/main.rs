@@ -8,6 +8,7 @@ use std::sync::{Barrier, Mutex, OnceLock};
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
     fn _exit(status: i32) -> !;
@@ -360,11 +361,21 @@ impl Units {
 }
 
 fn main() {
-    unsafe { (mallopt(-3, 1 << 16), prctl(41, 1u64, 0u64, 0u64, 0u64)) };
+    unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
-    // Mapped on its own, so it is page aligned and can be handed back after the scan.
-    let slot = unsafe { std::slice::from_raw_parts_mut(mmap(std::ptr::null_mut(), n * 8, 3, 0x22, -1, 0).cast(), n) };
+    // Mapped on its own and handed back after the scan. Every token's lookup
+    // lands on a random line of it, so it is put on 2 MB pages (one TLB entry
+    // instead of 512), faulted in before huge pages are turned off for the rest,
+    // where a page written only in part would cost memory.
+    let slot = unsafe {
+        let len = (n * 8).next_multiple_of(1 << 21);
+        let raw = mmap(std::ptr::null_mut(), len + (1 << 21), 3, 0x22, -1, 0);
+        let p = raw.add(raw.align_offset(1 << 21));
+        (madvise(p, len, 14), std::ptr::write_volatile(p, 0));
+        prctl(41, 1u64, 0u64, 0u64, 0u64);
+        std::slice::from_raw_parts_mut(p.cast(), n)
+    };
     let mut terms = Terms { slot, n: 0 };
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
