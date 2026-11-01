@@ -84,7 +84,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 77 | Step 75's code with the page drop in fewer lines | run-8600f965283b | 0.153 | 44.6 | 74.60 |
 | 78 | One term of each phrase window compared before the whole window | run-c7c9af1cbbe1 | 0.140 | 44.7 | 75.57 |
 | 79 | Queries parsed on all threads, each table partition filled by one thread from per-partition lists | run-7a24fbd236a6 | 0.142 | 49.3 | 74.68 |
-| 80 | Step 78's code, the answers' numbers written by hand instead of with `write!` | pending | | | |
+| 80 | Step 78's code, the answers' numbers written by hand instead of with `write!` | run-35e2245a0253 | 0.143 | 46.5 | 75.08 |
+| 81 | Measurement only: after the scan, wait as long as its threads ended apart | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -323,6 +324,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 79.** The query parse runs on one thread while eleven wait. Step 59 parallelised it and lost because each partition's thread scanned all 152,904 hashes through a division to find its own. Now each thread parses a twelfth of `queries.txt` and files each term's place in a list per partition (a shift picks the partition); each of the 64 partitions is then claimed by one thread, which inserts that partition's terms from the twelve lists in query order (so ids do not depend on timing) and writes each id to an atomic per position; a serial pass of 150,000 entries adds the partitions' bases. Probes stay inside a partition (one more AND and OR per group step). The laptop's page faults hide this phase, so the box decides. Same hash on all six datasets, 8 repeated full runs gave one hash; 46.0 to 46.8 MB at peak on the laptop against 46.5 to 47.2.
 
 **Step 79 on the board, and step 80.** run-7a24fbd236a6: 0.1424 s, no faster than step 78's 0.1397 s, and 49.3 MiB against 44.7, as at step 59: each thread's first small allocations open a malloc arena of its own, which keeps what is freed. The serial parse is short enough on the box that sharing it does not pay. Step 80 goes back to step 78's code and writes the 600,000 numbers of the answers with a small digit loop instead of `write!` (2.1% of all cycles were in `line`, mostly in the formatting machinery): 42M fewer instructions on the laptop. Same hash on all six datasets, 5 repeated full runs gave one hash.
+
+**Step 80 on the board, and step 81.** run-35e2245a0253: 0.1431 s, within the box's spread of step 78 (Track C's run of the same commit was 2% slow too), so it stays for its fewer instructions. The user-mode cycles of a laptop run, spread over twelve threads at the box's 2.5 GHz, come to about 107 ms against the box's 140, so some 30 ms go to serial phases, the kernel and threads waiting; the largest unknown is how far apart the twelve scan threads finish on the box (on the laptop, 15 to 30 ms, mostly WSL2's scheduling). Step 81 measures it: each scan thread notes when it ends, and after the scan the main thread waits as long as the first and last ended apart, so the rise in T is that spread.
 
 ## What the profile said, step by step
 
