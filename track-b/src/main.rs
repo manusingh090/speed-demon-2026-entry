@@ -512,8 +512,11 @@ fn main() {
                 for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
                     let span = spans[q as usize];
                     let phrase = &ids[span.1 as usize..span.2 as usize];
-                    let s = at.wrapping_sub(j as usize);
-                    if toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
+                    // One term other than the anchor is compared first, so most
+                    // windows are turned down without the slice compare's call.
+                    let (s, e) = (at.wrapping_sub(j as usize), if j == 0 { phrase.len() - 1 } else { 0 });
+                    let near = toks.get(s.wrapping_add(e)) == phrase.get(e);
+                    if near && toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
                         mine.push((q, doc));
                     }
                 }

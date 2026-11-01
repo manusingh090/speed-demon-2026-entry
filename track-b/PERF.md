@@ -81,7 +81,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 74 | Each anchor's phrases stored inline in one run of records, compared term by term without a call | run-31ee1537fce3 | 0.189 | 46.3 | 72.05 |
 | 75 | Step 67's code, each thread dropping its share of docs.txt's pages after the scan | run-20ca46853c3d | 0.141 | 45.3 | 75.37 |
 | 76 | Measurement only: step 75 with the answers computed twice | run-2e8f3c3abd8b | 0.161 | 45.2 | 73.94 |
-| 77 | Step 75's code with the page drop in fewer lines | pending | | | |
+| 77 | Step 75's code with the page drop in fewer lines | run-8600f965283b | 0.153 | 44.6 | 74.60 |
+| 78 | One term of each phrase window compared before the whole window | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -312,6 +313,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 75 on the board, and step 76.** run-20ca46853c3d: 0.1412 s against 0.1437 s, the best Track B run so far at 75.37 even with 13 more counted lines (Track C's run of the same commit was at its usual time, so the box was not fast that minute). Step 76 measures the answer phase on the box as step 48 did for older code: the queries are answered twice and the first answers thrown away, so the rise in T is the phase's cost there.
 
 **Step 76 on the board, and step 77.** run-2e8f3c3abd8b: 0.1609 s against 0.1412 s, so answering the 50,000 queries costs about 20 ms on the box, 14% of the run (step 48 measured 21 ms on much older code). Step 77 is step 75's code with the page drop written in three lines instead of eleven formatted ones (`madvise` with a length of zero does nothing, so the guard goes): 623 counted lines against 633. Same hash on all six datasets, 5 repeated full runs gave one hash.
+
+**Step 77 on the board, and step 78.** run-8600f965283b: 0.1532 s against step 75's 0.1412 s for the same work, while Track C's run of the same commit moved 1.4%. Step 67's code has run at 0.1437, 0.1448 and 0.1474 s, so one Track B run on the box varies by several percent, and a single run cannot separate changes smaller than that; from here a change is kept when the laptop's counters and the board agree. An inclusive profile with call stacks (`perf record --call-graph dwarf`) then puts 6.2% of all cycles in the phrase windows' slice compare, mostly libc's `bcmp`, called at every occurrence of every anchor. Step 78 compares one term of the window other than the anchor first (the last if the anchor leads, else the first) and calls the slice compare only if it matches: 49M fewer instructions, and fewer cycles in two of three rounds on a busy laptop. Same hash on all six datasets, 5 repeated full runs gave one hash.
 
 ## What the profile said, step by step
 
