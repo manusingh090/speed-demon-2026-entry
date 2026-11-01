@@ -150,6 +150,18 @@ fn on_threads<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     out.into_iter().map(|r| r.into_inner().unwrap().unwrap()).collect()
 }
 
+/// Running sums of v in place (v[i] += v[i - 1]), each thread a share.
+fn prefix_sum(nt: usize, v: &mut [u32]) {
+    let (n, r) = (v.len(), Raw::of(v));
+    let sums: Vec<u32> = on_threads(nt, |t| share(n, t, nt).map(|i| unsafe { *r.at(i) }).sum());
+    on_threads(nt, |t| {
+        let mut acc: u32 = sums[..t].iter().sum();
+        for i in share(n, t, nt) {
+            unsafe { (acc, *r.at(i)) = (acc + *r.at(i), acc + *r.at(i)) };
+        }
+    });
+}
+
 /// Thread t's share of 0..n.
 fn share(n: usize, t: usize, nt: usize) -> std::ops::Range<usize> {
     n * t / nt..n * (t + 1) / nt
@@ -364,7 +376,6 @@ fn main() {
         prctl(41, 1, 0, 0, 0); // PR_SET_THP_DISABLE
         mallopt(-3, 1 << 16); // M_MMAP_THRESHOLD
     }
-    let clock = std::time::Instant::now(); // diagnostic run: see the end of main
     let nt = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 12);
     let qtext = map("/data/queries.txt");
     let mut queries = Vec::new();
@@ -468,11 +479,11 @@ fn main() {
     let (first_v, link_v) = (first, link);
     let (first, link) = (&first_v[..], &link_v[..]);
     // Each thread's chain of nodes, with their out-degrees.
-    let chains: Vec<(Vec<u32>, Vec<u32>)> = on_threads(nt, |t| {
+    let chains: Vec<(Vec<u32>, Vec<u32>, u32)> = on_threads(nt, |t| {
         drop_pages(&filed[t].offs, 0, 1); // the parse output is read no more
         drop_pages(&filed[t].words, 0, 1);
         let (mut ord, mut seeds) = (Vec::with_capacity(n / nt + BLOB), Vec::new());
-        let mut degs = Vec::with_capacity(n / nt + BLOB);
+        let (mut degs, mut edges) = (Vec::with_capacity(n / nt + BLOB), 0);
         let mut scan = share(n, t, nt).start;
         // Fetch the offsets 8 queue entries ahead, the edges 4 ahead and the
         // claim flags of their heads 2 ahead.
@@ -498,13 +509,13 @@ fn main() {
                 }
                 scan += 1;
             }
-            let Some(seed) = seed else { return (ord, degs) };
+            let Some(seed) = seed else { return (ord, degs, edges) };
             let (blob, mut i) = (ord.len(), ord.len());
             ord.push(seed);
             while i < ord.len() && ord.len() - blob < BLOB {
                 ahead(&ord, i);
                 let u = ord[i] as usize;
-                degs.push(first[u + 1] - first[u]);
+                (_, edges) = (degs.push(first[u + 1] - first[u]), edges + first[u + 1] - first[u]);
                 for e in first[u]..first[u + 1] {
                     let v = link[e as usize] & hmask;
                     if ord.len() - blob < BLOB && claim(v) {
@@ -516,7 +527,7 @@ fn main() {
             for i in i..ord.len() {
                 ahead(&ord, i);
                 let u = ord[i] as usize;
-                degs.push(first[u + 1] - first[u]);
+                (_, edges) = (degs.push(first[u + 1] - first[u]), edges + first[u + 1] - first[u]);
                 for e in first[u]..first[u + 1] {
                     let v = link[e as usize] & hmask;
                     if claimed[v as usize].load(Relaxed) == 0 {
@@ -532,12 +543,12 @@ fn main() {
     // New ids and offsets: each thread's chain in turn (every node is in one).
     let (mut id_v, mut off) = (vec![0u32; n], vec![0u32; n + 1]);
     let mut start = vec![(0, 0); nt + 1]; // a chain's first id and first edge
-    for (t, (ord, degs)) in chains.iter().enumerate() {
-        start[t + 1] = (start[t].0 + ord.len() as u32, start[t].1 + degs.iter().sum::<u32>());
+    for (t, (ord, _, edges)) in chains.iter().enumerate() {
+        start[t + 1] = (start[t].0 + ord.len() as u32, start[t].1 + edges);
     }
     let (ir, or) = (Raw::of(&mut id_v), Raw::of(&mut off));
     on_threads(nt, |t| {
-        let ((ord, degs), (mut k, mut e)) = (&chains[t], start[t]);
+        let ((ord, degs, _), (mut k, mut e)) = (&chains[t], start[t]);
         for (&u, &d) in ord.iter().zip(degs) {
             unsafe { (*ir.at(u as usize), *or.at(k as usize)) = (k, e) };
             (k, e) = (k + 1, e + d);
@@ -582,16 +593,14 @@ fn main() {
     std::thread::spawn(move || drop((heavy, first_v, link_v, id_v)));
 
     // The reverse graph in the same format: in-degrees counted into
-    // roff[v + 1], summed, then roff[v] used as v's cursor, which leaves it at
-    // v's end, so shifting it up by one restores the offsets.
+    // roff[v + 2] and summed, so roff[v + 1] is where v's in-edges start; as
+    // v's cursor while they are placed it ends at v's end, the start of v + 1.
     let adj = &adj;
-    let mut roff = vec![0u32; n + 1];
+    let mut roff = vec![0u32; n + 2];
     let rr = Raw::of(&mut roff);
     let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
-    on_threads(nt, |t| share(n, t, nt).for_each(|u| (off[u]..off[u + 1]).for_each(|e| { bump((adj[e as usize] & hmask) as usize + 1); })));
-    for v in 0..n {
-        roff[v + 1] += roff[v];
-    }
+    on_threads(nt, |t| share(n, t, nt).for_each(|u| (off[u]..off[u + 1]).for_each(|e| { bump((adj[e as usize] & hmask) as usize + 2); })));
+    prefix_sum(nt, &mut roff);
     let mut radj = vec![0u32; m];
     let rar = Raw::of(&mut radj);
     let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
@@ -599,7 +608,7 @@ fn main() {
         for u in share(n, t, nt) {
             for e in off[u]..off[u + 1] {
                 let x = adj[e as usize];
-                let j = bump((x & hmask) as usize);
+                let j = bump((x & hmask) as usize + 1);
                 if x >> hb == big {
                     out.push((j, heavy_weight(&heavy2, e)));
                 }
@@ -610,14 +619,11 @@ fn main() {
     })
     .concat();
     rheavy.sort_unstable();
-    roff.copy_within(0..n, 1);
-    roff[0] = 0;
 
     // 4. Queries sorted so neighbouring searches share cached pages.
     let mut order: Vec<usize> = (0..ends.len()).collect();
     order.sort_unstable_by_key(|&q| ends[q]);
     let graphs = [(&off[..], &adj[..], &heavy2[..], hb), (&roff[..], &radj[..], &rheavy[..], hb)];
-    let mark = clock.elapsed().as_millis() as usize;
     let mut ans = vec![INF; ends.len()];
     let ansr = Raw::of(&mut ans);
     let next = AtomicUsize::new(0);
@@ -650,9 +656,4 @@ fn main() {
     // INF prints as -1 (u64::MAX as i64); every real distance is below 2^63.
     let out: String = ans.iter().map(|&a| format!("{}\n", a as i64)).collect();
     std::fs::write("/out/distances.txt", out).unwrap();
-    // Diagnostic run: the board reports peak memory, so touch 200 MiB plus
-    // one MiB per millisecond that had passed at the mark.
-    let mut pad = vec![0u8; (200 + mark) << 20];
-    pad.iter_mut().step_by(4096).for_each(|b| *b = 1);
-    std::hint::black_box(&pad);
 }

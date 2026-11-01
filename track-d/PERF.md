@@ -42,7 +42,9 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 20 | Out-degrees recorded while the blobs grow, so new ids and new offsets come from one pass (no degree scatter, no serial prefix sum); parse arenas dropped in parallel; claim flags prefetched in the blob BFS | run-a8aa780ac7a5 | 0.163 s | 63.4 MiB | 69.03 |
 | 21 | After each pop, the edge list of the node now on top of that side's queue is prefetched | run-92286f5c8205 (best run-2f7e69f47d7a) | 0.161 (0.159) s | 63 MiB | 69.16 (69.24) |
 | 22 | Chain contraction: nodes with one or two neighbours (31%) are never settled; junction edges into a chain are redirected in place to the junction at its far end, and a query on a chain starts from its junctions | run-3c80edc59750 | 0.160 s | 64 MiB | 68.30 |
-| 23 | Back to step 21's code | pending | | | |
+| 23 | Back to step 21's code (no board run of its own: superseded by the diagnostic) | | | | |
+| 23d | Diagnostic: time to the start of the searches reported through M | run-c7795c71063c | (0.304 s) | (290 MiB) | |
+| 24 | Reverse offsets summed in parallel and built without the final shift; chain edge totals counted during the blob BFS | pending | | | |
 
 ## What the profile said, step by step
 
@@ -127,6 +129,10 @@ In Rust, settled nodes on the full data fell from 7.12 million to 5.09 million a
 Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178 s, best 0.132 against 0.148 s, about 100 ms less CPU, 13% fewer instructions. 751 rustfmt lines against 573. Same hash on full, sample, tiny, the worked example, seeds 7, 9, 13, 21, 22 and 23 at sample scale, and seeds 2 to 21 at tiny scale (the tiny ones against the reference).
 
 **Step 22 on the board, and step 23.** run-3c80edc59750: 0.160 s, 64 MiB, 759 counted lines, 68.30 points. Track A's unchanged code ran at its best speed in the same run, so the box was fast, and Track D only matched step 21's best (0.159 s): on the scoring machine the 28% fewer settled nodes are paid for by the classification and rewrite passes, and the 172 extra lines cost about a point. Step 23 is step 21's code again; the contraction stays in the history (commit 2e866e5) as a measured negative.
+
+**Step 23 diagnostic.** The laptop's phase timers have misled twice now (steps 18 and 22), so this run measured the box itself. The board reports memory to the byte, so the diagnostic build notes the time at which the searches start and, after writing the answers, touches 200 MiB plus one MiB per millisecond of it; locally the memory left at that point is 4 to 5 MiB. run-c7795c71063c reported 303,976,448 bytes (289.9 MiB), so on the box the searches start about 85 ms after exec: of step 21's 0.16 s, about 85 ms is parse and build and about 75 ms is the searches, the release and the exit.
+
+**Step 23 to 24.** Three serial pieces of the build went: the reverse graph's offsets are summed by all threads (two passes over shares) instead of one; the in-degrees are counted into roff[v + 2], so that roff[v + 1] serves as v's cursor and ends at the start of v + 1, which removes the 7 MB shift after the fill; and each blob thread totals its chain's edges as it records the degrees, instead of a serial sum over 1.74 million degrees afterwards. Six `perf stat -r 5` rounds against step 21: median 0.173 against 0.197 s (a loaded laptop), 170 ms less CPU, five of six pairs. Same hash on all thirty datasets.
 
 ## Tried and kept out
 
