@@ -23,6 +23,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | run-7f4f12386a23 | 0.0315 s | 19.1 MiB | 79.75 |
 | 17 | Diagnostic: each piece parsed twice, the first time into a parser that is then dropped (same output) | run-f846b47b55e9 | 0.0395 s | 32.6 MiB | 75.15 |
 | 18 | Step 11's code, and each parsed piece's log pages unmapped (`MADV_DONTNEED`) by the thread that parsed it | run-1bfda4424f2e | 0.0215 s | 18.1 MiB | 84.30 |
+| 19 | Sixteen pieces per thread instead of eight | pending | | | |
 
 ## Local measurements
 
@@ -84,6 +85,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 17 on the board, and step 18.** run-f846b47b55e9: 0.0395 s, so the parse costs 12 to 13 ms of the box's 26 (some of that the throwaway parser's own page faults), the hour phase 5.2 ms, and about 8 ms is everything else: starting threads, the two barriers, writing 7 MB of text and exiting. Exit alone tears down the 239 MB mapping of the log, about 58,000 page table entries, on one thread. The log is not read again after the parse, so step 18 has each thread unmap the pages of every piece it finishes, spreading that work over the threads and leaving exit little to do. On the laptop it costs kernel time (188 to 194M kernel cycles against 135 to 140M), as the virtual machine's page tables make it dear there; the board decides. Same hash on all six datasets.
 
 **Step 18 on the board.** run-1bfda4424f2e: 0.0215 s against about 0.026 s, 18% faster and the best so far at 84.30 points. Most of the 8 ms outside the two phases was the exit's teardown of the log's mapping on one thread.
+
+**Step 18 to 19.** With the exit's teardown gone, about 4 ms remain outside the parse and the hour phase. A parse piece is about 2.5 MB, some 1.5 ms of work on the box, and the barrier after the parse waits for the last one; sixteen pieces a thread halve that tail. (Track C's sixteen pieces were slower, but each of its pieces costs a populate call and a pipeline fill and drain; a Track A piece costs nothing extra.) Same hash on all six datasets.
 
 ## Tried and kept out
 
