@@ -21,7 +21,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 14 | One line 2 KB ahead again (step 11), and each piece's pages mapped in one `MADV_POPULATE_READ` call by the thread about to parse it | run-3fd1bf8b0782 | 0.0326 s | 8.9 MiB | 77.86 |
 | 15 | Lookups pipelined 32 records ahead instead of 16 | run-ada2e4fafc21 | 0.0329 s | 9.0 MiB | 77.70 |
 | 16 | LAG 16 again; records.csv cut into eight pieces per thread instead of four | run-5158cda3eca9 | 0.0322 s | 8.5 MiB | 78.18 |
-| 17 | Sixteen pieces per thread | pending | | | |
+| 17 | Sixteen pieces per thread | run-bdca4d9490bd | 0.0339 s | 9.2 MiB | 77.30 |
+| 18 | Back to eight pieces per thread (step 16's code) | pending | | | |
 
 **Step 3 to 4.** A profile of step 3 showed only 5.9 of 12 CPUs busy on average: before any record was parsed, the main thread spent about 4 ms populating 9 MB of shared tables, and the name lookup was still the largest part of the record pass (a hash loop over every word of the name, a probe over the 16-bit tags, then a 32-byte compare against a 32-byte slot whose head copy made the table 4 MB). The name table is now one array of 16-byte keys. A name of up to 16 bytes (89% of the 100,000 pool names at full scale) is its own key, its bytes zero padded, which is exact because names hold no zero byte. A longer name keeps its first 8 bytes and a 63-bit hash of the rest, with the top bit set (ASCII never sets it), so two names are confused only if they share their first 8 bytes and that hash; at full scale about 1,500 long names share a first 8 bytes with another, which puts the chance near 10^-16. The empty name has its own key. A key's slot is the name's id, a lookup is one aligned 16-byte load and compare (one cache line, prefetched when the record is parsed), and an empty slot is claimed with a 16-byte compare-and-swap, so a reader sees a slot either empty or whole and every name gets one id. The table is 2 MB instead of 4.25 MB plus the arena. The shared tables are now populated with `MADV_POPULATE_WRITE`, each thread its own share, inside the thread pool. Over three interleaved `perf stat -r 15` rounds: cycles 1.31G to 0.97G, wall 0.044 to 0.033 s; `cmp.ps1` median 49 to 38 ms and peak 14 to 11 MB. Same hash on full, sample, tiny, the worked example, the rules file and the seed-11 sample, and the same hash on 10 more runs each of full and sample.
 
@@ -56,6 +57,8 @@ Every step from the reference to your final version, each with the live-board ru
 **Step 15 on the board, and step 16.** run-ada2e4fafc21: 0.0329 s against 0.0326 s, no gain, so LAG is 16 again. Step 16 cuts the records into 96 pieces instead of 48: with two threads to a core, a thread finishing its last piece late keeps one core half used, and smaller pieces shorten that tail.
 
 **Step 16 on the board, and step 17.** run-5158cda3eca9: 0.0322 s and 8.5 MiB, the best so far at 78.18. Step 17 halves the pieces again (192 of about 1 MB).
+
+**Step 17 on the board, and step 18.** run-bdca4d9490bd: 0.0339 s, slower than eight pieces a thread (0.0322 s); each piece costs a `MADV_POPULATE_READ` call and a pipeline fill and drain, and at about 1 MB those start to show. Step 18 is step 16's code again.
 
 ## Tried and kept out
 
