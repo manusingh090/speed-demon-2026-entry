@@ -276,7 +276,7 @@ struct Parser {
 
 int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-  const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 6);
+  const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
   int in = open("/data/requests.log", O_RDONLY);
   int out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (in < 0 || out < 0)
