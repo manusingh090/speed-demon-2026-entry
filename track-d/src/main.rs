@@ -20,7 +20,7 @@
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex, Once, OnceLock};
 
 extern "C" {
@@ -656,57 +656,29 @@ fn main() {
     // The reverse graph in the same format: in-degrees counted into
     // roff[v + 2] and summed, so roff[v + 1] is where v's in-edges start; as
     // v's cursor while they are placed it ends at v's end, the start of v + 1.
-    // Each thread counts and places the in-edges of its own share of nodes
-    // with plain increments (in blob order nearly every edge stays inside its
-    // share); an edge into another share is handed to that share's thread.
     let adj = &adj;
-    let owner = |v: usize| (0..nt).find(|&t| share(n, t, nt).contains(&v)).unwrap();
-    let (mut roff_v, mut radj) = (vec![0u32; n + 2], vec![0u32; m]);
-    let (rr, rar) = (Raw::of(&mut roff_v), Raw::of(&mut radj));
-    let away: Vec<Vec<Vec<u32>>> = on_threads(nt, |t| {
-        let (r, mut away) = (share(n, t, nt), vec![Vec::new(); nt]);
-        for e in off.at(r.start)..off.at(r.end) {
-            match (adj[e as usize] & hmask) as usize {
-                v if r.contains(&v) => unsafe { *rr.at(v + 2) += 1 },
-                v => away[owner(v)].push(v as u32),
-            }
-        }
-        away
-    });
-    on_threads(nt, |t| away.iter().flat_map(|a| &a[t]).for_each(|&v| unsafe { *rr.at(v as usize + 2) += 1 }));
+    let mut roff_v = vec![0u32; n + 2];
+    let rr = Raw::of(&mut roff_v);
+    let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
+    on_threads(nt, |t| share(n, t, nt).for_each(|u| (off.at(u)..off.at(u + 1)).for_each(|e| { bump((adj[e as usize] & hmask) as usize + 2); })));
     prefix_sum(nt, &mut roff_v);
-    // Places in-edge word x of node v; returns where it went.
-    let place = |v: usize, x: u32| unsafe {
-        let j = *rr.at(v + 1);
-        (*rr.at(v + 1), *rar.at(j as usize)) = (j + 1, x);
-        j
-    };
-    let placed: Vec<(Vec<(u32, u32)>, Vec<Vec<(u32, u32, u32)>>)> = on_threads(nt, |t| {
-        let (r, mut heavy, mut away) = (share(n, t, nt), Vec::new(), vec![Vec::new(); nt]);
-        for u in r.clone() {
+    let mut radj = vec![0u32; m];
+    let rar = Raw::of(&mut radj);
+    let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
+        let mut out = Vec::new();
+        for u in share(n, t, nt) {
             for e in off.at(u)..off.at(u + 1) {
                 let x = adj[e as usize];
-                let (v, word) = ((x & hmask) as usize, u as u32 | (x & !hmask));
-                if !r.contains(&v) {
-                    away[owner(v)].push((v as u32, word, e));
-                } else if x >> hb == big {
-                    heavy.push((place(v, word), heavy_weight(&heavy2, e)));
-                } else {
-                    place(v, word);
+                let j = bump((x & hmask) as usize + 1);
+                if x >> hb == big {
+                    out.push((j, heavy_weight(&heavy2, e)));
                 }
+                unsafe { *rar.at(j as usize) = u as u32 | (x & !hmask) };
             }
         }
-        (heavy, away)
-    });
-    let rheavy = on_threads(nt, |t| {
-        let mut heavy = Vec::new();
-        for &(v, word, e) in placed.iter().flat_map(|p| &p.1[t]) {
-            let j = place(v as usize, word);
-            (word >> hb == big).then(|| heavy.push((j, heavy_weight(&heavy2, e))));
-        }
-        heavy
-    });
-    let mut rheavy: Vec<(u32, u32)> = placed.iter().flat_map(|p| p.0.iter().copied()).chain(rheavy.concat()).collect();
+        out
+    })
+    .concat();
     rheavy.sort_unstable();
     let roff = Offs::pack(nt, &roff_v[..n + 1]);
     drop(roff_v);

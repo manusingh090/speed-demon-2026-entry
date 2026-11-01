@@ -49,7 +49,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 26 | Edge offsets packed: a u32 per 8 nodes and a byte per node (plain u32s if a group overflows a byte), for the old, new and reverse graphs | run-388cd0d32097 | 0.157 s | 55 MiB | 69.68 |
 | 26d | Diagnostic: time to the end of the parse reported through M | run-806bba02eb3c | (0.246 s) | (222 MiB) | |
 | 27 | Back to step 26's code | pending | | | |
-| 28 | Reverse graph counted and placed with plain increments, each thread owning its share's nodes; edges into another share handed over | pending | | | |
+| 28 | Reverse graph counted and placed with plain increments, each thread owning its share's nodes; edges into another share handed over | run-62ef9877e352 | 0.159 s | 55 MiB | 69.41 |
+| 29 | Back to step 26's code | pending | | | |
 
 ## What the profile said, step by step
 
@@ -148,6 +149,10 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Second diagnostic.** The same trick with the mark at the end of the parse: run-806bba02eb3c reported 233,181,184 bytes, so on the box the parse (with exec and reading the queries) ends about 18 ms in. With the first diagnostic, the box's 0.157 s is about 18 ms of parse, about 67 ms from the parse to the first search (part build, blob order, ids, renumbering, reverse graph) and about 70 ms of searches, release and exit. Step 27 is step 26's code again.
 
 **Step 27 to 28.** Single-CPU phase costs (one thread doing everything, the steadiest measure on this laptop), in ms: parse 95, part build 40, blob order 135, ids 14, renumbering 100, reverse count 23, reverse placement 42, packing 5, searches 600. The reverse graph's 65 ms were mostly its 10 million locked read-modify-writes (an atomic add per edge to count, an atomic fetch-add per edge as the cursor). In blob order nearly every edge's head lies in the same thread's share of nodes as its tail, so each thread now counts and places the in-edges of its own share with plain increments, and an edge into another share is handed to that share's thread in a second short pass; no counter is ever touched by two threads. Reverse phase single-CPU 83 to 64 ms; six twelve-thread rounds: median 0.142 against 0.148 s, 60 ms less CPU. Same hash on all thirty datasets.
+
+**Measured after step 28 and kept out: longest queries first.** Per-thread end times showed a tail of 5 to 6 ms at the end of the searches (the first thread out of queries at 60 ms, the last done at 66). The distance between a query's ends in the blob order ranks its work well (Spearman 0.74 against settled nodes over the 2,000 queries; the top 10% of queries do 74% of the work), so the queries were sorted by it, longest first. The tail shrank to 0.4 to 1.7 ms, but the searches got slower overall (median 69.7 against 64.2 ms over eight interleaved runs, eight of eight): sorted by (source, target), queries running at the same moment on different threads share their forward balls in the L3 cache, and that is worth more than the tail. Putting only the longest 10% or 20% first, each group in (source, target) order, measured the same as plain sorting (65.5 and 65.9 against 65.2 ms).
+
+**Step 28 on the board, and step 29.** run-62ef9877e352: 0.159 s against 0.157 s for step 26, 675 lines, 69.41 points: the box did not see the gain the laptop measured, and the 26 extra lines cost more than any time it saved. Step 29 is step 26's code again.
 
 ## Tried and kept out
 
