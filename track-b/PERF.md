@@ -47,8 +47,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 40 | Count and position sum of a bitmap answer with AVX2, four words at a time; the sample back to 1/32 | run-393a2f308eda (with 41) | | | |
 | 41 | OR of two lists totalling over 2,048 documents goes into a bitmap | run-393a2f308eda | 0.178 | 47.1 | 72.52 |
 | 42 | The same code in 602 counted lines instead of 671: bitmaps padded to whole vectors, and long chains and tuples split where rustfmt would wrap them | run-74dca041f2ff | 0.178 | 47.1 | 72.84 |
-| 43 | Six more statements that rustfmt would wrap, written short (596 lines) | pending (with 44) | | | |
-| 44 | A token's bits cleared from the window mask by adding its lowest bit (`m & (m + (m & -m))`) instead of a checked shift | pending | | | |
+| 43 | Six more statements that rustfmt would wrap, written short (596 lines) | run-6c03749873e8 (with 44) | | | |
+| 44 | A token's bits cleared from the window mask by adding its lowest bit (`m & (m + (m & -m))`) instead of a checked shift | run-6c03749873e8 | 0.175 | 47.3 | 73.02 |
+| 45 | The tokenizer prefetches each term's last-document mark as it resolves the token, so the handler finds it in cache | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -192,6 +193,10 @@ The laptop runs in a WSL2 VM where one page fault costs about 9 µs (25,600 faul
 **Measuring in this VM.** Sampled profiles here capture only a few percent of the retired instructions and attribute them unevenly between threads, so they were misleading twice (the per-document handler closure looked like the scatter). Phase costs now come from switching parts off and counting user cycles, and the scan alone from per-thread CPU clocks summed over threads: about 1,050 ms of CPU, of which tokenizing and lookups are about 550, the bitmap bits about 120, the last-document marks about 170, and anchors with their phrase checks about 170.
 
 **Step 44.** Adding a word's lowest set bit carries through the token's run of bits, so `m & (m + lowest)` clears exactly that token, with no special case when it reaches bit 63. 2.5% fewer instructions, no new lines.
+
+**Steps 43 and 44 on the board.** run-6c03749873e8: 0.1754 s, 47.3 MiB, 596 lines, K 28.86 and 73.02 points.
+
+**Step 45.** The handler cost about 60 cycles per token for some 20 instructions, and switching off its parts one at a time (scan CPU summed over threads) showed no single piece dominating: it waits on memory. The last-document marks are 150 KB per thread, so the marks of rarer terms are often out of L1 when the handler reaches them. The tokenizer knows each token's id a whole document before the handler runs, so it now prefetches that term's mark as it resolves the token. 4% fewer cycles in each of four interleaved rounds, for 0.5% more instructions and 11 more lines. Keeping each term's count beside its mark, so that one line serves both, added nothing more.
 
 Measured and kept out this session (from step 36 on):
 - OR of two long lists into a bitmap (over 1,024 or 4,096 documents): more cycles, since the bitmap results cost more to count and sum.

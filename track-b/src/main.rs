@@ -187,10 +187,14 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 /// per 64-byte window; a token that runs into the window's end starts the next
 /// window. Each token's slot is prefetched and the token looked up LAG tokens
 /// later, so the misses overlap.
-unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>) -> *const u8 {
+unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
     const LAG: usize = 8;
     let mut ring = [(_mm256_setzero_si256(), 0); LAG];
-    let mut look = |r: &(__m256i, usize)| ids.push(t.find(r.0, r.1));
+    let mut look = |r: &(__m256i, usize)| {
+        let id = t.find(r.0, r.1);
+        _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
+        ids.push(id);
+    };
     let mut n = 0usize;
     loop {
         let (word, nl) = classes(p);
@@ -368,8 +372,9 @@ fn line(out: &mut String, docs: &Docs) {
 }
 
 /// Calls f(doc, ids) with the token ids of each line in text, the first
-/// being document first; returns the number of documents.
-fn walk(text: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, &[u32])) -> u32 {
+/// being document first, with pre[id] prefetched for each; returns the
+/// number of documents.
+fn walk(text: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32, &[u32])) -> u32 {
     let (mut p, end) = (text.as_ptr(), text.as_ptr_range().end);
     let (mut doc, mut ids) = (first, Vec::with_capacity(1 << 12));
     while p < end {
@@ -378,7 +383,7 @@ fn walk(text: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, &[u32])) -> u
                 p = p.add(1);
             }
             ids.clear();
-            p = tokens(p, t, &mut ids);
+            p = tokens(p, t, &mut ids, pre);
         }
         f(doc, &ids);
         doc += 1;
@@ -483,7 +488,7 @@ fn main() {
     let samples = on_threads(|t| {
         let (mut df, mut last) = (vec![0u32; nterms + 1], vec![NONE; nterms + 1]);
         let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 32];
-        let n = walk(sample, firsts[t], &terms, |doc, toks| {
+        let n = walk(sample, firsts[t], &terms, std::ptr::null(), |doc, toks| {
             for &id in toks {
                 if std::mem::replace(&mut last[id as usize], doc) != doc {
                     df[id as usize] += 1;
@@ -559,7 +564,8 @@ fn main() {
         };
         // Every token does the same work, kept or not by masks, so whether a
         // term is new to the document, a list or a bitmap costs no branch.
-        let n = walk(&text[cut[t]..cut[t + 1]], first, &terms, |doc, toks| {
+        let (share, pre) = (&text[cut[t]..cut[t + 1]], last.as_ptr());
+        let n = walk(share, first, &terms, pre, |doc, toks| {
             if doc as usize / 64 != block {
                 let w = std::mem::replace(&mut block, doc as usize / 64);
                 flush(&mut pending, w);
