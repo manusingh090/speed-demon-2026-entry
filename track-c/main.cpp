@@ -12,8 +12,8 @@
 //     escape), so commas and LFs inside quotes cost nothing. Numbers are decoded
 //     eight digits at a time. Sums go to the thread's own per-country totals. Names
 //     go through a shared lock-free intern table to dense ids, which are marked
-//     in one bitset per country; both steps are prefetched records ahead.
-//  4. Each thread counts the set bits of every nthreads-th country.
+//     in one bitset per country; both steps are prefetched records ahead. A
+//     mark that sets a new bit adds one to the country's distinct names.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -214,16 +214,13 @@ struct NamesSeen {
     // fetch it shared first.
     void prefetch(u32 c, u32 name) { __builtin_prefetch(&word(c, name), 1); }
 
-    void mark(u32 c, u32 name) {
-        // No test first: the read would fetch the line shared, then the OR
-        // would have to fetch it again exclusive.
-        word(c, name).fetch_or(u64(1) << name % 64, std::memory_order_relaxed);
-    }
-
-    u64 count(u32 c) const {
-        u64 n = 0;
-        for (u32 w = 0; w < WORDS; ++w) n += __builtin_popcountll(bits[c * WORDS + w].load(std::memory_order_relaxed));
-        return n;
+    // Whether this is the first time the name is marked for the country, so
+    // the distinct counts come out of the marking (an OR returning the old
+    // bit) with no pass over the bitsets afterwards. No test first: the read
+    // would fetch the line shared, then the OR would fetch it again exclusive.
+    bool mark(u32 c, u32 name) {
+        u64 bit = u64(1) << name % 64;
+        return !(word(c, name).fetch_or(bit, std::memory_order_relaxed) & bit);
     }
 };
 
@@ -246,7 +243,7 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
     u64 n = 0, last = UINT64_MAX;  // records started; all of them once known
     auto advance = [&]() __attribute__((always_inline)) {  // retire ring slot n % LAG
         u32 k = n % LAG;
-        if (n >= 2 * LAG && n - 2 * LAG < last) seen.mark(marks[k].country, marks[k].id);
+        if (n >= 2 * LAG && n - 2 * LAG < last) totals[marks[k].country].distinct += seen.mark(marks[k].country, marks[k].id);
         if (n >= LAG && n - LAG < last) {
             const Pending& old = pending[k];
             u32 c = old.region < regions ? country_of[old.region] : 0;
@@ -284,9 +281,9 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         u32 r = region < regions ? u32(region) : u32(regions);
         _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
         advance();
-        Pending& next = pending[n++ % LAG];
-        next = {NameTable::key(name.at, name.raw), r, u32(id), name.length, note.length, cents};
-        names.prefetch(next.name);
+        u64 key = NameTable::key(name.at, name.raw);
+        pending[n++ % LAG] = {key, r, u32(id), name.length, note.length, cents};
+        names.prefetch(key);
         p = eol + 1;
     }
     for (last = n; n < last + 2 * LAG; ++n) advance();
@@ -377,8 +374,8 @@ int main() {
     NamesSeen seen;
 
     // Populate tables and flag countries; populate bitsets and fill the region
-    // table; parse records; count each country's names.
-    Phase flag{.pieces = nthreads}, fill{.pieces = nthreads}, parse{.pieces = pieces}, count{.pieces = 256};
+    // table; parse records.
+    Phase flag{.pieces = nthreads}, fill{.pieces = nthreads}, parse{.pieces = pieces};
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t)
         pool.emplace_back([&, t] {
@@ -399,9 +396,6 @@ int main() {
             parse.run([&](int k) {
                 parse_records(records + cut[k], records + cut[k + 1], records + size, country_of, nregions, names,
                               seen, totals[t].data());
-            });
-            count.run([&](int c) {
-                if (c <= int(codes.size())) totals[t][c].distinct = seen.count(c);
             });
         });
     for (auto& th : pool) th.join();
