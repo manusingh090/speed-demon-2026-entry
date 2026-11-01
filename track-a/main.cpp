@@ -180,9 +180,6 @@ struct Parser {
 
     void run(const char* p, const char* end) {
         while (p < end) {
-            // The log's pages are scattered in memory and the hardware prefetcher
-            // stops at each 4 KB page; this reaches into the next one in time.
-            _mm_prefetch(p + 2048, _MM_HINT_T0);
             // YYYY-MM-DDTHH: month's last digit at 6, day at 8-9, hour at 11-12.
             int day = (p[8] - '0') * 10 + (p[9] - '0'), hour = (p[11] - '0') * 10 + (p[12] - '0');
             int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
@@ -237,9 +234,8 @@ int main() {
     // backed by whole 2 MB pages and count against peak memory.
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
-    int in = open("/data/requests.log", O_RDONLY);
-    int out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (in < 0 || out < 0) return perror("open"), 1;
+    int in = open("/data/requests.log", O_RDONLY), out = -1;
+    if (in < 0) return perror("open"), 1;
 
     // Map the log over one spare zero page, so the 64-byte scans stay in bounds.
     size_t size = lseek(in, 0, SEEK_END);
@@ -292,6 +288,8 @@ int main() {
         u64 total = 0;
         for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
         at[HOURS] = total;
+        out = open("/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (out < 0) _exit(1);
         if (total == 0) return;
         if (ftruncate(out, total) != 0) _exit(1);
         text = (char*)mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
@@ -300,6 +298,10 @@ int main() {
 
     std::vector<std::thread> pool;
     for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
+        // An output left by an earlier run is truncated page by page, which
+        // here would hold up the start; one thread deletes it while the
+        // others parse (it is created again once its size is known).
+        if (t == 0) unlink("/out/summary.txt");
         parsers[t].map(size);
         for (int k; (k = claim_piece++) < pieces;) parsers[t].run(log + cut[k], log + cut[k + 1]);
         ranked.arrive_and_wait();

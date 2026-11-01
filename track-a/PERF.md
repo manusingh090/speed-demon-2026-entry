@@ -16,7 +16,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Chunks handed back in 64 KB batches instead of 256 KB; every remaining chunk and each thread's sort scratch freed before the output's pages start to count | run-0fb87a6d8f1a | 0.0280 | 18.6 | 81.56 |
 | 10 | Each thread's sort scratch sized once for the largest hour (a growing buffer is remapped, which stalls every thread's page faults); endpoint names up to 64 bytes compared in two AVX2 steps | run-0ee3487c8434 | 0.0269 | 19.6 | 81.68 |
 | 11 | The sort scratch allocated without zeroing, so each thread is charged only for the pages its own largest hour uses; a number's width from its bit length and one compare instead of a recursion | run-ebcf5b81097e | 0.0260 | 18.8 | 82.16 |
-| 12 | Each line prefetches the log 2 KB ahead, into the next page before the parse reaches it | pending | | | |
+| 12 | Each line prefetches the log 2 KB ahead, into the next page before the parse reaches it | run-e0e1b7e99d99 | 0.0290 s | 17.9 MiB | 81.13 |
+| 13 | No prefetch (step 11's parse); an output left by an earlier run is deleted by one thread while the others parse, and the file is created once its size is known | pending | | | |
 
 ## Local measurements
 
@@ -66,6 +67,8 @@ Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup 
 **Step 11 on the board.** run-ebcf5b81097e: 0.0260 s, 18.75 MiB, 329 counted lines, K 43.96, 82.16 points, the best Track A run so far: the memory step 10 had cost came back and the time gain held.
 
 **Step 11 to 12.** Taken from Track C, where one prefetch a record 2 KB ahead made the box 3.7% faster (run-7951b634b59d) while the laptop saw no change: the page cache's pages are scattered in physical memory, the hardware prefetcher stops at each 4 KB page, and each page's first lines were waited on. (4 KB ahead was 12% slower there, as it often reaches a page not yet mapped.) Same hash on all six datasets.
+
+**Step 12 on the board, and step 13.** run-e0e1b7e99d99: 0.0290 s against 0.026 to 0.027 s for step 11's code, so the prefetch that paid on Track C costs here, and it goes. Phase timers on step 11 then showed 2.4 ms before the first thread started, almost all of it in `open("/out/summary.txt", O_TRUNC)` from the second run on: truncating the 7 MB left by the run before frees its pages one by one. If the five timed runs share `/out`, four of them pay that before any work starts. Now thread 0 deletes the old file while the other threads parse (pieces are claimed, so they take its share), and the output is created at the barrier where its size is known. Repeated runs in one container (`perf stat -r 10`, 3 rounds): wall 21.3 to 22.4 ms against 24.2 to 27.0 ms; in fresh containers (`cmp.ps1`), where there is no old file, the same 25 ms median. Same hash on all six datasets. Also tried: the hour phase's heap growth (the `Line` vectors, a cursor vector per hour) takes the address-space lock through `mprotect`, 120 calls a run. Writing the long latencies into the chunks as two-slot escapes instead of side vectors removed most of them but cost 12% more instructions in the three passes over the records; a single block for all hours' lines and one cursor per thread halved the calls with no measurable change.
 
 ## Tried and kept out
 
