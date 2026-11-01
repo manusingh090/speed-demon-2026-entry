@@ -538,32 +538,27 @@ fn main() {
     }
     let buckets: Vec<_> = scans.into_iter().map(|s| s.1).collect();
     let post: Vec<AtomicU16> = unsafe { std::mem::transmute(vec![0u16; end as usize]) };
-    // A bucket's lists are written by one thread, from every thread's stream
-    // of it in turn, so no two threads fault in or write the same pages.
-    let next = AtomicUsize::new(0);
-    on_threads(|_| {
+    on_threads(|t| {
+        let buckets = std::mem::take(&mut *buckets[t].lock().unwrap());
         let mut cursor = vec![0u32; lists.div_ceil(BUCKETS)];
-        while let b @ 0..BUCKETS = next.fetch_add(1, Relaxed) {
-            for (t, mine) in buckets.iter().enumerate() {
-                let units = std::mem::take(&mut mine.lock().unwrap()[b]);
-                for (c, i) in cursor.iter_mut().zip((b..lists).step_by(BUCKETS)) {
-                    let before: u32 = seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum();
-                    *c = start[i] + before;
-                }
-                let (mut doc, mut term) = (0u32, NONE);
-                for x in units.chunks.into_iter().flatten() {
-                    if term == NONE {
-                        term = (x >> 4) as u32;
-                        if x as u32 & GAP == GAP {
-                            continue;
-                        }
-                        doc += x as u32 & GAP;
-                    } else {
-                        doc += x as u32;
+        for (b, units) in buckets.into_iter().enumerate() {
+            for (c, i) in cursor.iter_mut().zip((b..lists).step_by(BUCKETS)) {
+                let before: u32 = seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum();
+                *c = start[i] + before;
+            }
+            let (mut doc, mut term) = (0u32, NONE);
+            for x in units.chunks.into_iter().flatten() {
+                if term == NONE {
+                    term = (x >> 4) as u32;
+                    if x as u32 & GAP == GAP {
+                        continue;
                     }
-                    let c = &mut cursor[std::mem::replace(&mut term, NONE) as usize];
-                    (post[*c as usize].store(doc as u16, Relaxed), *c += 1);
+                    doc += x as u32 & GAP;
+                } else {
+                    doc += x as u32;
                 }
+                let c = &mut cursor[std::mem::replace(&mut term, NONE) as usize];
+                (post[*c as usize].store(doc as u16, Relaxed), *c += 1);
             }
         }
     });
