@@ -282,7 +282,6 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         // The file's pages are scattered in memory, and the hardware prefetcher
         // stops at each 4 KB page; this reaches into the next one in time.
         _mm_prefetch(p + 2048, _MM_HINT_T0);
-        _mm_prefetch(p + 2048 + 64, _MM_HINT_T0);
         if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
         const char* f1 = comma_after(p);
         u64 id = digits(p, f1);
@@ -418,6 +417,10 @@ int main() {
                 }
             });
             parse.run([&](int k) {
+                // Map the piece's pages in one call rather than by a fault
+                // every 16 pages as the parse reaches them.
+                uintptr_t from = uintptr_t(records + cut[k]) & ~uintptr_t(4095);
+                madvise(reinterpret_cast<void*>(from), uintptr_t(records + cut[k + 1]) - from, MADV_POPULATE_READ);
                 parse_records(records + cut[k], records + cut[k + 1], records + size, country_of, nregions, names,
                               seen, totals[t].data());
             });
