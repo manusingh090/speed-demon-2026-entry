@@ -59,6 +59,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 52 | Diagnostic: step 46's code with each thread scanning its share twice, the first result dropped (same output), so the extra time is the scan's cost on the box | run-6f25326f6975 | 0.311 | 50.4 | 66.45 |
 | 53 | Term table of 64-bit fingerprints: each slot holds the token's hash above its id, and no key array is kept or read | run-f0281b69a8d6 | 0.173 | 45.6 | 73.23 |
 | 54 | The tokenizer prefetches the corpus 2 KB ahead of each 64-byte window | run-ba21b3893a3a | 0.172 | 45.3 | 73.33 |
+| 55 | The tokenizer looks a token up 16 tokens after prefetching its slot instead of 8 | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
