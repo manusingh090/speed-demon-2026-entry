@@ -35,7 +35,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 13 | Numbers parsed with one 8-byte load each; Rust trimmed from 494 to 478 rustfmt lines | run-96410d780f29 | 0.174 | 71 | 68.34 |
 | 14 | 4-ary heaps instead of radix heaps; every node may seed a blob, so no serial pass for unreached nodes; the old graph freed on a side thread | run-71cc7da0e392 | 0.196 | 67 | 67.45 |
 | 15 | One pool of threads for every phase; parse output in 6-byte records, filed in chunks from one arena per thread; parts of 16,384 nodes | run-92e934101917 | 0.172 | 67 | 68.58 |
-| 16 | Each thread unmaps (`MADV_DONTNEED`) the part of graph.txt it parsed as soon as it is done, instead of the whole 92 MB being torn down at exit by one thread | pending | | | |
+| 16 | Each thread unmaps (`MADV_DONTNEED`) the part of graph.txt it parsed as soon as it is done, instead of the whole 92 MB being torn down at exit by one thread | run-beecc52de687 | 0.190 s | 66.7 MiB | 67.47 |
+| 17 | Back to step 15's code | pending | | | |
 
 ## What the profile said, step by step
 
@@ -84,6 +85,8 @@ Also measured and kept out at this step: dense per-thread distance arrays (no fa
 **Step 15 on the board.** run-92e934101917: 0.172 s, 66.9 MiB, 516 counted lines, K 23.52, 68.58 points, the best Track D run so far (step 13's best was 23.30). The box was still in its slow spell: Track A's unchanged code measured 0.0334 s in the same push against its best of 0.0301 s, and step 14's two runs on that box were 0.196 and 0.183 s. A second run of the same Track D code (run-6779065e4aee, pushed with Track A's step 8) measured 0.168 s, 66.8 MiB, K 23.86, 68.88 points, the new best.
 
 **Step 15 to 16.** Found on Track A by measuring its phases on the box: much of the time outside its two phases was the process exit tearing down the mapping of its 239 MB input on one thread, and unmapping each piece as its thread finished took that track from 0.026 to 0.0215 s (run-1bfda4424f2e). graph.txt is 92 MB, about 23,000 page table entries, so each parse thread now unmaps its range when it is done with it. Same hash on all seven datasets, three runs each.
+
+**Step 16 on the board, and step 17.** run-beecc52de687: 0.190 s against 0.167 to 0.172 s, slower. Here the parse threads all finish together and the unmapping lands while the next phase's threads fault their own new pages in, so it competes with them rather than with an idle exit; the 92 MB mapping's teardown at exit is the cheaper place for it. Step 17 is step 15's code again.
 
 ## Tried and kept out
 
