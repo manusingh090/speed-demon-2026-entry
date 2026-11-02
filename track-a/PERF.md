@@ -250,6 +250,8 @@ Step 58 is a new program built on that floor. The pieces are claimed in order, a
 
 **Step 67's second run.** run-96d23fd675ca: 0.0193 s and 13.97 MiB, 85.97 points. Two runs at 0.0193 to 0.0194 s against 0.0196 to 0.0199 s for steps 58 to 65, so the guided pieces stay.
 
+**Step 67's third run, and a box-matched profile.** run-58f30b420180: 0.0196 s and 14.13 MiB, so three runs of the guided pieces average 0.0194 s against about 0.0198 for steps 58 to 65. The laptop's `-march=native` build uses AVX-512, which the box lacks, so its profiles measured a binary the box never runs; built with `-march=raptorlake` (the box's core), the parser takes 85% of user cycles, and its largest single cost (21% of them) is the load of the stored endpoint name that confirms a match: 1,842 names 128 bytes apart are 236 KB, an L2 working set, not L1. The stride cannot shrink, since endpoint names in this generator reach 125 bytes.
+
 ## Tried and kept out
 
 - **The hour phase priced by switching parts off** (laptop, user-mode `perf stat`): the three selections per group are 135M of 685M user instructions and about 80M of 410M cycles; placing each latency at its group's cursor about 20M cycles more. **Counting sort by endpoint and latency octave** (16 octaves of bit length), so each percentile is found in a known octave and selected among that octave's latencies only (the median's octave holds about a fifth of a group): correct, but 683M instructions against 685M and the same cycles, as the octave is computed twice a record and the counting table is 16 times larger; 2 MB more at peak. Kept out.
