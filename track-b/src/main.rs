@@ -19,7 +19,7 @@ const BUCKETS: usize = 32;
 const GAP: u32 = 15;
 const ID_BITS: u32 = 18;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const BIG: usize = 384;
+const BIG: usize = 768;
 
 fn map(path: &str) -> &'static [u8] {
     let file = std::fs::File::open(path).expect(path);
@@ -257,7 +257,7 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
             });
             List(a)
         }
-        (List(a), _, List(b)) if a.len() + b.len() > BIG => {
+        (List(a), _, List(b)) if a.len() + b.len() > if op == b'O' { 2048 } else { BIG } => {
             let mut bits = vec![0u64; words];
             b.iter().for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
             apply(List(a), op, Bits(Cow::Owned(bits)), words)
