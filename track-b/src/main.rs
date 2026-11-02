@@ -64,15 +64,27 @@ fn number(text: &[u8], i: usize) -> u32 {
 
 // The token's bytes, lowercased (OR 0x20 leaves digits as they are) and
 // zero-padded, in two words folded by one 128-bit multiply: both constants
-// hold bytes no token has, so neither factor is ever zero.
+// hold bytes no token has, so neither factor is ever zero. A token of over 32
+// bytes is no term and hashes to 0.
+// MASK[k + 32] keeps the first k bytes of a word (all of them from 8 on).
+const MASK: [u64; 104] = {
+    let mut m = [0; 104];
+    let mut k = 0;
+    while k < 104 {
+        m[k] = if k <= 32 { 0 } else if k >= 40 { !0 } else { (1 << 8 * (k - 32)) - 1 };
+        k += 1;
+    }
+    m
+};
+
 unsafe fn hash(p: *const u8, len: usize) -> u64 {
-    let load = |i| p.add(i).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020;
+    let word = |i: usize| (p.add(i).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020) & MASK[32 + len - i];
     let fold = |x: u64, y: u64| (x as u128 * y as u128) as u64 ^ (x as u128 * y as u128 >> 64) as u64;
-    let b = len as u32 * 8;
-    let h = fold(_bzhi_u64(load(0), b) ^ 0x9E37_79B9_7F4A_7C15, _bzhi_u64(load(8), b.saturating_sub(64)) ^ 0xC2B2_AE3D_27D4_EB4F);
+    let h = fold(word(0) ^ 0x9E37_79B9_7F4A_7C15, word(8) ^ 0xC2B2_AE3D_27D4_EB4F);
     match len {
         0..=16 => h,
-        _ => fold(h, fold(_bzhi_u64(load(16), b - 128) ^ 0xBF58_476D_1CE4_E5B9, _bzhi_u64(load(24), b.saturating_sub(192)) ^ 0x94D0_49BB_1331_11EB)),
+        17..=32 => fold(h, fold(word(16) ^ 0xBF58_476D_1CE4_E5B9, word(24) ^ 0x94D0_49BB_1331_11EB)),
+        _ => 0,
     }
 }
 
@@ -96,7 +108,7 @@ impl Terms {
                 let m = _mm256_movemask_pd(_mm256_castsi256_pd(found)) as usize;
                 if m != 0 {
                     let s = *self.slot.get_unchecked(i + m.trailing_zeros() as usize);
-                    return ((s & ID_MASK) as u32).wrapping_sub(1).min(self.n as u32);
+                    return ((s & ID_MASK) as u32).wrapping_sub(1); // u32::MAX if none
                 }
                 i = (i + 4) & mask;
             }
@@ -146,7 +158,7 @@ struct Doc(Vec<u64>, Vec<u32>);
 impl Doc {
     // Reads the document whose text starts at p; returns the next line's
     // start and the document's ids.
-    unsafe fn read(&mut self, mut p: *const u8, t: &Terms, pre: *const u16) -> (*const u8, &[u32]) {
+    unsafe fn read(&mut self, mut p: *const u8, t: &Terms) -> (*const u8, &[u32]) {
         let (mut n, mask) = (LAG, t.slot.len() - 1);
         loop {
             if n + 32 > self.0.capacity().min(self.1.capacity()) {
@@ -155,32 +167,29 @@ impl Doc {
             let (hs, ids) = (self.0.as_mut_ptr(), self.1.as_mut_ptr());
             _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(2048).cast());
             let (word, nl) = classes(p);
-            let mut m = _bzhi_u64(word, nl.trailing_zeros());
-            let mut next = 64;
+            // The window's tokens end at the line's end, or else before one
+            // that reaches its last byte, which the next window starts with.
+            // One that fills it is no term: it counts as one token of 48.
+            let mut next = if nl != 0 { nl.trailing_zeros() } else { 64 - (!word).leading_zeros() };
+            let mut m = _bzhi_u64(word, next);
+            if next == 0 && nl == 0 {
+                while (*p.add(next as usize)).is_ascii_alphanumeric() {
+                    next += 1;
+                }
+                m = (1 << 48) - 1;
+            }
             while m != 0 {
                 let (s, e) = (m.trailing_zeros(), m.wrapping_add(m & m.wrapping_neg()));
-                let mut len = e.trailing_zeros() - s;
-                if e == 0 && nl == 0 {
-                    if s != 0 {
-                        next = s;
-                        break;
-                    }
-                    while (*p.add(next as usize)).is_ascii_alphanumeric() {
-                        next += 1;
-                    }
-                    len = next;
-                }
                 m &= e;
-                let h = if len <= 32 { hash(p.add(s as usize), len as usize) } else { 0 };
+                let h = hash(p.add(s as usize), (e.trailing_zeros() - s) as usize);
                 _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h as usize & mask).cast());
                 *hs.add(n) = h;
                 let id = t.find(*hs.add(n - LAG));
-                _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast());
                 (*ids.add(n - LAG), n) = (id, n + 1);
             }
             if nl != 0 {
                 (n - LAG..n).for_each(|k| *ids.add(k) = t.find(*hs.add(k)));
-                return (p.add(nl.trailing_zeros() as usize + 1), std::slice::from_raw_parts(ids.add(LAG), n - LAG));
+                return (p.add(next as usize + 1), std::slice::from_raw_parts(ids.add(LAG), n - LAG));
             }
             p = p.add(next as usize);
         }
@@ -323,7 +332,7 @@ fn line(out: &mut String, docs: &Docs) {
     out.push('\n');
 }
 
-fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32, &[u32])) -> u32 {
+fn walk(s: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, &[u32])) -> u32 {
     let (mut p, end) = (s.as_ptr(), s.as_ptr_range().end);
     let mut doc = first;
     let mut buf = Doc(vec![0; LAG], vec![0; LAG]);
@@ -333,7 +342,7 @@ fn walk(s: &[u8], first: u32, t: &Terms, pre: *const u16, mut f: impl FnMut(u32,
                 p = p.add(1);
             }
             let ids;
-            (p, ids) = buf.read(p, t, pre);
+            (p, ids) = buf.read(p, t);
             f(doc, ids);
         }
         doc += 1;
@@ -443,11 +452,11 @@ fn main() {
         let samples = on_threads(|t| {
             let (mut df, mut last) = (vec![0u32; nterms + 1], vec![0u16; nterms + 1]);
             let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 64];
-            let n = walk(sample, 0, &terms, last.as_ptr(), |doc, toks| {
+            let n = walk(sample, 0, &terms, |doc, toks| {
                 let mark = (doc + 1) as u16;
-                for &id in toks {
-                    if std::mem::replace(&mut last[id as usize], mark) != mark {
-                        df[id as usize] += 1;
+                for i in toks.iter().map(|&id| (id as usize).min(nterms)) {
+                    if std::mem::replace(&mut last[i], mark) != mark {
+                        df[i] += 1;
                     }
                 }
             });
@@ -488,6 +497,18 @@ fn main() {
         let astart: Vec<usize> = (a0..=nkeep).map(first_of).collect();
         (nbits, a0, lists, nkeep, anchored, astart)
     };
+    // Each anchor's first phrase in one 16-byte head, read where the anchor
+    // is met: the query, the term at the window's other end, and the anchor's
+    // place in the phrase, its length and the number of further phrases.
+    let heads: Vec<[u32; 4]> = (0..nkeep - a0)
+        .map(|k| {
+            let (_, q, j) = anchored[astart[k]];
+            let (_, from, to) = spans[q as usize];
+            let e = if j == 0 { to - from - 1 } else { 0 };
+            let more = (astart[k + 1] - astart[k] - 1) as u32;
+            [q, ids[(from + e) as usize], j | e << 8 | more << 16, 0]
+        })
+        .collect();
 
     let words = ndocs.div_ceil(256) * 4;
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
@@ -505,10 +526,8 @@ fn main() {
                 }
             }
         };
-        // A list term's mark sits at its id less nbits, so the tokenizer
-        // prefetches it at this pointer plus the id.
-        let (share, pre) = (&text[cut[t]..cut[t + 1]], last.as_ptr().wrapping_sub(nbits));
-        walk(share, first, &terms, pre, |doc, toks| {
+        let share = &text[cut[t]..cut[t + 1]];
+        walk(share, first, &terms, |doc, toks| {
             if doc as usize / 64 != block {
                 let w = std::mem::replace(&mut block, doc as usize / 64);
                 flush(&mut pending, w);
@@ -518,9 +537,19 @@ fn main() {
             let (a0, nbits) = (a0 as u32, nbits as u32);
             kept.resize(kept.len().max(toks.len()), 0);
             anchors.resize(anchors.len().max(toks.len()), 0);
-            // Three short loops, each with few enough values to stay in
-            // registers. Other tokens' bits go to 8 spare words, taken in
-            // turn, so no store waits on the one before.
+            // Short loops, each with few enough values to stay in registers.
+            // The anchors' heads are fetched while the others run. Other
+            // tokens' bits go to 8 spare words, taken in turn, so no store
+            // waits on the one before.
+            let mut na = 0;
+            for (at, &id) in toks.iter().enumerate() {
+                unsafe { *anchors.get_unchecked_mut(na) = at };
+                na += ((id.wrapping_sub(a0) as usize) < nanchors) as usize;
+            }
+            for &at in &anchors[..na] {
+                let head = heads.as_ptr().wrapping_add((toks[at] - a0) as usize);
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(head.cast()) };
+            }
             for (at, &id) in toks.iter().enumerate() {
                 unsafe { *pending.get_unchecked_mut(id.min(nbits + (at & 7) as u32) as usize) |= bit };
             }
@@ -533,23 +562,24 @@ fn main() {
                     n += (new & (i < nlists)) as usize;
                 }
             }
-            let mut na = 0;
-            for (at, &id) in toks.iter().enumerate() {
-                unsafe { *anchors.get_unchecked_mut(na) = at };
-                na += ((id.wrapping_sub(a0) as usize) < nanchors) as usize;
-            }
             for &at in &anchors[..na] {
                 let k = (toks[at] - a0) as usize;
-                for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
-                    let span = spans[q as usize];
-                    let phrase = &ids[span.1 as usize..span.2 as usize];
-                    // One term other than the anchor is compared first, so most
-                    // windows are turned down without the slice compare's call.
-                    let (s, e) = (at.wrapping_sub(j as usize), if j == 0 { phrase.len() - 1 } else { 0 });
-                    let near = toks.get(s.wrapping_add(e)) == phrase.get(e);
-                    if near && toks.get(s..s.wrapping_add(phrase.len())) == Some(phrase) {
+                let mut check = |q: u32, j: u32| {
+                    let (_, from, to) = spans[q as usize];
+                    let s = at.wrapping_sub(j as usize);
+                    if toks.get(s..s.wrapping_add((to - from) as usize)) == Some(&ids[from as usize..to as usize]) {
                         mine.push((q, doc));
                     }
+                };
+                // The first phrase is turned down on its other end's term
+                // unless that matches; further ones are compared whole.
+                let [q, end, info, _] = heads[k];
+                let (j, e) = (info & 255, info >> 8 & 255);
+                if toks.get((at + e as usize).wrapping_sub(j as usize)) == Some(&end) {
+                    check(q, j);
+                }
+                for &(_, q, j) in &anchored[astart[k] + 1..][..(info >> 16) as usize] {
+                    check(q, j);
                 }
             }
             for &i in &kept[..n] {
