@@ -37,7 +37,6 @@
 #include <vector>
 
 using u8 = uint8_t;
-using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
@@ -196,11 +195,7 @@ struct NamesSeen {
     // would fetch the line shared, then the OR would fetch it again exclusive.
     bool mark(u32 c, u32 name) {
         u64 bit = u64(1) << name % 64;
-        // Probe: a plain read-modify-write, no lock (racy: can lose a bit).
-        u64& w = reinterpret_cast<u64&>(word(c, name));
-        u64 old = w;
-        w = old | bit;
-        return !(old & bit);
+        return !(word(c, name).fetch_or(bit, std::memory_order_relaxed) & bit);
     }
 };
 
