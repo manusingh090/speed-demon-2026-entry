@@ -45,18 +45,17 @@ using i64 = int64_t;
     _exit(1);
 }
 
-// Zero-filled anonymous memory; pages are charged only once touched. Every
-// block is reserved in whole 2 MB pages, aligned (untouched address space
-// costs nothing); a huge one sits on 2 MB pages, the rest refuse them, as
+// Zero-filled anonymous memory; pages are charged only once touched. A huge
+// block sits on 2 MB pages (whole ones, aligned); the rest refuse them, as
 // the box runs huge pages always on.
 constexpr size_t HUGE_PAGE = 2 << 20;
 template <class T>
 T* zeroed(size_t n, bool huge = false) {
-    const size_t bytes = (n * sizeof(T) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
-    auto p = uintptr_t(mmap(nullptr, bytes + HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (p == uintptr_t(MAP_FAILED)) die("mmap");
-    p = (p + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
-    madvise(reinterpret_cast<void*>(p), bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+    const size_t bytes = huge ? (n * sizeof(T) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1) : n * sizeof(T);
+    auto* p = static_cast<char*>(mmap(nullptr, bytes + huge * HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) die("mmap");
+    if (huge) p = reinterpret_cast<char*>((uintptr_t(p) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
+    madvise(p, bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     return reinterpret_cast<T*>(p);
 }
 
