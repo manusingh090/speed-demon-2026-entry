@@ -123,7 +123,8 @@ The decisions that mattered, in order of what they bought:
 | 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | run-e1bf8b3072c9 | 0.097 | 39.9 | 77.93 |
 | 104 | Back to step 102's code (256 KiB slices, 200 to a phase, a 12-slice sample) | no run of its own | | | |
 | 105 | Slices of 128 KiB, 400 to a phase, a 24-slice sample (the same 3 MiB); shorter names (6 fewer counted lines) | run-9dc00bccecd0 | 0.095 | 42.6 | 78.11 |
-| 106 | Step 102's slices and sample again (256 KiB, 200 to a phase, 12), with step 105's shorter names | queued at the time of writing | | | |
+| 106 | Step 102's slices and sample again (256 KiB, 200 to a phase, 12), with step 105's shorter names | run-0b53079ad15e (also run-227b79cf2eff, run-d277caba6b4f, and run-35af3acb097e in a push where the box ran slow) | 0.0922 (0.0926, 0.0934, 0.1115) | 40.9 (41.2, 41.2, 40.4) | 78.53 (78.49, 78.39, 76.47) |
+| 107 | Back to step 102's code, the best run (run-be2f78572d3a): four runs of step 106 stayed under it | no run of its own yet | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 

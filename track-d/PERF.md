@@ -4,7 +4,7 @@ Every step from the reference to your final version, each with the live-board ru
 
 ## Where it stands
 
-Best run: **run-360759fad852**, 0.1243 s, 55.41 MiB, 707 counted lines, 71.92 points (step 38's code; step 34's best was run-c8d89b3d1e46, 0.1260 s and 71.81). The reference takes 72.69 s. The decisions that moved it most, each measured below:
+Best run: **run-459d0520484b**, 0.1226 s, 55.0 MiB, 707 counted lines, 72.10 points (step 38's code, the code in this folder, measured with commit 60e56b5; its first run was run-360759fad852, 0.1243 s and 71.92; step 34's best was run-c8d89b3d1e46, 0.1260 s and 71.81). The reference takes 72.69 s. The decisions that moved it most, each measured below:
 
 - **Renumbering nodes for locality**: node ids are a random relabelling, which cost about 480 ns per settled node. Compact 512-node BFS blobs (step 4) put a road neighbourhood on a few cache lines, and since step 31 the BFS copies each node's edges into the new order as it orders it.
 - **Bidirectional Dijkstra with distances in recycled 4 KB pages**: about 7.1 million settled nodes for 2,000 queries, in a few MB a thread instead of 167 MB of dense arrays.
@@ -71,6 +71,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 36d | Diagnostic: time to the first search reported through M, time to the end of the BFS through T | run-0a5e9b7be14b | (1.184 s) | (276 MiB) | |
 | 37 | Back to step 34's code | run-d2d4f27e8067 (also run-5fc51c420d92) | 0.1267 (0.1361) s | 55 MiB | 71.77 (70.96) |
 | 38 | Distance pages of 128 instead of 512; the search recomputes only the settled side's smallest key | run-360759fad852 | 0.1243 s | 55.4 MiB | 71.92 |
+| 38, again | Step 38's code, measured with a later commit (60e56b5) that only changed this log | run-459d0520484b | 0.1226 s | 55.0 MiB | 72.10 |
 
 ## What the profile said, step by step
 

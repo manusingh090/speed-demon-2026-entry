@@ -24,7 +24,7 @@ const HUGE_PAGE: usize = 1 << 21;
 // Bytes of text a worker takes at once.
 const SLICE: usize = 1 << 18;
 // Slices per phase: postings are rebuilt every this many.
-const PHASE_SLICES: usize = 200;
+const SLICES_PER_PHASE: usize = 200;
 // Postings before each list, holding a value no document has.
 const SENTINELS: usize = 1;
 const PLAN_PARTS: usize = 16;
@@ -37,19 +37,19 @@ const LINE_SLOTS: usize = 7;
 const ID_RUN: usize = 32;
 const MAX_TERMS: usize = LINES * LINE_SLOTS + 64 * ID_RUN;
 // Tokens between fetching a table line and reading it.
-const AHEAD: usize = 20;
+const PREFETCH_GAP: usize = 20;
 // Action bits: a bitmap term, a full line, a phrase to check.
 const BITMAP_FLAG: u32 = 1 << 31;
 const SPILL: u32 = 1 << 30;
 const CHECK_FLAG: u32 = 1 << 29;
-const MAX_BITS: usize = 4096;
+const MAX_BITMAPS: usize = 4096;
 // Lists are built in this many independent shards.
 const ROW_SHARDS: usize = 64;
-const DOC_BITS: u32 = 18;
+const DOC_ID_BITS: u32 = 18;
 const ROW_CHUNK: usize = 64;
-const JOB_QUERIES: usize = 64;
+const QUERIES_PER_JOB: usize = 64;
 const WORKER_BYTES: usize = 32 << 20;
-const MAX_WORDS: usize = 8;
+const WINDOW_MAX: usize = 8;
 
 /// One cache line of the term table: 7 tags, then 8 actions, the last for a miss.
 #[repr(C, align(64))]
@@ -64,12 +64,12 @@ struct Bench {
     ends: &'static mut [u32],
     lines: &'static mut [u32],
     hashes: &'static mut [u64],
-    bit_hits: &'static mut [u32],
-    bit_ends: &'static mut [u32],
+    bitmap_hits: &'static mut [u32],
+    bitmap_ends: &'static mut [u32],
     group: &'static mut [u64],
-    phrase_hits: &'static mut [u64],
+    window_hits: &'static mut [u64],
     acts: &'static mut [u32],
-    list_acts: &'static mut [u32],
+    list_actions: &'static mut [u32],
     list_ends: &'static mut [u32],
     check_hits: &'static mut [u64],
     counts: &'static mut [u32],
@@ -80,7 +80,7 @@ struct TermInfo {
     first: u32,
     count: u32,
     phrases: u32,
-    bitmaps_n: bool,
+    bitmap_count: bool,
     in_bool: bool,
 }
 
@@ -90,7 +90,7 @@ struct Window {
     len: u32,
     pivot: u32,
     next: u32,
-    words: [u64; MAX_WORDS],
+    words: [u64; WINDOW_MAX],
 }
 
 /// A BOOL operator.
@@ -199,7 +199,7 @@ impl Running {
 struct Engine {
     text: &'static [u8],
     docs: usize,
-    bit_words: usize,
+    bitmap_words: usize,
     buckets: *mut TermLine,
     terms: *mut TermInfo,
     term_count: AtomicUsize,
@@ -209,7 +209,7 @@ struct Engine {
     sample: &'static [AtomicU32],
     prep: [AtomicUsize; 6],
     phase: Vec<[AtomicUsize; 4]>,
-    phase_at: Vec<u32>,
+    phase_first: Vec<u32>,
     waiting: AtomicU32,
     epoch: AtomicU32,
     bitmaps: *mut u64,
@@ -222,7 +222,7 @@ struct Engine {
 unsafe impl Sync for Engine {}
 
 /// Address space on a 2 MiB boundary, huge pages on or off.
-unsafe fn map_region<T>(count: usize, huge: bool) -> *mut T {
+unsafe fn reserve_region<T>(count: usize, huge: bool) -> *mut T {
     let bytes = count * size_of::<T>();
     let region = mmap(null_mut(), bytes + HUGE_PAGE, 3, ANONYMOUS, -1, 0);
     let aligned = region.add(region.align_offset(HUGE_PAGE));
@@ -237,7 +237,7 @@ unsafe fn release(at: *const u8, len: usize) {
 
 /// A slice whose pages exist only once written.
 unsafe fn lazy_slice<T>(count: usize) -> &'static mut [T] {
-    std::slice::from_raw_parts_mut(map_region(count, false), count)
+    std::slice::from_raw_parts_mut(reserve_region(count, false), count)
 }
 
 /// The next part of a worker's arena.
@@ -462,13 +462,14 @@ impl Engine {
             let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
             let batch_doc = doc;
             let buckets = self.buckets;
-            let (bit_hits, list_acts) = (b.bit_hits.as_mut_ptr(), b.list_acts.as_mut_ptr());
+            let (bitmap_hits, list_actions) =
+                (b.bitmap_hits.as_mut_ptr(), b.list_actions.as_mut_ptr());
             let acts = b.acts.as_mut_ptr();
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
                 let from = token;
                 for t in from..to {
-                    let ahead = line_index(*hashes.add(t + AHEAD));
+                    let ahead = line_index(*hashes.add(t + PREFETCH_GAP));
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     *acts.add(t) = lookup(buckets, *hashes.add(t));
                 }
@@ -480,7 +481,7 @@ impl Engine {
                     } else {
                         (1u32 << (to - t)) - 1
                     };
-                    let bitmaps_n = _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 & valid;
+                    let bitmap_count = _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 & valid;
                     let list = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
                         v,
                         _mm256_setzero_si256(),
@@ -492,12 +493,12 @@ impl Engine {
                         ))
                     };
                     _mm256_storeu_si256(
-                        bit_hits.add(heavy_count).cast(),
-                        _mm256_permutevar8x32_epi32(v, pick(bitmaps_n)),
+                        bitmap_hits.add(heavy_count).cast(),
+                        _mm256_permutevar8x32_epi32(v, pick(bitmap_count)),
                     );
-                    heavy_count += bitmaps_n.count_ones() as usize;
+                    heavy_count += bitmap_count.count_ones() as usize;
                     _mm256_storeu_si256(
-                        list_acts.add(list_count).cast(),
+                        list_actions.add(list_count).cast(),
                         _mm256_permutevar8x32_epi32(v, pick(list)),
                     );
                     list_count += list.count_ones() as usize;
@@ -515,7 +516,7 @@ impl Engine {
                     t += 8;
                 }
                 token = to;
-                *b.bit_ends.get_unchecked_mut(line) = heavy_count as u32;
+                *b.bitmap_ends.get_unchecked_mut(line) = heavy_count as u32;
                 *b.list_ends.get_unchecked_mut(line) = list_count as u32;
                 if line + 1 < line_count {
                     doc += 1;
@@ -541,27 +542,27 @@ impl Engine {
                         && token - pivot + len <= ready
                         && b.hashes[token - pivot..token - pivot + len] == phrase.words[..len]
                     {
-                        b.phrase_hits[phrase_count] =
+                        b.window_hits[phrase_count] =
                             (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
                         phrase_count += 1;
                     }
                 }
             }
             if !SAMPLE {
-                let (words, mut from) = (self.bitmaps_n().div_ceil(64), 0);
+                let (words, mut from) = (self.bitmap_count().div_ceil(64), 0);
                 for line in 0..line_count {
-                    let to = b.bit_ends[line] as usize;
+                    let to = b.bitmap_ends[line] as usize;
                     let rel = (batch_doc as usize + line
-                        - self.phase_at[claim / PHASE_SLICES] as usize)
+                        - self.phase_first[claim / SLICES_PER_PHASE] as usize)
                         % 64;
                     let row = &mut b.group[rel * words..(rel + 1) * words];
-                    for &action in &b.bit_hits[from..to] {
+                    for &action in &b.bitmap_hits[from..to] {
                         let id = (action & !BITMAP_FLAG) as usize;
                         row[id / 64] |= 1 << (id % 64);
                     }
                     from = to;
                     if rel == 63 {
-                        self.flush_rows(b.group, claim, batch_doc as usize + line);
+                        self.transpose_group(b.group, claim, batch_doc as usize + line);
                     }
                 }
             }
@@ -576,19 +577,19 @@ impl Engine {
                 if cursor.0 == cursor.1 {
                     *cursor = self.new_chunk(shard, claim);
                 }
-                *cursor.0 = ((term >> ROW_SHARDS.trailing_zeros()) + 1) << DOC_BITS | hit as u32;
+                *cursor.0 = ((term >> ROW_SHARDS.trailing_zeros()) + 1) << DOC_ID_BITS | hit as u32;
                 cursor.0 = cursor.0.add(1);
             };
             let mut from = 0;
             for line in 0..line_count {
                 let to = b.list_ends[line] as usize;
                 let doc = (batch_doc as usize + line) as u64;
-                for &action in &b.list_acts[from..to] {
+                for &action in &b.list_actions[from..to] {
                     emit((action as u64) << 32 | doc);
                 }
                 from = to;
             }
-            for &hit in &b.phrase_hits[..phrase_count] {
+            for &hit in &b.window_hits[..phrase_count] {
                 emit(hit);
             }
             b.lines[0] = 0;
@@ -599,22 +600,22 @@ impl Engine {
             end_count -= ready;
         }
         if !SAMPLE {
-            self.flush_rows(b.group, claim, doc as usize);
+            self.transpose_group(b.group, claim, doc as usize);
         }
         doc - first_doc + 1
     }
 
     /// Terms that have a bitmap.
-    fn bitmaps_n(&self) -> usize {
-        self.prep[3].load(Relaxed).min(MAX_BITS)
+    fn bitmap_count(&self) -> usize {
+        self.prep[3].load(Relaxed).min(MAX_BITMAPS)
     }
 
     /// Moves 64 documents' bitmap rows into the bitmaps, one 64x64 transpose per word.
-    unsafe fn flush_rows(&self, group: &mut [u64], claim: usize, doc: usize) {
-        let phase = claim / PHASE_SLICES;
-        let rel = doc - self.phase_at[phase] as usize;
-        let (bitmaps_n, out) = (self.bitmaps_n(), self.bitmap_at(0, phase).add(rel / 64));
-        let words = bitmaps_n.div_ceil(64);
+    unsafe fn transpose_group(&self, group: &mut [u64], claim: usize, doc: usize) {
+        let phase = claim / SLICES_PER_PHASE;
+        let rel = doc - self.phase_first[phase] as usize;
+        let (bitmap_count, out) = (self.bitmap_count(), self.bitmap_at(0, phase).add(rel / 64));
+        let words = bitmap_count.div_ceil(64);
         for k in 0..words {
             let mut m: [u64; 64] =
                 std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
@@ -626,8 +627,8 @@ impl Engine {
                     m[r] ^= t << width;
                 }
             }
-            for (t, &bits) in m.iter().enumerate().take(bitmaps_n - k * 64) {
-                *out.add((k * 64 + t) * self.bit_words) |= bits;
+            for (t, &bits) in m.iter().enumerate().take(bitmap_count - k * 64) {
+                *out.add((k * 64 + t) * self.bitmap_words) |= bits;
             }
         }
     }
@@ -661,7 +662,7 @@ impl Engine {
     }
 
     /// Gives each phrase its rarest word in the sample as the word that triggers its check.
-    unsafe fn pick_anchors(&self, slice: usize) {
+    unsafe fn choose_anchors(&self, slice: usize) {
         let count = self.prep[5].load(Relaxed);
         for index in count * slice / PLAN_PARTS..count * (slice + 1) / PLAN_PARTS {
             let phrase = &mut *self.phrases.add(index);
@@ -677,7 +678,7 @@ impl Engine {
     }
 
     /// Sets each term's scan action once anchors and bitmaps are chosen.
-    unsafe fn set_actions(&self, slice: usize) {
+    unsafe fn finish_actions(&self, slice: usize) {
         let docs = self.prep[4].load(Relaxed);
         for index in LINES * slice / PLAN_PARTS..LINES * (slice + 1) / PLAN_PARTS {
             let bucket = &mut *self.buckets.add(index);
@@ -692,10 +693,10 @@ impl Engine {
                 } else if !term.in_bool {
                     *action = 0;
                 } else if self.sample[id].load(Relaxed) as usize * 32 >= docs {
-                    let bitmaps_n = self.prep[3].fetch_add(1, Relaxed);
-                    if bitmaps_n < MAX_BITS {
-                        *action = BITMAP_FLAG | bitmaps_n as u32;
-                        (term.bitmaps_n, term.first) = (true, bitmaps_n as u32);
+                    let bitmap_count = self.prep[3].fetch_add(1, Relaxed);
+                    if bitmap_count < MAX_BITMAPS {
+                        *action = BITMAP_FLAG | bitmap_count as u32;
+                        (term.bitmap_count, term.first) = (true, bitmap_count as u32);
                     }
                 }
             }
@@ -703,8 +704,8 @@ impl Engine {
     }
 
     /// Turns one shard's rows into sorted, deduplicated postings for the phase.
-    unsafe fn build_lists(&self, shard: usize, phase: usize) {
-        let base = self.phase_at[phase];
+    unsafe fn shard_postings(&self, shard: usize, phase: usize) {
+        let base = self.phase_first[phase];
         let region = self.rows.add(shard * (self.text.len() + 4096));
         let shard_fill = self.shard_fill[shard].load(Relaxed);
         let mut chunks: Vec<(u32, u32)> = (0..shard_fill)
@@ -744,27 +745,27 @@ impl Engine {
         }
         std::ptr::write_bytes(region, 0, shard_fill);
         self.shard_fill[shard].store(0, Relaxed);
-        let bitmaps_n = self.bitmaps_n();
+        let bitmap_count = self.bitmap_count();
         let (from, to) = (
-            bitmaps_n * shard / ROW_SHARDS,
-            bitmaps_n * (shard + 1) / ROW_SHARDS,
+            bitmap_count * shard / ROW_SHARDS,
+            bitmap_count * (shard + 1) / ROW_SHARDS,
         );
         let first = self.bitmap_at(from as u32, phase + 1);
-        std::ptr::write_bytes(first, 0, (to - from) * self.bit_words);
+        std::ptr::write_bytes(first, 0, (to - from) * self.bitmap_words);
     }
 
     /// Bitmap of a term in a phase; two sets alternate between phases.
     unsafe fn bitmap_at(&self, index: u32, phase: usize) -> *mut u64 {
-        let set = (phase & 1) * MAX_BITS + index as usize;
-        self.bitmaps.add(set * self.bit_words)
+        let set = (phase & 1) * MAX_BITMAPS + index as usize;
+        self.bitmaps.add(set * self.bitmap_words)
     }
 
     /// A term's documents in a phase.
     unsafe fn docs_of(&self, term: u32, phase: usize) -> Docs {
         let info = &*self.terms.add(term as usize);
-        if info.bitmaps_n {
+        if info.bitmap_count {
             let bits = self.bitmap_at(info.first, phase);
-            return Docs::Bits(std::slice::from_raw_parts(bits, self.bit_words));
+            return Docs::Bits(std::slice::from_raw_parts(bits, self.bitmap_words));
         }
         let docs = self.postings.add(info.first as usize + SENTINELS);
         Docs::List(std::slice::from_raw_parts(docs, info.count as usize))
@@ -784,8 +785,8 @@ impl Engine {
 
     /// Answers a batch of queries on a phase into their running results.
     unsafe fn answer_batch(&self, (share, first, batch): Job, phase: usize, scratch: &mut Spare) {
-        let base = self.phase_at[phase];
-        let end = (first + JOB_QUERIES).min(share.queries.len());
+        let base = self.phase_first[phase];
+        let end = (first + QUERIES_PER_JOB).min(share.queries.len());
         let tallies = share.tallies.as_ptr() as *mut Running;
         let steps_of = |at: usize| &share.steps[share.queries[at].clone()];
         let prefetch = |at: usize, lists: bool| {
@@ -793,7 +794,7 @@ impl Engine {
                 let info = &*self.terms.add(term as usize);
                 if !lists {
                     _mm_prefetch::<_MM_HINT_T0>((info as *const TermInfo).cast());
-                } else if !info.bitmaps_n {
+                } else if !info.bitmap_count {
                     let list = self.postings.add(info.first as usize);
                     for line in 0..(info.count as usize).div_ceil(32).min(6) {
                         _mm_prefetch::<_MM_HINT_T0>(list.add(line * 32).cast());
@@ -813,8 +814,8 @@ impl Engine {
                 Docs::Bits(bits) => tally.add_bitmap(base, bits),
             }
         }
-        if phase + 1 == self.phase_at.len() - 1 {
-            let mut out = Vec::with_capacity(JOB_QUERIES * 64);
+        if phase + 1 == self.phase_first.len() - 1 {
+            let mut out = Vec::with_capacity(QUERIES_PER_JOB * 64);
             for index in first..end {
                 (*tallies.add(index)).write(&mut out);
             }
@@ -848,7 +849,7 @@ impl Engine {
             }
             let phrase = line[0] == b'P';
             let body = &line[if phrase { 8 } else { 5 }..line.len() - phrase as usize];
-            let (first, mut words, mut count) = (parsed.steps.len(), [0; MAX_WORDS], 0);
+            let (first, mut words, mut count) = (parsed.steps.len(), [0; WINDOW_MAX], 0);
             for word in body.split(|&c| c == b' ') {
                 match word {
                     b"AND" => op = Op::And,
@@ -887,13 +888,13 @@ impl Engine {
             starts: carve(&mut next, tokens),
             ends: carve(&mut next, tokens),
             lines: carve(&mut next, TEXT_BATCH / 2 + 64),
-            hashes: carve(&mut next, tokens + AHEAD),
-            bit_hits: carve(&mut next, tokens),
-            bit_ends: carve(&mut next, TEXT_BATCH / 2 + 64),
-            group: carve(&mut next, 64 * MAX_BITS / 64),
-            phrase_hits: carve(&mut next, tokens),
+            hashes: carve(&mut next, tokens + PREFETCH_GAP),
+            bitmap_hits: carve(&mut next, tokens),
+            bitmap_ends: carve(&mut next, TEXT_BATCH / 2 + 64),
+            group: carve(&mut next, 64 * MAX_BITMAPS / 64),
+            window_hits: carve(&mut next, tokens),
             acts: carve(&mut next, tokens + 8),
-            list_acts: carve(&mut next, tokens + 8),
+            list_actions: carve(&mut next, tokens + 8),
             list_ends: carve(&mut next, TEXT_BATCH / 2 + 64),
             check_hits: carve(&mut next, tokens),
             counts: carve(&mut next, MAX_TERMS),
@@ -909,27 +910,29 @@ impl Engine {
         }
         release(buffers.counts.as_ptr().cast(), MAX_TERMS * 4);
         self.sync_all();
-        self.take_jobs(&self.prep[1], PLAN_PARTS, |slice| self.pick_anchors(slice));
+        self.take_jobs(&self.prep[1], PLAN_PARTS, |slice| {
+            self.choose_anchors(slice)
+        });
         self.sync_all();
-        self.take_jobs(&self.prep[2], PLAN_PARTS, |part| self.set_actions(part));
+        self.take_jobs(&self.prep[2], PLAN_PARTS, |part| self.finish_actions(part));
         self.sync_all();
 
         let mut units = Vec::new();
         for share in self.shares.iter().map(|share| share.get().unwrap()) {
-            for first in (0..share.queries.len()).step_by(JOB_QUERIES) {
+            for first in (0..share.queries.len()).step_by(QUERIES_PER_JOB) {
                 units.push((share, first, units.len()));
             }
         }
         let mut scratch = Spare {
-            bits: vec![0; self.bit_words],
-            marks: vec![0; self.bit_words],
+            bits: vec![0; self.bitmap_words],
+            marks: vec![0; self.bitmap_words],
             ..Default::default()
         };
-        let phases = self.phase_at.len() - 1;
+        let phases = self.phase_first.len() - 1;
         for stage in 0..=phases {
             if stage < phases {
-                self.take_jobs(&self.phase[stage][0], PHASE_SLICES, |claim| {
-                    self.scan_claim::<false>(stage * PHASE_SLICES + claim, &mut buffers);
+                self.take_jobs(&self.phase[stage][0], SLICES_PER_PHASE, |claim| {
+                    self.scan_claim::<false>(stage * SLICES_PER_PHASE + claim, &mut buffers);
                 });
             }
             if stage > 0 {
@@ -946,9 +949,9 @@ impl Engine {
                     |n: usize| (self.text.len() * n / self.shares.len()).div_ceil(4096) * 4096;
                 release(self.text.as_ptr().add(page(id)), page(id + 1) - page(id));
             }
-            assert!(self.phase_at[stage + 1] - self.phase_at[stage] < u16::MAX as u32);
+            assert!(self.phase_first[stage + 1] - self.phase_first[stage] < u16::MAX as u32);
             self.take_jobs(&self.phase[stage][1], ROW_SHARDS, |shard| {
-                self.build_lists(shard, stage)
+                self.shard_postings(shard, stage)
             });
             self.sync_all();
         }
@@ -964,7 +967,10 @@ unsafe fn each_row(region: *const u32, chunks: &[(u32, u32)], mut visit: impl Fn
             if row == 0 {
                 break;
             }
-            visit((row >> DOC_BITS) as usize - 1, row & ((1 << DOC_BITS) - 1));
+            visit(
+                (row >> DOC_ID_BITS) as usize - 1,
+                row & ((1 << DOC_ID_BITS) - 1),
+            );
         }
     }
 }
@@ -1172,36 +1178,36 @@ fn main() {
         let [text, queries] = ["/data/docs.txt", "/data/queries.txt"].map(|path| map_input(path));
         let last_line = text.rsplit(|&c| c == b'\n').nth(1);
         let docs = last_line.map_or(0, |line| line_id(line.as_ptr()) + 1);
-        assert!(docs < 1 << DOC_BITS);
-        let phases = text.len().div_ceil(PHASE_SLICES * SLICE).max(1);
-        let phase_at: Vec<u32> = (0..=phases)
-            .map(|phase| line_at_64(text, docs, phase * PHASE_SLICES * SLICE).1 as u32)
+        assert!(docs < 1 << DOC_ID_BITS);
+        let phases = text.len().div_ceil(SLICES_PER_PHASE * SLICE).max(1);
+        let phase_first: Vec<u32> = (0..=phases)
+            .map(|phase| line_at_64(text, docs, phase * SLICES_PER_PHASE * SLICE).1 as u32)
             .collect();
-        let widest = phase_at.windows(2).fold(0, |m, w| m.max(w[1] - w[0]));
-        let bit_words = (widest as usize / 64 + 2).next_multiple_of(4);
-        let batches = queries.len() / (7 * JOB_QUERIES) + threads;
+        let widest = phase_first.windows(2).fold(0, |m, w| m.max(w[1] - w[0]));
+        let bitmap_words = (widest as usize / 64 + 2).next_multiple_of(4);
+        let batches = queries.len() / (7 * QUERIES_PER_JOB) + threads;
         let run = Engine {
             text,
             docs,
-            bit_words,
-            buckets: map_region(LINES, true),
-            terms: map_region(MAX_TERMS, true),
+            bitmap_words,
+            buckets: reserve_region(LINES, true),
+            terms: reserve_region(MAX_TERMS, true),
             term_count: AtomicUsize::new(0),
             queries,
             shares: (0..threads).map(|_| OnceLock::new()).collect(),
-            phrases: map_region(MAX_TERMS, false),
+            phrases: reserve_region(MAX_TERMS, false),
             sample: lazy_slice(MAX_TERMS),
             prep: [0; 6].map(AtomicUsize::new),
             phase: (0..phases).map(|_| Default::default()).collect(),
-            phase_at,
+            phase_first,
             waiting: Default::default(),
             epoch: Default::default(),
-            bitmaps: map_region(2 * MAX_BITS * bit_words, true),
-            rows: map_region(ROW_SHARDS * (text.len() + 4096), false),
+            bitmaps: reserve_region(2 * MAX_BITMAPS * bitmap_words, true),
+            rows: reserve_region(ROW_SHARDS * (text.len() + 4096), false),
             shard_fill: (0..ROW_SHARDS).map(|_| AtomicUsize::new(0)).collect(),
-            postings: map_region(text.len() + HUGE_PAGE, true),
+            postings: reserve_region(text.len() + HUGE_PAGE, true),
             outputs: (0..batches).map(|_| Mutex::default()).collect(),
-            arena: map_region(threads * WORKER_BYTES, false),
+            arena: reserve_region(threads * WORKER_BYTES, false),
         };
         run.buckets.cast::<u8>().write_volatile(0);
         prctl(41, 1, 0, 0, 0);

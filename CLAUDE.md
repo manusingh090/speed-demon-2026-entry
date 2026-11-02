@@ -85,21 +85,25 @@ A track folder that is byte-identical to the starter (ignoring Markdown and `.sp
 
 ## 4. Status
 
-| Track | State | Local wall | Local peak | Notes |
+Each track folder holds the code of its best board run (restored Nov 2, about 12:00 UTC). Board T and M are the box's own numbers.
+
+| Track | Language | Best run | Commit measured | T | M | S | Points | Rank (of scored) |
+|---|---|---|---|---|---|---|---|---|
+| A | C++ | run-7f6a46f87af4 (step 71) | a0e183d | 0.0189 s | 14.14 MiB | 405 | 86.16 | 11 of 137 |
+| B | Rust | run-be2f78572d3a (step 102) | 5afe647 | 0.0907 s | 41.4 MiB | 1,103 | 78.70 | 11 of 110 |
+| C | C++ | run-42430f7979bf (step 48) | 05e40e1 | 0.0228 s | 8.15 MiB | 425 | 81.93 | 16 of 117 |
+| D | C++ | run-459d0520484b (step 38) | 60e56b5 | 0.1226 s | 55.0 MiB | 707 | 72.10 | 17 of 117 |
+
+Board leaders at 11:59 UTC on Nov 2 (refresh with `python tools/board.py`):
+
+| Track | Leader | Best K | Leader's T / M / S | Points |
 |---|---|---|---|---|
-| A | C++, pushed, all hashes pass incl. worked example | 35 to 46 ms | 33 MB | S 222 after clang-format (was 373; ref 56); see track-a/README.md |
-| B | C++, pushed, all hashes pass incl. worked | 0.30 to 0.35 s | 71 MB | S about 790 after clang-format (ref 91); tiny hash dcdad7ce..., worked 9c296c06...; see section 7 |
-| C | C++, pushed, all hashes pass incl. worked and rules examples | 62 to 77 ms | 13 MB | S about 374 after clang-format (ref 108); see track-c/README.md |
-| D | C++, pushed, all hashes pass incl. worked | 0.42 to 0.45 s | 85 MB | S about 285 after clang-format (ref 43); tiny hash ecaca77d..., worked 2e9871bb...; see track-d/README.md |
+| A | LippInc | 62.5 | 0.0140 s / 13.5 MiB / 383 lines | 89.79 |
+| B | LippInc | 50.2 | 0.0554 s / 40.1 MiB / 819 lines | 85.02 |
+| C | LippInc | 53.0 | 0.0162 s / 7.5 MiB / 394 lines | 86.20 |
+| D | SweetDreams | 34.2 | 0.0855 s / 54.9 MiB / 578 lines | 76.68 |
 
-Board snapshot, Oct 30 17:35 UTC (58 teams; refresh with `python tools/board.py`). Board T values are the box's own timer and read much lower than our laptop's in-container timer, so compare K, not seconds:
-
-| Track | Teams with runs | Best K | Leader's T / M / S |
-|---|---|---|---|
-| A | 38 | 37.8 | 0.03 s / 28 MB / 210 lines |
-| B | 26 | 20.5 | 0.27 s / 69 MB / 832 lines |
-| C | 29 | 26.0 | 0.07 s / 10 MB / 275 lines |
-| D | 33 | 17.9 | 0.27 s / 86 MB / 508 lines |
+Single board runs of the same code spread by 2 to 20% (a push where every track runs slow is common), so the best run of a code version is a lucky draw as much as a measure; compare several runs before deciding.
 
 For the overall title we need three tracks. D has the lowest bar and a clear algorithm; C rewards care more than raw speed; A is the most crowded and the bar is very high.
 
