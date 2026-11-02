@@ -434,7 +434,7 @@ int main() {
     // records.csv: skip the BOM and header, then split after CRLFs into eight
     // pieces per thread, claimed in turn, so a thread whose pieces are slow
     // (more first sightings of names) is evened out by the others.
-    size_t start = size ? static_cast<const char*>(memchr(records, '\n', size)) - records + 1 : 0;
+    size_t start = static_cast<const char*>(memchr(records, '\n', size)) - records + 1;
     const int pieces = 8 * nthreads;
     std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
     NameTable names;
@@ -491,12 +491,8 @@ int main() {
             sum.amount_max = std::max(sum.amount_max, t.amount_max);
         }
         if (sum.count == 0) continue;
-        if (c == 0) {
-            out += "_UNMATCHED";
-        } else {
-            u32 k = codes[c - 1];
-            out += {char('A' + (k >> 10)), char('A' + (k >> 5 & 31)), char('A' + (k & 31))};
-        }
+        u32 k = c ? codes[c - 1] : 0;
+        out += c ? std::string{char('A' + (k >> 10)), char('A' + (k >> 5 & 31)), char('A' + (k & 31))} : "_UNMATCHED";
         for (u64 v : {sum.count, sum.id_sum}) out += ' ' + std::to_string(v);
         for (i64 v : {sum.amount_sum, sum.amount_min, sum.amount_max}) put_money(out, v);
         for (u64 v : {sum.distinct, sum.name_bytes, sum.note_bytes}) out += ' ' + std::to_string(v);
