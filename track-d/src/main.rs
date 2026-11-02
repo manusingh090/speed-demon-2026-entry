@@ -255,6 +255,100 @@ impl<T: Len> Heap<T> {
     }
 }
 
+const SPAN: usize = 2048; // keys the bucket queue covers ahead of its minimum
+const NIL: u32 = u32::MAX;
+
+/// A monotone priority queue for Dijkstra (Dial's buckets, circular): a key
+/// less than SPAN above the current minimum goes into bucket key % SPAN, which
+/// then holds that key only, as a list threaded through one entry array whose
+/// freed slots are reused; a bitmap finds the next nonempty bucket. Keys
+/// further ahead (edges of SPAN or more, rare here) wait in a heap. Push and
+/// pop take a few instructions where a heap's pop sifts through every level.
+struct Queue {
+    cur: u64, // the smallest key queued, once min has run
+    len: usize,
+    bits: [u64; SPAN / 64],
+    head: Vec<u32>,        // bucket -> its first entry
+    ent: Vec<(u32, u32)>,  // (node, next entry in its bucket or free list)
+    free: u32,
+    far: Heap<u64>,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Queue { cur: 0, len: 0, bits: [0; SPAN / 64], head: vec![NIL; SPAN], ent: Vec::new(), free: NIL, far: Heap::default() }
+    }
+    /// Queues node v at key k, never below the current minimum.
+    fn push(&mut self, k: u64, v: u32) {
+        self.len += 1;
+        if k - self.cur >= SPAN as u64 {
+            return self.far.push(k, v);
+        }
+        let b = k as usize % SPAN;
+        let e = (v, self.head[b]);
+        let i = if self.free == NIL {
+            self.ent.push(e);
+            self.ent.len() - 1
+        } else {
+            let i = self.free as usize;
+            (self.free, self.ent[i]) = (self.ent[i].1, e);
+            i
+        };
+        self.head[b] = i as u32;
+        self.bits[b / 64] |= 1 << (b % 64);
+    }
+    /// The smallest key queued, which becomes the current minimum.
+    fn min(&mut self) -> Option<u64> {
+        if self.len == 0 {
+            return None;
+        }
+        // The first nonempty bucket at or after cur's, circularly.
+        let (from, words) = (self.cur as usize % SPAN, SPAN / 64);
+        let mut gap = match self.bits[from / 64] >> (from % 64) {
+            0 => (1..=words).find_map(|i| match self.bits[(from / 64 + i) % words] {
+                0 => None,
+                w => Some(i * 64 + w.trailing_zeros() as usize - from % 64),
+            }),
+            w => Some(w.trailing_zeros() as usize),
+        }
+        .map_or(INF, |g| self.cur + g as u64);
+        if let Some(&(k, _)) = self.far.0.first() {
+            gap = gap.min(k);
+        }
+        self.cur = gap;
+        Some(gap)
+    }
+    /// Takes an entry at the current minimum (min must have found one); also
+    /// returns the next node in its bucket, if any.
+    fn pop(&mut self) -> (u64, u32, Option<u32>) {
+        self.len -= 1;
+        let b = self.cur as usize % SPAN;
+        let i = self.head[b];
+        if i == NIL {
+            let (k, v) = self.far.pop();
+            return (k, v, None);
+        }
+        let (v, next) = self.ent[i as usize];
+        (self.head[b], self.ent[i as usize].1, self.free) = (next, self.free, i);
+        if next == NIL {
+            self.bits[b / 64] &= !(1 << (b % 64));
+            return (self.cur, v, None);
+        }
+        (self.cur, v, Some(self.ent[next as usize].0))
+    }
+    fn clear(&mut self) {
+        for (w, bits) in self.bits.iter_mut().enumerate() {
+            while *bits != 0 {
+                self.head[w * 64 + bits.trailing_zeros() as usize] = NIL;
+                *bits &= *bits - 1;
+            }
+        }
+        (self.cur, self.len, self.free) = (0, 0, NIL);
+        self.ent.clear();
+        self.far.0.clear();
+    }
+}
+
 /// Tentative distances in pages of 512, handed out on first touch and taken
 /// back after each query, so a thread's memory follows its largest search.
 struct Dist<T> {
@@ -308,12 +402,12 @@ type Graph<'a> = (&'a Offs, &'a [u32], &'a [(u32, u32)], u32);
 /// One side of a search, with distances stored as T.
 struct Side<T> {
     dist: Dist<T>,
-    queue: Heap<T>,
+    queue: Queue,
 }
 
 impl<T: Len> Side<T> {
     fn new(n: usize) -> Self {
-        Side { dist: Dist::new(n), queue: Heap::default() }
+        Side { dist: Dist::new(n), queue: Queue::new() }
     }
 
     /// Settles the next queued node and relaxes its edges; returns the best
@@ -322,12 +416,11 @@ impl<T: Len> Side<T> {
     fn settle(&mut self, g: Graph, other: &Dist<T>, mut best: u64, over: &mut bool) -> u64 {
         let (off, adj, heavy, hb) = g;
         let (hmask, big) = ((1 << hb) - 1, u32::MAX >> hb);
-        let (d, u) = self.queue.pop();
-        if let Some(&(_, next)) = self.queue.0.first() {
+        let (d, u, next) = self.queue.pop();
+        if let Some(next) = next {
             // Its offsets were fetched when it was queued; start on its edges.
             prefetch(adj.as_ptr().wrapping_add(off.at(next as usize) as usize));
         }
-        let d: u64 = d.into();
         if d > self.dist.get(u) {
             return best;
         }
@@ -344,7 +437,7 @@ impl<T: Len> Side<T> {
                 let slot = self.dist.at(v);
                 if nt < *slot {
                     *slot = nt;
-                    self.queue.push(nt, v);
+                    self.queue.push(nd, v);
                     prefetch(off.rel.as_ptr().wrapping_add(v as usize));
                     best = best.min(nd.saturating_add(other.get(v)));
                 }
@@ -364,20 +457,20 @@ fn search<T: Len>(side: &mut [Side<T>; 2], g: [Graph; 2], s: u32, t: u32) -> (u6
     let (mut best, mut over) = (INF, false);
     for (x, v) in side.iter_mut().zip([s, t]) {
         *x.dist.at(v) = 0.into();
-        x.queue.push(0.into(), v);
+        x.queue.push(0, v);
     }
-    while let (Some(a), Some(b)) = (side[0].queue.0.first(), side[1].queue.0.first()) {
-        if a.0.into() + b.0.into() >= best {
+    while let (Some(a), Some(b)) = (side[0].queue.min(), side[1].queue.min()) {
+        if a + b >= best {
             break;
         }
         let [f, r] = &mut *side;
-        best = match r.queue.0.len() < f.queue.0.len() {
+        best = match r.queue.len < f.queue.len {
             true => r.settle(g[1], &f.dist, best, &mut over),
             false => f.settle(g[0], &r.dist, best, &mut over),
         };
     }
     for x in side.iter_mut() {
-        x.queue.0.clear();
+        x.queue.clear();
         x.dist.reset();
     }
     (best, over)
@@ -506,14 +599,14 @@ fn main() {
             }
             for f in &filed {
                 let mut h = f.heavy[p].iter();
-                for (o, x) in f.records(p) {
+                f.records(p).for_each(|(o, x)| {
                     let c = &mut cursor[o];
                     if x >> hb == big {
                         heavy.push((*c, *h.next().unwrap()));
                     }
                     unsafe { *lr.at(*c as usize) = x };
                     *c += 1;
-                }
+                });
             }
         }
         })

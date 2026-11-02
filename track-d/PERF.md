@@ -53,7 +53,8 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 29 | Back to step 26's code | pending | | | |
 | 30 | Offsets packed group by group; the distance lookup's fast path inlined, the page hand-out out of line | run-3abb5a273094 | 0.157 s | 55 MiB | 69.66 |
 | 31 | The BFS copies each node's edges into its thread's region of the new edge array as it orders it; one pass maps heads and counts in-degrees (no renumbering pass, no separate count) | run-7a0d6f42cbe9 (best run-851a07a5ae88) | 0.154 (0.151) s | 55 MiB | 69.90 (70.03) |
-| 32 | The BFS no longer prefetches its heads' claim flags | pending | | | |
+| 32 | The BFS no longer prefetches its heads' claim flags | run-70e8045774b8 (best run-5084ada06aad) | 0.152 (0.144) s | 55 MiB | 70.00 (70.60) |
+| 33 | The searches' 4-ary heaps replaced by circular bucket queues (Dial's algorithm), with a heap only for keys 2048 or more ahead | pending | | | |
 
 ## What the profile said, step by step
 
@@ -168,6 +169,10 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Step 31 on the board.** run-7a0d6f42cbe9: 0.154 s, 55 MiB, 651 counted lines, 69.90 points; a second run of the same code (run-851a07a5ae88, from a later commit) 0.151 s and 70.03 points, the best so far.
 
 **Step 31 to 32.** With the edge lists now read once by the BFS, its lookahead walked each upcoming node's list a second time only to prefetch claim flags. Without it the BFS measured the same or slightly faster (single-CPU 194 to 206 ms against 203 to 213; twelve threads 18.8 to 26.3 ms against 23.1 to 27.0), and longer lookahead distances (16 and 8 instead of 8 and 4) changed nothing. Four lines fewer. Same hash on all thirty datasets.
+
+**Step 32 on the board.** run-5084ada06aad: 0.144 s, 55 MiB, 70.60 points, the best so far; a second run of the same code (run-70e8045774b8) 0.152 s.
+
+**Step 32 to 33: the priority queue.** The leaders now run in about 0.09 s at the same 55 MB, so the gap is time. Phase laps (twelve threads, laptop): parse 25 ms, build 68 ms, searches 80 ms. `perf record` on cycles put 51% of all samples in the search's settle, and mapping them onto its disassembly showed where: the 4-ary heap's pop alone was 19.6% of all cycles and its push 3%, so the heap was about 45% of the search. Counted, the searches do 7.57 million pops, 7.12 million settles, 21 million relaxations and 8.6 million pushes; a pop sifts a heap of thousands of entries through five or six levels, each with a dependent load and an unpredictable branch. Edge weights here are small integers (a road's length over its speed, mostly 50 to 1,500), which is the case Dial's algorithm is made for (Cherkassky, Goldberg and Radzik, Shortest paths algorithms: theory and experimental evaluation, 1996, found bucket-based queues fastest on such graphs). Each side now keeps 2048 buckets in a circle: a key less than 2048 above the current minimum goes into bucket key mod 2048, which then holds that one key, as a list threaded through an entry array whose freed slots are reused (so the memory follows the live entries, as the heap's did), and a 2048-bit map finds the next nonempty bucket with a trailing-zero count. A key further ahead, from an edge of 2048 or more (the injected heavy edges and a few slow diagonals), waits in the old heap, and the minimum is the smaller of the two. Push and pop are now a few instructions each, and the next entry of the bucket just popped is the next node settled, so its edges are prefetched as before. Four `perf stat -r 5` rounds: 3.72 to 3.77 against 4.42 to 4.54 billion cycles (minus 17% overall, about 31% of the search), 5.15 against 6.39 billion instructions, wall 0.129 to 0.136 against 0.155 to 0.220 s. Same hash on all thirty datasets.
 
 ## Tried and kept out
 
