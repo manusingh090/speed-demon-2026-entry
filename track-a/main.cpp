@@ -21,10 +21,11 @@
 // is caught (each hour counts the threads filing into it), and the pass is
 // then redone with every hour held open to the end.
 //
-// Text. Each group keeps its numbers and the exact size of its line. Once
-// every hour is done the sizes become offsets, the output is mapped at its
-// final size and every thread formats its hours straight into it: the text
-// is written only after the records are gone.
+// Text. Each group keeps its numbers and the exact size of its line, so an
+// hour's place in the output is known once every earlier hour is done. The
+// output is mapped up front, and each thread formats hours straight into it:
+// once no piece is left to claim, a thread with no hour to finish writes the
+// next placed hour, and the rest follow when every hour is done.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -337,7 +338,6 @@ int main() {
   std::vector<u64> at(HOURS + 1), bytes(HOURS);
   std::vector<char> finished(HOURS);
   int sized = 0, next_text = 0;
-  u64 early = 0;
   // The output is mapped at a size no output reaches (a group's line is less
   // than one and a half times its log line) and cut to size at the end, so
   // an hour's text can be written as soon as its offset is known.
@@ -454,7 +454,7 @@ int main() {
     madvise(lines, HOURS * hour_bytes, MADV_DONTNEED);
     for (int h = 0; h < HOURS; ++h)
       filled[h] = active[h] = count[h] = finished[h] = 0, closed[h] = false;
-    sized = next_text = early = 0;
+    sized = next_text = 0;
     for (auto &p : parsers)
       p = Parser();
     std::fill(parsed.begin(), parsed.end(), 0);
@@ -476,8 +476,8 @@ int main() {
               h = next_hour++, closed[h] = true;
             else if (next_piece < pieces)
               k = next_piece++;
-            else if (next_text < sized && early + bytes[next_text] <= 3000000)
-              g = next_text++, early += bytes[g];
+            else if (next_text < sized)
+              g = next_text++;
             else if (next_hour == HOURS)
               break;
           }
