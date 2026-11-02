@@ -97,7 +97,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 90 | Term table of 1 MB instead of 2 MB (load 0.58) | run-9fbf4b590d0c | 0.133 | 48.4 | 75.40 |
 | 91 | Measurement only: step 89's code, the query parse kept as memory (a page per 4 us) and the serial setup after the sample as ten times its length in wait | run-d59c352f1a2a | 0.188 | 55.2 | 71.04 |
 | 92 | Queries read with the documents' 64-byte class masks; one vector probe for lookups and inserts; anchor starts in one pass | run-fa63626812c0 | 0.114 | 46.9 | 77.15 |
-| 93 | Terms numbered by class alone (a counting pass instead of a sort on class and sampled count); anchor records placed by counting | pending | | | |
+| 93 | Terms numbered by class alone (a counting pass instead of a sort on class and sampled count); anchor records placed by counting | run-c7b706580cc0 | 0.116 | 46.9 | 77.02 |
+| 94 | Measurement only: step 93's code, the time to the scan's start kept as memory (a page per 4 us) and the answers added as five times their length in wait | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -380,6 +381,12 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 92 on the board.** run-fa63626812c0: 0.1144 s against 0.1243 s, 46.9 MiB, 77.15, the best Track B run so far; a second run of the same code (run-2173f972a914, commit aa8a430) 0.1154 s. The parse was worth more on the box (about 10 ms) than the laptop's cycles promised.
 
 **Step 93.** Since step 89 nothing reads a term's state by id in the scan except the bitmaps' 378 pending words, so numbering terms by sampled frequency within a class no longer buys locality; the lists' round-robin over the 32 buckets stays balanced with terms in query order. Terms are now numbered by class alone with a counting pass over the five classes, which replaces packing 75,747 keys and sorting them. The anchors' phrase records are placed anchor by anchor by counting, instead of sorted. To the scan's start on the laptop: 72M instructions against 87M, 1 to 2 ms less wall time; the whole run's instructions, misses and peak memory unchanged. 707 counted lines. Same hash on all six datasets.
+
+**Step 93 on the board.** run-c7b706580cc0: 0.1157 s, against 0.1144 and 0.1154 s for step 92's code: within the spread, so the setup's 1 to 2 ms are not visible on their own.
+
+**Step 94** measures where the run goes now: step 93's code, with the time from the start of `main` to the start of the scan kept as memory (one touched 4 KB page per 4 us), and the time to answer the queries added before the exit as a wait five times as long.
+
+Tried for the answers and kept out: an AND or NOT of a list with a long list term of comparable length (10,083 operations, 29M documents, the largest single cost of answering at about 40% of the set operations' cycles) through a per-thread scratch bitmap marked straight from the term's stored stretches, filtered without a branch per document, and cleared word by word afterwards, instead of decoding the term into a vector and setting a fresh zeroed bitmap: 150M to 180M more instructions and the same cycles.
 
 ## What the profile said, step by step
 
