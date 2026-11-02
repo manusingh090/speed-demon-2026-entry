@@ -36,7 +36,9 @@ type Job = &'static (dyn Fn(usize) + Sync);
 static JOB: Mutex<Option<Job>> = Mutex::new(None);
 static GATE: OnceLock<Barrier> = OnceLock::new();
 
-fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+// The pool's threads, started once; main starts them from a thread of their
+// own first thing, so that this overlaps reading the queries.
+fn start() {
     if GATE.set(Barrier::new(THREADS)).is_ok() {
         for t in 1..THREADS {
             std::thread::spawn(move || loop {
@@ -47,6 +49,10 @@ fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
             });
         }
     }
+}
+
+fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    start();
     let gate = GATE.get().unwrap();
     let out: Vec<Mutex<Option<R>>> = (0..THREADS).map(|_| Mutex::new(None)).collect();
     let run = |t: usize| *out[t].lock().unwrap() = Some(f(t));
@@ -455,6 +461,7 @@ impl Units {
 
 fn main() {
     unsafe { mallopt(-3, 1 << 16) };
+    std::thread::spawn(start);
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
     // Mapped on its own and handed back after the scan. Every token's lookup
@@ -674,11 +681,14 @@ fn main() {
         }
         count
     });
+    // Each thread's counts are copied in order; the stretches are then laid
+    // out bucket by bucket, reading one 24-byte row per term.
     let (mut seg, mut start, mut end) = (vec![0u16; lists * THREADS], vec![0u32; lists], 0);
+    for (t, c) in counts.iter().enumerate() {
+        (0..lists).for_each(|i| seg[i * THREADS + t] = c[i]);
+    }
     for i in (0..BUCKETS).flat_map(|b| (b..lists).step_by(BUCKETS)) {
-        let s = &mut seg[i * THREADS..][..THREADS];
-        s.iter_mut().zip(&counts).for_each(|(n, c)| *n = c[i]);
-        (start[i], end) = (end, end + s.iter().map(|&n| n as u32).sum::<u32>());
+        (start[i], end) = (end, end + seg[i * THREADS..][..THREADS].iter().map(|&n| n as u32).sum::<u32>());
     }
     let post: Vec<AtomicU16> = unsafe { std::mem::transmute(vec![0u16; end as usize]) };
     on_threads(|t| {
