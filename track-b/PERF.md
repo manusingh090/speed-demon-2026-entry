@@ -104,7 +104,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 97 | Step 96 with the thresholds back at 2,048 for OR and 768 otherwise; a document's buffers always grown by enough for a full window | run-c730e3fb810e | 0.115 | 48.1 | 76.92 |
 | 98 | The per-document handler's three loops as AVX2 selections, eight ids at a time; the bitmap sums back to step 93's | run-807c1ffd2504 | 0.111 | 47.9 | 77.26 |
 | 99 | The pool's threads started from a thread of their own at the start of `main`; the lists' stretches laid out from one row per term | run-71af5d224eec | 0.110 | 47.8 | 77.32 |
-| 100 | New design: the corpus in phases of 50 MiB, postings and bitmaps per phase answered into running tallies; phrases checked in the scan on token hashes as pseudo-terms; a bucket table of cache lines with actions; work shared by job counters and a futex barrier | pending | | | |
+| 100 | A phased design pushed as written outside this log with two small edits; withdrawn before its run | (withdrawn) | | | |
+| 101 | Back to step 99's code | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -414,15 +415,9 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 
 **Step 99 on the board.** run-71af5d224eec: 0.1102 s, 47.8 MiB, 739 counted lines, 77.32, the best Track B run so far.
 
-## Sixth session (Nov 2): a phased design
+## Sixth session (Nov 2)
 
-**Step 100** replaces the program with a different design, written by the team outside this log and changed here before submitting. The corpus is read in phases of 200 claims of 256 KiB (about 50 MiB), each starting on a document whose id is a multiple of 64, so no two workers share a bitmap word. Within a phase, list terms become rows (term, document) in 64 shards, written in chunks that need no shared counters, and then 16-bit postings relative to the phase's first document; bitmap terms are gathered per document as one row of bits and transposed into the bitmaps every 64 documents. Each phase's postings and bitmaps answer every query into a running tally (count, id sum, the ten smallest ids), so no full index ever exists, and the answers of one phase run on whichever threads have run out of scan claims in the next. Phrases need no positions: when a phrase's rarest word appears, the neighbouring tokens' hashes are compared with the phrase's, and a match writes a row for a pseudo-term standing for the phrase. The term table is 2^15 buckets of one cache line (7 tags of 32 bits and 8 actions), so a token's lookup is one load and compare, and the action says what the scan does with it. Hashes pair two tokens in one AES round pair (VAES). Threads start as a tree, parse a share of the queries each and intern their terms by compare-exchange, and meet at a barrier on one futex word.
-
-Changes made here: the output is gathered and written in one call instead of one per batch of 64 queries (about 790 writes), and each thread's share of the query file is split into lines with `memchr`.
-
-Checked locally: the same hash on all six datasets and the dense-token test; peak memory 41.5 to 42.6 MB against 47.5 to 47.9 MB for step 99. It tells tokens apart by 47 bits of their hash (15 for the bucket, 32 for the tag), so a token that is no query term matches one with odds of about 3 in 10,000 over the whole corpus, against about 2^-46 per pair before. 1,088 counted lines against 739, which costs about 6% of K, so it has to be faster on the box by more than about 12% to gain; the laptop's wall times (95 to 169 ms for both) cannot tell.
-
-Tried for the answers and kept out: an AND or NOT of a list with a long list term of comparable length (10,083 operations, 29M documents, the largest single cost of answering at about 40% of the set operations' cycles) through a per-thread scratch bitmap marked straight from the term's stored stretches, filtered without a branch per document, and cleared word by word afterwards, instead of decoding the term into a vector and setting a fresh zeroed bitmap: 150M to 180M more instructions and the same cycles.
+**Step 100**, a phased design written outside this log, was pushed with only two small edits and withdrawn: step 101 is step 99's code again. Its ideas (per-phase postings answered into running tallies, phrase checks on token hashes) are to be rebuilt here in this program's own code before any of them is submitted.
 
 ## What the profile said, step by step
 
