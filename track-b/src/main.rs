@@ -161,8 +161,8 @@ impl Doc {
     unsafe fn read(&mut self, mut p: *const u8, t: &Terms) -> (*const u8, &[u32]) {
         let (mut n, mask) = (LAG, t.slot.len() - 1);
         loop {
-            if n + 32 > self.0.capacity().min(self.1.capacity()) {
-                (self.0.reserve(2 * n + 32), self.1.reserve(2 * n + 32));
+            if n + 40 > self.0.capacity().min(self.1.capacity()) {
+                (self.0.reserve(2 * n + 40), self.1.reserve(2 * n + 40));
             }
             let (hs, ids) = (self.0.as_mut_ptr(), self.1.as_mut_ptr());
             _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(2048).cast());
@@ -189,6 +189,7 @@ impl Doc {
             }
             if nl != 0 {
                 (n - LAG..n).for_each(|k| *ids.add(k) = t.find(*hs.add(k)));
+                (n..n + 8).for_each(|k| *ids.add(k) = u32::MAX); // read by select
                 return (p.add(next as usize + 1), std::slice::from_raw_parts(ids.add(LAG), n - LAG));
             }
             p = p.add(next as usize);
@@ -214,6 +215,31 @@ unsafe fn words(mut p: *const u8, e: *const u8, mut f: impl FnMut(*const u8, usi
         p = p.add(next.max(1) as usize);
     }
     e
+}
+
+// Writes to out, packed to the front, the ids (or with at, their places) of
+// ids that lie in lo..lo + len, eight at a time: a compare gives a lane mask,
+// whose lanes' indices BMI2 gathers into a permutation. Reads up to seven ids
+// past the end of ids, which must be no term. Returns how many it wrote.
+unsafe fn select(ids: &[u32], lo: u32, len: u32, at: bool, out: &mut [u32]) -> usize {
+    let lo = _mm256_set1_epi32(lo as i32);
+    let top = _mm256_set1_epi32(len as i32 - 1);
+    let pick = _mm256_set1_epi32(-(at as i32));
+    let mut place = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut n = 0;
+    for k in (0..ids.len()).step_by(8) {
+        let x = _mm256_loadu_si256(ids.as_ptr().add(k).cast());
+        let d = _mm256_sub_epi32(x, lo);
+        let inside = _mm256_cmpeq_epi32(_mm256_min_epu32(d, top), d);
+        let m = _mm256_movemask_ps(_mm256_castsi256_ps(inside)) as u64;
+        let lanes = _pext_u64(0x0706_0504_0302_0100, _pdep_u64(m, 0x0101_0101_0101_0101) * 255);
+        let order = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(lanes as i64));
+        let v = _mm256_blendv_epi8(x, place, pick);
+        _mm256_storeu_si256(out.as_mut_ptr().add(n).cast(), _mm256_permutevar8x32_epi32(v, order));
+        n += m.count_ones() as usize;
+        place = _mm256_add_epi32(place, _mm256_set1_epi32(8));
+    }
+    n * (len > 0) as usize
 }
 
 enum Docs<'a> {
@@ -288,38 +314,27 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
     }
 }
 
-// Count and position sum of a bitmap, four words at a time. Nibble tables give
-// each byte's bits set (n) and the sum of their places (p, a high nibble's
-// counting from 4); n is weighed by the byte's place in its word and, summed
-// per word, by the word's index.
 unsafe fn bit_sums(b: &[u64]) -> (u64, u64) {
-    const NIB: [[u8; 16]; 3] = [
-        [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4],
-        [0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6],
-        [0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22],
-    ];
-    let [pop, low_at, high_at] = NIB.map(|t| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast())));
-    let (z, nib, sh) = (_mm256_setzero_si256(), _mm256_set1_epi8(15), |t, x| _mm256_shuffle_epi8(t, x));
-    let place = _mm256_set1_epi64x(0x0706_0504_0302_0100);
-    let (mut count, mut words, mut bytes, mut places) = (z, z, z, z);
-    let mut word = _mm256_setr_epi64x(0, 1, 2, 3);
+    const NIB: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
+    let nib = _mm256_broadcastsi128_si256(_mm_loadu_si128(NIB.as_ptr().cast()));
+    let (low, z) = (_mm256_set1_epi8(0x0F), _mm256_setzero_si256());
+    let h = |v: __m256i| _mm256_shuffle_epi8(nib, _mm256_and_si256(v, low));
+    let pop = |v: __m256i| _mm256_sad_epu8(_mm256_add_epi8(h(v), h(_mm256_srli_epi16::<4>(v))), z);
+    let sel = |k: usize| _mm256_set1_epi64x(!(u64::MAX / ((1u64 << (1 << k)) + 1)) as i64);
+    let (mut acc, mut word) = ([z; 8], _mm256_setr_epi64x(0, 1, 2, 3));
     for q in b.chunks_exact(4) {
         let v = _mm256_loadu_si256(q.as_ptr().cast());
-        let lo = _mm256_and_si256(v, nib);
-        let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nib);
-        let n = _mm256_add_epi8(sh(pop, lo), sh(pop, hi));
-        let c = _mm256_sad_epu8(n, z);
-        count = _mm256_add_epi64(count, c);
-        words = _mm256_add_epi64(words, _mm256_mul_epu32(c, word));
-        let by_byte = _mm256_maddubs_epi16(n, place);
-        bytes = _mm256_add_epi32(bytes, _mm256_madd_epi16(by_byte, _mm256_set1_epi16(1)));
-        let p = _mm256_add_epi8(sh(low_at, lo), sh(high_at, hi));
-        places = _mm256_add_epi64(places, _mm256_sad_epu8(p, z));
+        let c = pop(v);
+        acc[6] = _mm256_add_epi64(acc[6], c);
+        acc[7] = _mm256_add_epi64(acc[7], _mm256_mul_epu32(c, word));
+        for k in 0..6 {
+            acc[k] = _mm256_add_epi64(acc[k], pop(_mm256_and_si256(v, sel(k))));
+        }
         word = _mm256_add_epi64(word, _mm256_set1_epi64x(4));
     }
-    let total = |v: __m256i| -> u64 { std::mem::transmute::<_, [u64; 4]>(v).iter().sum() };
-    let bytes = std::mem::transmute::<_, [u32; 8]>(bytes).map(|x| x as u64);
-    (total(count), 64 * total(words) + 8 * bytes.iter().sum::<u64>() + total(places))
+    let total = |k: usize| -> u64 { std::mem::transmute::<_, [u64; 4]>(acc[k]).iter().sum() };
+    let sum = 64 * total(7) + (0..6).map(|k| total(k) << k).sum::<u64>();
+    (total(6), sum)
 }
 
 // v in decimal after a space (or none, first on a line), without the
@@ -574,9 +589,10 @@ fn main() {
     let found = Mutex::new(vec![]);
     let scans = on_threads(|t| {
         let (mut mine, mut kept, mut anchors) = (vec![], vec![0; 1 << 12], vec![0; 1 << 12]);
+        let mut dense = vec![0; 1 << 12];
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
         let first = firsts[t];
-        let (mut pending, mut block) = (vec![0u64; nbits + 8], first as usize / 64);
+        let (mut pending, mut block) = (vec![0u64; nbits], first as usize / 64);
         let flush = |pending: &mut [u64], w: usize| {
             for (b, x) in pending[..nbits].iter_mut().enumerate() {
                 if *x != 0 {
@@ -592,32 +608,25 @@ fn main() {
             }
             let (bit, off, nanchors) = (1u64 << (doc % 64), doc - first, nkeep - a0);
             let (a0, nbits, nlists) = (a0 as u32, nbits as u32, (lists - nbits) as u32);
-            kept.resize(kept.len().max(toks.len()), 0);
-            anchors.resize(anchors.len().max(toks.len()), 0);
-            // Short loops, each with few enough values to stay in registers.
-            // The anchors' heads are fetched while the others run. Other
-            // tokens' bits go to 8 spare words, taken in turn, so no store
-            // waits on the one before.
-            let mut na = 0;
-            for (at, &id) in toks.iter().enumerate() {
-                unsafe { *anchors.get_unchecked_mut(na) = at };
-                na += ((id.wrapping_sub(a0) as usize) < nanchors) as usize;
+            for v in [&mut kept, &mut anchors, &mut dense] {
+                v.resize(v.len().max(toks.len() + 8), 0);
             }
+            // The anchors' places (their heads are fetched while the rest
+            // runs), the bitmap terms, and every occurrence of a list term,
+            // repeats in a document too (under 1% of them), which the lists
+            // drop when built.
+            let na = unsafe { select(toks, a0, nanchors as u32, true, &mut anchors) };
             for &at in &anchors[..na] {
-                let head = heads.as_ptr().wrapping_add((toks[at] - a0) as usize);
-                unsafe { _mm_prefetch::<_MM_HINT_T0>(head.cast()) };
+                let k = (toks[at as usize] - a0) as usize;
+                unsafe { _mm_prefetch::<_MM_HINT_T0>(heads.as_ptr().add(k).cast()) };
             }
-            for (at, &id) in toks.iter().enumerate() {
-                unsafe { *pending.get_unchecked_mut(id.min(nbits + (at & 7) as u32) as usize) |= bit };
+            let nd = unsafe { select(toks, 0, nbits, false, &mut dense) };
+            for &id in &dense[..nd] {
+                unsafe { *pending.get_unchecked_mut(id as usize) |= bit };
             }
-            // Every occurrence of a list term is kept, repeats in a document
-            // too (under 1% of them), which the lists drop when built.
-            let mut n = 0;
-            for &id in toks {
-                unsafe { *kept.get_unchecked_mut(n) = id };
-                n += (id.wrapping_sub(nbits) < nlists) as usize;
-            }
+            let n = unsafe { select(toks, nbits, nlists, false, &mut kept) };
             for &at in &anchors[..na] {
+                let at = at as usize;
                 let k = (toks[at] - a0) as usize;
                 let mut check = |q: u32, j: u32| {
                     let (_, from, to) = spans[q as usize];
