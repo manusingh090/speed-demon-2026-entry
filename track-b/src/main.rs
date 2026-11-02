@@ -383,6 +383,23 @@ impl Units {
         }
     }
 
+    // Calls f with each unit's term (its index in the bucket) and document.
+    fn each(&self, mut f: impl FnMut(usize, u32)) {
+        let (mut doc, mut term) = (0u32, NONE);
+        for &x in self.chunks.iter().flatten() {
+            if term == NONE {
+                term = (x >> 4) as u32;
+                if x as u32 & GAP == GAP {
+                    continue;
+                }
+                doc += x as u32 & GAP;
+            } else {
+                doc += x as u32;
+            }
+            f(std::mem::replace(&mut term, NONE) as usize, doc);
+        }
+    }
+
     fn finish(&mut self) {
         if let Some(c) = self.chunks.last_mut() {
             unsafe { c.set_len((self.at - c.as_ptr() as usize) / 2) };
@@ -514,7 +531,6 @@ fn main() {
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
     let found = Mutex::new(vec![]);
     let scans = on_threads(|t| {
-        let (mut count, mut last) = (vec![0u16; nkeep + 1], vec![0u16; lists - nbits + 1]);
         let (mut mine, mut kept, mut anchors) = (vec![], vec![0; 1 << 12], vec![0; 1 << 12]);
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
         let first = firsts[t];
@@ -532,9 +548,8 @@ fn main() {
                 let w = std::mem::replace(&mut block, doc as usize / 64);
                 flush(&mut pending, w);
             }
-            let (mark, bit) = ((doc - first + 1) as u16, 1u64 << (doc % 64));
-            let (off, nlists, nanchors) = (doc - first, lists - nbits, nkeep - a0);
-            let (a0, nbits) = (a0 as u32, nbits as u32);
+            let (bit, off, nanchors) = (1u64 << (doc % 64), doc - first, nkeep - a0);
+            let (a0, nbits, nlists) = (a0 as u32, nbits as u32, (lists - nbits) as u32);
             kept.resize(kept.len().max(toks.len()), 0);
             anchors.resize(anchors.len().max(toks.len()), 0);
             // Short loops, each with few enough values to stay in registers.
@@ -553,14 +568,12 @@ fn main() {
             for (at, &id) in toks.iter().enumerate() {
                 unsafe { *pending.get_unchecked_mut(id.min(nbits + (at & 7) as u32) as usize) |= bit };
             }
+            // Every occurrence of a list term is kept, repeats in a document
+            // too (under 1% of them), which the lists drop when built.
             let mut n = 0;
             for &id in toks {
-                let i = id.wrapping_sub(nbits) as usize;
-                unsafe {
-                    let new = std::mem::replace(last.get_unchecked_mut(i.min(nlists)), mark) != mark;
-                    *kept.get_unchecked_mut(n) = id;
-                    n += (new & (i < nlists)) as usize;
-                }
+                unsafe { *kept.get_unchecked_mut(n) = id };
+                n += (id.wrapping_sub(nbits) < nlists) as usize;
             }
             for &at in &anchors[..na] {
                 let k = (toks[at] - a0) as usize;
@@ -584,7 +597,6 @@ fn main() {
             }
             for &i in &kept[..n] {
                 buckets[i as usize % BUCKETS].add(i / BUCKETS as u32, off);
-                count[i as usize] += 1;
             }
         });
         flush(&mut pending, block);
@@ -595,40 +607,43 @@ fn main() {
         unsafe { madvise(a as *mut u8, b.saturating_sub(a), 4) };
         buckets.iter_mut().for_each(Units::finish);
         found.lock().unwrap().extend(mine);
-        (count, Mutex::new(buckets))
+        Mutex::new(buckets)
     });
     unsafe { munmap(terms.slot.as_mut_ptr().cast(), terms.slot.len() * 8) };
 
+    // Each thread counts its documents per list term (a term's units are in
+    // document order, so a repeat follows its first), then writes them.
+    let counts = on_threads(|t| {
+        let (mut count, mut last) = (vec![0u16; lists], vec![NONE; lists.div_ceil(BUCKETS)]);
+        for (b, units) in scans[t].lock().unwrap().iter().enumerate() {
+            last.fill(NONE);
+            units.each(|k, doc| {
+                count[b + k * BUCKETS] += (std::mem::replace(&mut last[k], doc) != doc) as u16;
+            });
+        }
+        count
+    });
     let (mut seg, mut start, mut end) = (vec![0u16; lists * THREADS], vec![0u32; lists], 0);
     for i in (0..BUCKETS).flat_map(|b| (b..lists).step_by(BUCKETS)) {
         let s = &mut seg[i * THREADS..][..THREADS];
-        s.iter_mut().zip(&scans).for_each(|(n, c)| *n = c.0[i]);
+        s.iter_mut().zip(&counts).for_each(|(n, c)| *n = c[i]);
         (start[i], end) = (end, end + s.iter().map(|&n| n as u32).sum::<u32>());
     }
-    let buckets: Vec<_> = scans.into_iter().map(|s| s.1).collect();
     let post: Vec<AtomicU16> = unsafe { std::mem::transmute(vec![0u16; end as usize]) };
     on_threads(|t| {
-        let buckets = std::mem::take(&mut *buckets[t].lock().unwrap());
-        let mut cursor = vec![0u32; lists.div_ceil(BUCKETS)];
+        let buckets = std::mem::take(&mut *scans[t].lock().unwrap());
+        let (mut cursor, mut last) = (vec![0u32; lists.div_ceil(BUCKETS)], vec![NONE; lists.div_ceil(BUCKETS)]);
         for (b, units) in buckets.into_iter().enumerate() {
             for (c, i) in cursor.iter_mut().zip((b..lists).step_by(BUCKETS)) {
                 let before: u32 = seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum();
                 *c = start[i] + before;
             }
-            let (mut doc, mut term) = (0u32, NONE);
-            for x in units.chunks.into_iter().flatten() {
-                if term == NONE {
-                    term = (x >> 4) as u32;
-                    if x as u32 & GAP == GAP {
-                        continue;
-                    }
-                    doc += x as u32 & GAP;
-                } else {
-                    doc += x as u32;
+            last.fill(NONE);
+            units.each(|k, doc| {
+                if std::mem::replace(&mut last[k], doc) != doc {
+                    (post[cursor[k] as usize].store(doc as u16, Relaxed), cursor[k] += 1);
                 }
-                let c = &mut cursor[std::mem::replace(&mut term, NONE) as usize];
-                (post[*c as usize].store(doc as u16, Relaxed), *c += 1);
-            }
+            });
         }
     });
     let post: Vec<u16> = unsafe { std::mem::transmute(post) };
