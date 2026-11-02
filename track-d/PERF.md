@@ -70,6 +70,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 36 | Back to step 34's code (no board run of its own: superseded by the diagnostic) | | | | |
 | 36d | Diagnostic: time to the first search reported through M, time to the end of the BFS through T | run-0a5e9b7be14b | (1.184 s) | (276 MiB) | |
 | 37 | Back to step 34's code | run-d2d4f27e8067 (also run-5fc51c420d92) | 0.1267 (0.1361) s | 55 MiB | 71.77 (70.96) |
+| 38 | Distance pages of 128 instead of 512; the search recomputes only the settled side's smallest key | pending | | | |
 
 ## What the profile said, step by step
 
@@ -205,6 +206,17 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 - *Prefetching the group bases too* (at a push in the search, and 8 entries ahead in the BFS, where only the offset bytes were prefetched): no change in cycles.
 - *A reverse graph that mirrors the forward one.* 2.9% of edges have no edge back (measured on the sample; 8% of nodes have such an edge coming in). So the reverse graph can share the forward offsets: the slot of v -> u holds u and the weight of u -> v, found by scanning u's row (nearby in the blob order), or a dead self-loop of weight 0, and the one-way edges go into a small graph of their own. That removes the in-degree count, its prefix sum, the atomic placement and the second packing. It cost more than it saved: 1 billion more instructions and 0.8 billion more cycles, from the row scans, the side graph's offsets and the backward search's loop over two graphs.
 - *Two searches per thread, a settle of each in turn* (interleaved execution, as AMAC, Kocberber et al., VLDB 2015, and coroutine interleaving, Psaropoulos et al., VLDB 2017, do for pointer chasing): the idea is that while one search's settle waits on memory the core has the other's to work on. On the laptop it took 11% more cycles (3.45 to 3.49 against 3.08 to 3.17 billion): the second search's distance pages and queue compete for the same caches, and the hyperthread already provides the overlap.
+
+**Step 37 to 38: two small cuts in the search.** `perf record` on step 34's code: the search's settle 42 to 49% of cycles, the blob BFS 13 to 14%, the parse 6 to 10%, the mapping pass 4.5%, the reverse fill 3.4%, and 2 to 3% in the kernel's LRU lock, taken by the parallel `MADV_DONTNEED` frees. Inside the settle, the hottest instruction (13%) is the load of a neighbour's distance slot. Two changes, each correct on all fifteen local datasets (the published sample and full hashes, the worked example, tiny, and eleven other seeds and scales against step 34's output):
+
+- *Distance pages of 128 instead of 512.* A search hands out 57,207 pages over the run; with smaller ones it touches fewer slots it never uses, so more of the ones it does use stay in cache. Seven alternating `perf stat -r 5` rounds: 3.78 against 3.87 billion cycles (minus 2.2%), the same instructions. Pages of 256 and 64 were no better than 128.
+- *Only the settled side's smallest key is recomputed.* The loop called `min()` on both queues at every step, though the side that did not settle has the same minimum as before. Four rounds: 4.51 against 4.69 billion instructions (minus 3.8%) and 3.73 against 3.84 billion cycles (minus 3%).
+
+Also measured at this step and kept out:
+
+- *Not queueing a node that cannot win.* A node whose length plus the other side's smallest queued key is at least the best meeting would never be settled before the search stops, so it need not be queued (its meeting with the other side is still recorded). Pushes fell from 8,653,549 to 8,158,512 (minus 5.7%), but cycles moved by 0.4%, inside the noise, so the four lines stayed out.
+- *Prefetching the next node's neighbours' distance slots* at the end of each settle, once its edges have had a settle's time to arrive: 3 to 7% more cycles.
+- Two facts from the generator and the data that bound what is left: queries pick a Dijkstra rank in octaves 1 to 16, so the few searches of rank 65,536 to 131,071 do most of the 7.1 million settles; and only 6,016 of the 5 million edges repeat a (u, v) pair and 508 are self-loops, so removing duplicates would save nothing. On the laptop the threads finish the searches within about 5 ms of each other.
 
 ## Tried and kept out
 

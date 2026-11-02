@@ -36,7 +36,7 @@ extern "C" {
 const INF: u64 = u64::MAX;
 const BLOB: usize = 512; // nodes per locality blob
 const PART_BITS: u32 = 14; // nodes per part: 2^14, so offsets fit 16 bits
-const PAGE: usize = 512; // distances per page
+const PAGE: usize = 128; // distances per page
 
 /// A pointer the threads share; every use writes indices no other thread writes.
 #[derive(Clone, Copy)]
@@ -318,7 +318,7 @@ impl Queue {
     }
 }
 
-/// Tentative distances in pages of 512, handed out on first touch and taken
+/// Tentative distances in pages of 128, handed out on first touch and taken
 /// back after each query, so a thread's memory follows its largest search.
 struct Dist<T> {
     tab: Vec<u16>,
@@ -428,15 +428,18 @@ fn search<T: Len>(side: &mut [Side<T>; 2], g: [Graph; 2], s: u32, t: u32) -> (u6
         *x.dist.at(v) = 0.into();
         x.queue.push(0, v);
     }
-    while let (Some(a), Some(b)) = (side[0].queue.min(), side[1].queue.min()) {
-        if a + b >= best {
+    // Only the side that settled has a new smallest key.
+    let [f, r] = &mut *side;
+    let (mut a, mut b) = (f.queue.min(), r.queue.min());
+    while let (Some(x), Some(y)) = (a, b) {
+        if x + y >= best {
             break;
         }
-        let [f, r] = &mut *side;
-        best = match r.queue.len < f.queue.len {
-            true => r.settle(g[1], &f.dist, best, &mut over),
-            false => f.settle(g[0], &r.dist, best, &mut over),
-        };
+        if r.queue.len < f.queue.len {
+            (best, b) = (r.settle(g[1], &f.dist, best, &mut over), r.queue.min());
+        } else {
+            (best, a) = (f.settle(g[0], &r.dist, best, &mut over), f.queue.min());
+        }
     }
     for x in side.iter_mut() {
         x.queue.clear();
