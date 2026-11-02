@@ -15,9 +15,9 @@
 // Between the phases the last thread to arrive sorts the names, so each
 // endpoint id gets its rank in output order.
 //
-// Hours. Threads claim hours. An hour's latencies are counting-sorted by
-// endpoint rank into per-thread scratch, and three selections per group give
-// the percentiles. Each group keeps its numbers along with the exact size its
+// Hours. Threads claim hours. An hour's records are radix-sorted by endpoint
+// rank and latency, so each group comes out sorted and its percentiles are
+// read off by index. Each group keeps its numbers along with the exact size its
 // line will take, since a number's width is known without formatting it.
 //
 // Text. The last thread into the second barrier turns the sizes into offsets
@@ -72,74 +72,6 @@ inline void put(char *end, u32 x) {
     memcpy(end - 2, &pairs[x * 2], 2);
   else
     end[-1] = '0' + x;
-}
-
-// Puts the k-th smallest of a[0, n) at a[k], the smaller ones before it,
-// without a branch on the data: each round partitions around the median of
-// three with an unconditional swap. Many equal values could shrink a round by
-// one only, so after 40 rounds the library's selection finishes.
-inline void select(u32 *a, u32 n, u32 k) {
-  for (int round = 0; n > 1; ++round) {
-    if (round == 40)
-      return std::nth_element(a, a + k, a + n);
-    u32 m = n / 2;
-    if (a[m] < a[0])
-      std::swap(a[m], a[0]);
-    if (a[n - 1] < a[m])
-      std::swap(a[n - 1], a[m]);
-    if (a[m] < a[0])
-      std::swap(a[m], a[0]);
-    std::swap(a[m], a[n - 1]);
-    u32 pivot = a[n - 1], lt = 0;
-    for (u32 i = 0; i + 1 < n; ++i) {
-      u32 x = a[i];
-      a[i] = a[lt], a[lt] = x, lt += x < pivot;
-    }
-    std::swap(a[lt], a[n - 1]);
-    if (k == lt)
-      return;
-    if (k < lt)
-      n = lt;
-    else
-      a += lt + 1, k -= lt + 1, n -= lt + 1;
-  }
-}
-
-// Writes the values at ranks r[0] <= r[1] <= r[2] of a[0, n) to v. A group
-// of 16 or fewer (four in five groups) is padded to 16 and sorted by Batcher's
-// odd-even merge network, 63 min/max pairs with no branch on the data; its
-// first 19 pairs already sort the first 8 places, so a group of 8 or fewer
-// stops there. Otherwise each rank is selected among the values left above
-// the one before.
-inline void percentiles(u32 *a, u32 n, const u32 *r, u32 *v) {
-  if (n <= 16) {
-    static constexpr int net[63][2] = {
-        {0, 1},   {2, 3},   {0, 2},   {1, 3},   {1, 2},   {4, 5},   {6, 7},
-        {4, 6},   {5, 7},   {5, 6},   {0, 4},   {2, 6},   {2, 4},   {1, 5},
-        {3, 7},   {3, 5},   {1, 2},   {3, 4},   {5, 6},   {8, 9},   {10, 11},
-        {8, 10},  {9, 11},  {9, 10},  {12, 13}, {14, 15}, {12, 14}, {13, 15},
-        {13, 14}, {8, 12},  {10, 14}, {10, 12}, {9, 13},  {11, 15}, {11, 13},
-        {9, 10},  {11, 12}, {13, 14}, {0, 8},   {4, 12},  {4, 8},   {2, 10},
-        {6, 14},  {6, 10},  {2, 4},   {6, 8},   {10, 12}, {1, 9},   {5, 13},
-        {5, 9},   {3, 11},  {7, 15},  {7, 11},  {3, 5},   {7, 9},   {11, 13},
-        {1, 2},   {3, 4},   {5, 6},   {7, 8},   {9, 10},  {11, 12}, {13, 14}};
-    u32 s[16];
-    for (u32 i = 0; i < 16; ++i)
-      s[i] = i < n ? a[i] : ~0u;
-    for (int c = 0, pairs = n <= 8 ? 19 : 63; c < pairs; ++c) {
-      auto [i, j] = net[c];
-      u32 x = std::min(s[i], s[j]);
-      s[j] = std::max(s[i], s[j]), s[i] = x;
-    }
-    for (int t = 0; t < 3; ++t)
-      v[t] = s[r[t]];
-    return;
-  }
-  for (u32 from = 0, t = 0; t < 3; ++t)
-    if (r[t] >= from)
-      select(a + from, n - from, r[t] - from), from = r[t] + 1;
-  for (int t = 0; t < 3; ++t)
-    v[t] = a[r[t]];
 }
 
 inline __m256i load(const char *p) {
@@ -393,15 +325,6 @@ int main() {
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   });
 
-  // Calls f(endpoint id, 5xx flag, latency) for every record of hour h.
-  auto each = [&](int h, auto &&f) {
-    for (u32 *r = records + h * per_hour, *e = r + filled[h]; r < e; ++r)
-      if (__builtin_expect((*r | ID_MASK | ERR) == SPARE, 0)) {
-        if (*r != SPARE) // an escape: the raw latency follows
-          f(*r & ID_MASK, *r & ERR, r[1]), ++r;
-      } else
-        f(*r & ID_MASK, *r & ERR, *r >> KEY_BITS);
-  };
   auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
   std::vector<u64> at(HOURS + 1);
   char *text = nullptr;
@@ -434,36 +357,66 @@ int main() {
       parsers[t].seal();
       ranked.arrive_and_wait();
       {
-        const u32 ne = names.size(), ids = endpoints.ids;
-        std::vector<u32> start(ids), errors(ids), cursor(ids);
-        std::unique_ptr<u32[]> latency(new u32[most]);
+        // Each hour is sorted by (endpoint rank, latency), the rank above a
+        // 20-bit latency in one 31-bit key, by a radix sort of three passes
+        // (10, 10 and 11 bits) between the hour's own record pages and one
+        // scratch array. Every group then comes out sorted, at a known place,
+        // and its percentiles are read off by index. Latencies too large for
+        // 20 bits sort last in their group with the same key; their values
+        // are kept, sorted, in a short list.
+        const u32 ne = names.size();
+        std::vector<u32> rank_of(Names::MAX);
+        for (u32 e = 0; e < ne; ++e)
+          rank_of[by_rank[e]] = e;
+        std::unique_ptr<u32[]> scratch(new u32[most]);
+        std::vector<u64> big;
         for (int i; (i = claim++) < HOURS;) {
           int h = order[i];
-          std::fill(start.begin(), start.end(), 0);
-          std::fill(errors.begin(), errors.end(), 0);
-          // Counting sort of the hour's latencies, counted and placed by
-          // endpoint id with the groups laid out in rank order.
-          each(h, [&](u32 id, u32 err, u32) {
-            ++start[id], errors[id] += err != 0;
-          });
-          for (u32 e = 0, at = 0; e < ne; ++e) {
-            u32 id = by_rank[e];
-            cursor[id] = at, at += start[id], start[id] = cursor[id];
+          u32 *keys = records + h * per_hour, *sorted = scratch.get(), total = 0;
+          u32 low[1024] = {}, mid[1024] = {}, top[Names::MAX] = {},
+              errors[Names::MAX] = {};
+          big.clear();
+          for (u32 *r = keys, *end = r + filled[h]; r < end; ++r) {
+            u32 x = *r;
+            if ((x | ID_MASK | ERR) == SPARE) [[unlikely]] {
+              if (x == SPARE)
+                continue;
+              big.push_back(u64(rank_of[x & ID_MASK]) << 32 | *++r);
+            }
+            u32 rank = rank_of[x & ID_MASK], key = rank << 20 | x >> KEY_BITS;
+            errors[rank] += (x & ERR) != 0;
+            ++low[key & 1023], ++mid[key >> 10 & 1023], ++top[rank];
+            keys[total++] = key;
           }
-          each(h, [&](u32 id, u32, u32 l) { latency[cursor[id]++] = l; });
+          auto pass = [total](const u32 *from, u32 *to, u32 *at, u32 buckets,
+                              int shift, u32 mask) {
+            for (u32 b = 0, sum = 0; b < buckets; ++b)
+              sum += std::exchange(at[b], sum);
+            for (u32 j = 0; j < total; ++j)
+              to[at[from[j] >> shift & mask]++] = from[j];
+          };
+          pass(keys, sorted, low, 1024, 0, 1023);
+          pass(sorted, keys, mid, 1024, 10, 1023);
+          pass(keys, sorted, top, ne, 20, 2047);
           madvise(records + h * per_hour, filled[h] * 4, MADV_DONTNEED);
+          std::sort(big.begin(), big.end());
           u64 sz = 0;
-          for (u32 e = 0; e < ne; ++e) {
-            u32 id = by_rank[e], n = cursor[id] - start[id];
+          for (u32 e = 0, from = 0, b = 0; e < ne; from = top[e++]) {
+            u32 n = top[e] - from, large = 0;
             if (!n)
               continue;
+            while (b + large < big.size() && big[b + large] >> 32 == e)
+              ++large;
             // Nearest rank p is index ceil(p * n / 100) - 1.
-            u32 *a = latency.get() + start[id], r50 = (50 * n + 99) / 100 - 1,
-                r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
-            u32 ranks[3] = {r50, r95, r99}, v[3];
-            percentiles(a, n, ranks, v);
+            u32 v[3], t = 0;
+            for (u32 p : {50, 95, 99}) {
+              u32 k = (p * n + 99) / 100 - 1;
+              v[t++] = k < n - large ? sorted[from + k] & PACKED_MAX
+                                     : u32(big[b + k - (n - large)]);
+            }
+            b += large;
             Line &l = ((Line *)(lines + h * hour_bytes))[count[h]++];
-            l = {e, n, v[0], v[1], v[2], errors[id]};
+            l = {e, n, v[0], v[1], v[2], errors[e]};
             sz += 28 + names[e].size();
             for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
               sz += width(x);
