@@ -1,761 +1,1227 @@
-use std::arch::x86_64::*;
-use std::borrow::Cow;
-use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Barrier, Mutex, OnceLock};
+//! Track B: answers the 50,000 queries of /data/queries.txt over /data/docs.txt.
+//!
+//! The corpus is read in phases of about 50 MiB. In each phase every list term's documents
+//! become 16-bit postings and every common term a bitmap; the phase answers all queries
+//! into a running result per query (count, id sum, first ten ids), and the next phase
+//! reuses the space. Phrases are checked while their documents' token hashes are at hand
+//! and their matches stored as an extra list term each. All threads run the same worker:
+//! parse a part of the queries, sample, plan, then scan, build and answer phase by phase.
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::*};
+use std::sync::{Mutex, OnceLock};
+use std::{arch::x86_64::*, fs::File, io::Write, os::fd::AsRawFd, ptr::null_mut, thread};
 
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    fn mallopt(param: i32, value: i32) -> i32;
-    fn prctl(option: i32, ...) -> i32;
-    fn _exit(status: i32) -> !;
+    fn prctl(option: i32, arg: usize, a: usize, b: usize, c: usize) -> i32;
+    fn syscall(number: i64, ...) -> i64;
+    fn memchr(text: *const u8, byte: i32, len: usize) -> *const u8;
+}
+// mmap flags: private, anonymous, no swap reservation.
+const ANONYMOUS: i32 = 0x4022;
+
+const HUGE_PAGE: usize = 1 << 21;
+// Bytes of text a worker takes at once.
+const SLICE: usize = 1 << 18;
+// Slices per phase: postings are rebuilt every this many.
+const SLICES_PER_PHASE: usize = 200;
+// Postings before each list, holding a value no document has.
+const SENTINELS: usize = 1;
+const PLAN_PARTS: usize = 16;
+const FIRST_IDS: usize = 10;
+// Bytes tokenized before the token pass hands over to the term pass.
+const TEXT_BATCH: usize = 1 << 14;
+// Lines of the term table, and slots in each.
+const LINES: usize = 1 << 15;
+const LINE_SLOTS: usize = 7;
+const ID_RUN: usize = 32;
+const MAX_TERMS: usize = LINES * LINE_SLOTS + 64 * ID_RUN;
+// Tokens between fetching a table line and reading it.
+const PREFETCH_GAP: usize = 20;
+// Action bits: a bitmap term, a full line, a phrase to check.
+const BITMAP_FLAG: u32 = 1 << 31;
+const SPILL: u32 = 1 << 30;
+const CHECK_FLAG: u32 = 1 << 29;
+const MAX_BITMAPS: usize = 4096;
+// Lists are built in this many independent shards.
+const ROW_SHARDS: usize = 64;
+const DOC_ID_BITS: u32 = 18;
+const ROW_CHUNK: usize = 64;
+const QUERIES_PER_JOB: usize = 64;
+const WORKER_BYTES: usize = 32 << 20;
+const WINDOW_MAX: usize = 8;
+
+/// One cache line of the term table: 7 tags, then 8 actions, the last for a miss.
+#[repr(C, align(64))]
+struct TermLine {
+    tags: [u32; LINE_SLOTS + 1],
+    actions: [u32; LINE_SLOTS + 1],
 }
 
-const THREADS: usize = 12;
-const NONE: u32 = u32::MAX;
-const BUCKETS: usize = 32;
-const GAP: u32 = 15;
-const ID_BITS: u32 = 18;
-const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const BIG: usize = 768;
+/// Per-worker buffers for one batch of text.
+struct Bench {
+    starts: &'static mut [u32],
+    ends: &'static mut [u32],
+    lines: &'static mut [u32],
+    hashes: &'static mut [u64],
+    bitmap_hits: &'static mut [u32],
+    bitmap_ends: &'static mut [u32],
+    group: &'static mut [u64],
+    window_hits: &'static mut [u64],
+    acts: &'static mut [u32],
+    list_actions: &'static mut [u32],
+    list_ends: &'static mut [u32],
+    check_hits: &'static mut [u64],
+    counts: &'static mut [u32],
+}
 
-fn map(path: &str) -> &'static [u8] {
-    let file = std::fs::File::open(path).expect(path);
-    let len = file.metadata().unwrap().len() as usize;
-    unsafe {
-        let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
-        let ok = len == 0 || mmap(p, len, 1, 0x12, file.as_raw_fd(), 0) == p;
-        assert!(p as isize != -1 && ok);
-        std::slice::from_raw_parts(p, len)
+/// Where a term's documents are in the current phase.
+struct TermInfo {
+    first: u32,
+    count: u32,
+    phrases: u32,
+    bitmap_count: bool,
+    in_bool: bool,
+}
+
+/// A phrase: its words' hashes, its anchor word, and its stand-in term.
+struct Window {
+    term: u32,
+    len: u32,
+    pivot: u32,
+    next: u32,
+    words: [u64; WINDOW_MAX],
+}
+
+/// A BOOL operator.
+#[derive(Clone, Copy, PartialEq)]
+enum Op {
+    And,
+    Or,
+    Not,
+}
+
+/// A result set: a list of 16-bit document offsets, or a bitmap.
+#[derive(Clone, Copy)]
+enum Docs {
+    List(&'static [u16]),
+    Bits(&'static [u64]),
+}
+
+/// Per-worker space for intermediate results.
+#[derive(Default)]
+struct Spare {
+    lists: [Vec<u16>; 2],
+    bits: Vec<u64>,
+    marks: Vec<u64>,
+}
+
+/// One query's answer so far, summed over the phases done.
+struct Running {
+    count: u32,
+    sum: u64,
+    first: [u32; FIRST_IDS],
+}
+
+impl Running {
+    fn add_docs(&mut self, base: u32, list: &[u16]) {
+        let sum = list.iter().map(|&doc| doc as u64).sum();
+        let ids = list.iter().map(|&doc| doc as u32);
+        self.add(base, list.len() as u64, sum, ids);
     }
-}
 
-type Job = &'static (dyn Fn(usize) + Sync);
-static JOB: Mutex<Option<Job>> = Mutex::new(None);
-static GATE: OnceLock<Barrier> = OnceLock::new();
-
-// The pool's threads, started once; main starts them from a thread of their
-// own first thing, so that this overlaps reading the queries.
-fn start() {
-    if GATE.set(Barrier::new(THREADS)).is_ok() {
-        for t in 1..THREADS {
-            std::thread::spawn(move || loop {
-                GATE.get().unwrap().wait();
-                let job = JOB.lock().unwrap().unwrap(); // the guard is dropped here, before the job runs
-                job(t);
-                GATE.get().unwrap().wait();
-            });
+    fn add(&mut self, base: u32, count: u64, sum: u64, ids: impl Iterator<Item = u32>) {
+        let room = (self.count as usize).min(FIRST_IDS);
+        for (slot, id) in self.first[room..].iter_mut().zip(ids) {
+            *slot = base + id;
         }
+        self.count += count as u32;
+        self.sum += sum + base as u64 * count;
+    }
+
+    fn add_bitmap(&mut self, base: u32, bits: &[u64]) {
+        let (count, sum) = unsafe {
+            let table =
+                |row: [i8; 16]| _mm256_broadcastsi128_si256(_mm_loadu_si128(row.as_ptr().cast()));
+            let pick = |table, index| _mm256_shuffle_epi8(table, index);
+            let ones = table([0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]);
+            let places = table([0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6]);
+            let weights = _mm256_set1_epi64x(0x3830_2820_1810_0800);
+            let (low, zero) = (_mm256_set1_epi8(15), _mm256_setzero_si256());
+            let (mut counts, mut sums, mut offsets, mut starts) = (zero, zero, zero, zero);
+            let mut first = _mm256_setr_epi64x(0, 64, 128, 192);
+            for block in bits.chunks_exact(4) {
+                let word = _mm256_loadu_si256(block.as_ptr().cast());
+                let lo = _mm256_and_si256(word, low);
+                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(word), low);
+                let high_ones = pick(ones, hi);
+                let per_byte = _mm256_add_epi8(pick(ones, lo), high_ones);
+                let low_places = _mm256_add_epi8(pick(places, lo), pick(places, hi));
+                let positions = _mm256_add_epi8(low_places, _mm256_slli_epi16::<2>(high_ones));
+                let per_word = _mm256_sad_epu8(per_byte, zero);
+                counts = _mm256_add_epi64(counts, per_word);
+                sums = _mm256_add_epi64(sums, _mm256_sad_epu8(positions, zero));
+                starts = _mm256_add_epi64(starts, _mm256_mul_epu32(per_word, first));
+                let weighted = _mm256_maddubs_epi16(per_byte, weights);
+                offsets =
+                    _mm256_add_epi32(offsets, _mm256_madd_epi16(weighted, _mm256_set1_epi16(1)));
+                first = _mm256_add_epi64(first, _mm256_set1_epi64x(256));
+            }
+            let total = |v: __m256i| {
+                let lanes: [u32; 8] = std::mem::transmute(v);
+                lanes.iter().map(|&lane| lane as u64).sum::<u64>()
+            };
+            (total(counts), total(sums) + total(starts) + total(offsets))
+        };
+        let ids = bits
+            .iter()
+            .enumerate()
+            .filter(|(_, &word)| word != 0)
+            .flat_map(|(index, &word)| {
+                (0..64)
+                    .filter(move |bit| word >> bit & 1 == 1)
+                    .map(move |bit| index as u32 * 64 + bit)
+            });
+        self.add(base, count, sum, ids);
+    }
+
+    fn write(&self, out: &mut Vec<u8>) {
+        push_num(out, self.count as u64);
+        push_num(out, self.sum);
+        for &doc in &self.first[..(self.count as usize).min(FIRST_IDS)] {
+            push_num(out, doc as u64);
+        }
+        *out.last_mut().unwrap() = b'\n';
     }
 }
 
-fn on_threads<R: Send>(f: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    start();
-    let gate = GATE.get().unwrap();
-    let out: Vec<Mutex<Option<R>>> = (0..THREADS).map(|_| Mutex::new(None)).collect();
-    let run = |t: usize| *out[t].lock().unwrap() = Some(f(t));
-    let run: &(dyn Fn(usize) + Sync) = &run;
-    *JOB.lock().unwrap() = Some(unsafe { std::mem::transmute::<_, Job>(run) });
-    (gate.wait(), run(0), gate.wait());
-    let take = |r: Mutex<Option<R>>| r.into_inner().unwrap().unwrap();
-    out.into_iter().map(take).collect()
+/// Everything the workers share.
+struct Engine {
+    text: &'static [u8],
+    docs: usize,
+    bitmap_words: usize,
+    buckets: *mut TermLine,
+    terms: *mut TermInfo,
+    term_count: AtomicUsize,
+    queries: &'static [u8],
+    shares: Vec<OnceLock<QueryPart>>,
+    phrases: *mut Window,
+    sample: &'static [AtomicU32],
+    prep: [AtomicUsize; 6],
+    phase: Vec<[AtomicUsize; 4]>,
+    phase_first: Vec<u32>,
+    waiting: AtomicU32,
+    epoch: AtomicU32,
+    bitmaps: *mut u64,
+    rows: *mut u32,
+    shard_fill: Vec<AtomicUsize>,
+    postings: *mut u16,
+    outputs: Vec<Mutex<Vec<u8>>>,
+    arena: *mut u8,
+}
+unsafe impl Sync for Engine {}
+
+/// Address space on a 2 MiB boundary, huge pages on or off.
+unsafe fn reserve_region<T>(count: usize, huge: bool) -> *mut T {
+    let bytes = count * size_of::<T>();
+    let region = mmap(null_mut(), bytes + HUGE_PAGE, 3, ANONYMOUS, -1, 0);
+    let aligned = region.add(region.align_offset(HUGE_PAGE));
+    madvise(aligned, bytes, 15 - huge as i32);
+    aligned.cast()
 }
 
-fn number(text: &[u8], i: usize) -> u32 {
-    let digits = text[i..].iter().take_while(|b| b.is_ascii_digit());
-    digits.fold(0, |v, &b| v * 10 + (b - b'0') as u32)
+/// Returns pages to the kernel.
+unsafe fn release(at: *const u8, len: usize) {
+    madvise(at as *mut u8, len, 4);
 }
 
-// The token's bytes, lowercased (OR 0x20 leaves digits as they are) and
-// zero-padded, in two words folded by one 128-bit multiply: both constants
-// hold bytes no token has, so neither factor is ever zero. A token of over 32
-// bytes is no term and hashes to 0.
-// MASK[k + 32] keeps the first k bytes of a word (all of them from 8 on).
-const MASK: [u64; 104] = {
-    let mut m = [0; 104];
-    let mut k = 0;
-    while k < 104 {
-        m[k] = if k <= 32 { 0 } else if k >= 40 { !0 } else { (1 << 8 * (k - 32)) - 1 };
-        k += 1;
+/// A slice whose pages exist only once written.
+unsafe fn lazy_slice<T>(count: usize) -> &'static mut [T] {
+    std::slice::from_raw_parts_mut(reserve_region(count, false), count)
+}
+
+/// The next part of a worker's arena.
+unsafe fn carve<T>(next: &mut *mut u8, count: usize) -> &'static mut [T] {
+    let at = *next;
+    *next = at.add((count * size_of::<T>()).next_multiple_of(4096));
+    std::slice::from_raw_parts_mut(at.cast(), count)
+}
+
+/// Maps an input file, with zero pages after it for over-reads.
+unsafe fn map_input(path: &str) -> &'static [u8] {
+    let file = File::open(path).unwrap();
+    let len = file.metadata().unwrap().len() as usize;
+    let span = len.div_ceil(4096) * 4096 + 4096;
+    let base = mmap(null_mut(), span, 1, ANONYMOUS, -1, 0);
+    mmap(base, len, 1, 0x12, file.as_raw_fd(), 0);
+    std::slice::from_raw_parts(base, len)
+}
+
+// Round key for the token hash (47 of its bits tell terms apart).
+const AES_KEY: i64 = 0x9E37_79B9_7F4A_7C15_u64 as i64;
+
+/// Lane orders that pack the set lanes of an 8-bit mask to the front.
+static LEFT_PACK: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut mask = 0;
+    while mask < 256 {
+        let (mut lane, mut n) = (0, 0);
+        while lane < 8 {
+            if mask >> lane & 1 == 1 {
+                table[mask][n] = lane as u8;
+                n += 1;
+            }
+            lane += 1;
+        }
+        mask += 1;
     }
-    m
+    table
 };
 
-unsafe fn hash(p: *const u8, len: usize) -> u64 {
-    let word = |i: usize| (p.add(i).cast::<u64>().read_unaligned() | 0x2020_2020_2020_2020) & MASK[32 + len - i];
-    let fold = |x: u64, y: u64| (x as u128 * y as u128) as u64 ^ (x as u128 * y as u128 >> 64) as u64;
-    let h = fold(word(0) ^ 0x9E37_79B9_7F4A_7C15, word(8) ^ 0xC2B2_AE3D_27D4_EB4F);
-    match len {
-        0..=16 => h,
-        17..=32 => fold(h, fold(word(16) ^ 0xBF58_476D_1CE4_E5B9, word(24) ^ 0x94D0_49BB_1331_11EB)),
-        _ => 0,
+/// Read at 16 - len: the first len bytes set.
+static BYTE_MASKS: [[u8; 16]; 2] = [[255; 16], [0; 16]];
+
+/// Hashes two tokens of up to 16 bytes, lowercased, in one pair of AES rounds.
+#[inline(always)]
+unsafe fn hash_two(a: *const u8, len_a: usize, b: *const u8, len_b: usize) -> (u64, u64) {
+    let load = |at: *const u8| _mm_loadu_si128(at.cast());
+    let mask_of = |len: usize| load(BYTE_MASKS.as_flattened().as_ptr().add(16 - len));
+    let pair = _mm256_set_m128i(load(b), load(a));
+    let mask = _mm256_set_m128i(mask_of(len_b), mask_of(len_a));
+    let key = _mm256_and_si256(_mm256_or_si256(pair, _mm256_set1_epi8(0x20)), mask);
+    let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(key, _mm256_set1_epi64x(AES_KEY)), key);
+    let folded = _mm256_xor_si256(mixed, _mm256_srli_si256::<8>(mixed));
+    let [low, high] = [
+        _mm256_extract_epi64::<0>(folded),
+        _mm256_extract_epi64::<2>(folded),
+    ];
+    (low as u64 | 1, high as u64 | 1)
+}
+
+/// Hashes any token.
+#[inline(always)]
+unsafe fn token_hash(token: *const u8, len: usize) -> u64 {
+    if len > 16 {
+        hash_long(token, len)
+    } else {
+        hash_two(token, len, token, len).0
     }
 }
 
-// Slots are probed four at a time from the start of the aligned group of four
-// the hash points into: a 32-byte compare finds the term or the first free
-// slot, which is where it would have been inserted.
-struct Terms {
-    slot: &'static mut [u64],
-    n: usize,
-}
-
-impl Terms {
-    fn probe(&self, h: u64) -> usize {
-        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
-        unsafe {
-            let (tag, keep) = (_mm256_set1_epi64x((h & !ID_MASK) as i64), _mm256_set1_epi64x(!ID_MASK as i64));
-            loop {
-                let v = _mm256_load_si256(self.slot.as_ptr().add(i).cast());
-                let hit = _mm256_cmpeq_epi64(_mm256_and_si256(v, keep), tag);
-                let found = _mm256_or_si256(hit, _mm256_cmpeq_epi64(v, _mm256_setzero_si256()));
-                let m = _mm256_movemask_pd(_mm256_castsi256_pd(found)) as usize;
-                if m != 0 {
-                    return i + m.trailing_zeros() as usize;
-                }
-                i = (i + 4) & mask;
-            }
-        }
+/// The scan's action for a token: one line read, no branch on hit or miss.
+#[inline(always)]
+unsafe fn lookup(buckets: *const TermLine, hash: u64) -> u32 {
+    let bucket = buckets.add(line_index(hash));
+    let wanted = _mm256_set1_epi32(hash as i32);
+    let same = _mm256_cmpeq_epi32(_mm256_load_si256(bucket.cast()), wanted);
+    let found = _mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32 | 1 << LINE_SLOTS;
+    let action = (*bucket).actions[found.trailing_zeros() as usize];
+    if action == SPILL {
+        return Engine::lookup_far(buckets, hash);
     }
-
-    fn find(&self, h: u64) -> u32 {
-        let s = unsafe { *self.slot.get_unchecked(self.probe(h)) };
-        ((s & ID_MASK) as u32).wrapping_sub(1) // u32::MAX if none
-    }
-
-    fn renumber(&mut self, new: &[u32]) {
-        for s in self.slot.iter_mut().filter(|s| **s != 0) {
-            *s = (*s & !ID_MASK) | (new[(*s & ID_MASK) as usize - 1] + 1) as u64;
-        }
-    }
-
-    fn insert(&mut self, h: u64) -> u32 {
-        let i = self.probe(h);
-        if self.slot[i] == 0 {
-            (self.n += 1, self.slot[i] = (h & !ID_MASK) | self.n as u64);
-        }
-        (self.slot[i] & ID_MASK) as u32 - 1
-    }
+    action
 }
 
-unsafe fn classes(p: *const u8) -> (u64, u64) {
-    let half = |q: *const u8| {
-        let v = _mm256_loadu_si256(q.cast());
-        let c = |b: u8| _mm256_set1_epi8(b as i8);
-        let le = |x: __m256i, n: u8| _mm256_cmpeq_epi8(_mm256_subs_epu8(x, c(n)), c(0));
-        let a = le(_mm256_sub_epi8(_mm256_or_si256(v, c(0x20)), c(b'a')), 25);
-        let d = le(_mm256_sub_epi8(v, c(b'0')), 9);
-        let mask = |x: __m256i| _mm256_movemask_epi8(x) as u32 as u64;
-        (mask(_mm256_or_si256(a, d)), mask(_mm256_cmpeq_epi8(v, c(b'\n'))))
-    };
-    let ((w0, n0), (w1, n1)) = (half(p), half(p.add(32)));
-    (w0 | w1 << 32, n0 | n1 << 32)
+/// The table line a hash belongs to.
+#[inline(always)]
+fn line_index(hash: u64) -> usize {
+    (hash >> (64 - LINES.ilog2())) as usize
 }
 
-// A thread's buffers for one document, hashes then ids: token k's of both
-// at [LAG + k] (the first LAG hashes are spare zeros). Its id is looked up
-// when the hash of token k + LAG is stored, LAG tokens after its slot was
-// prefetched.
-const LAG: usize = 8;
-struct Doc(Vec<u64>, Vec<u32>);
-
-impl Doc {
-    // Reads the document whose text starts at p; returns the next line's
-    // start and the document's ids.
-    unsafe fn read(&mut self, mut p: *const u8, t: &Terms) -> (*const u8, &[u32]) {
-        let (mut n, mask) = (LAG, t.slot.len() - 1);
-        loop {
-            if n + 40 > self.0.capacity().min(self.1.capacity()) {
-                (self.0.reserve(2 * n + 40), self.1.reserve(2 * n + 40));
-            }
-            let (hs, ids) = (self.0.as_mut_ptr(), self.1.as_mut_ptr());
-            _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(2048).cast());
-            let (word, nl) = classes(p);
-            // The window's tokens end at the line's end, or else before one
-            // that reaches its last byte, which the next window starts with.
-            // One that fills it is no term: it counts as one token of 48.
-            let mut next = nl.trailing_zeros().min(64 - (!word).leading_zeros());
-            let mut m = _bzhi_u64(word, next);
-            if next == 0 && nl == 0 {
-                while (*p.add(next as usize)).is_ascii_alphanumeric() {
-                    next += 1;
-                }
-                m = (1 << 48) - 1;
-            }
-            while m != 0 {
-                let (s, e) = (m.trailing_zeros(), m.wrapping_add(m & m.wrapping_neg()));
-                m &= e;
-                let h = hash(p.add(s as usize), (e.trailing_zeros() - s) as usize);
-                _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h as usize & mask).cast());
-                *hs.add(n) = h;
-                let id = t.find(*hs.add(n - LAG));
-                (*ids.add(n - LAG), n) = (id, n + 1);
-            }
-            if nl != 0 {
-                (n - LAG..n).for_each(|k| *ids.add(k) = t.find(*hs.add(k)));
-                (n..n + 8).for_each(|k| *ids.add(k) = u32::MAX); // read by select
-                return (p.add(next as usize + 1), std::slice::from_raw_parts(ids.add(LAG), n - LAG));
-            }
-            p = p.add(next as usize);
-        }
-    }
+/// Tokens over 16 bytes: two hashes mixed.
+#[cold]
+unsafe fn hash_long(token: *const u8, len: usize) -> u64 {
+    (token_hash(token, 16).rotate_left(29) ^ token_hash(token.add(16), len - 16)) | 1
 }
 
-// Calls f with each word (a run of letters and digits) of the line at p and
-// returns the next line's start; the words of a query file are short.
-unsafe fn words(mut p: *const u8, e: *const u8, mut f: impl FnMut(*const u8, usize)) -> *const u8 {
-    while p < e {
-        let (word, nl) = classes(p);
-        let next = nl.trailing_zeros().min(64 - (!word).leading_zeros());
-        let mut m = _bzhi_u64(word, next);
-        while m != 0 {
-            let (s, e) = (m.trailing_zeros(), m.wrapping_add(m & m.wrapping_neg()));
-            m &= e;
-            f(p.add(s as usize), (e.trailing_zeros() - s) as usize);
-        }
-        if nl != 0 {
-            return p.add(next as usize + 1);
-        }
-        p = p.add(next.max(1) as usize);
-    }
-    e
-}
-
-// Writes to out, packed to the front, the ids (or with at, their places) of
-// ids that lie in lo..lo + len, eight at a time: a compare gives a lane mask,
-// whose lanes' indices BMI2 gathers into a permutation. Reads up to seven ids
-// past the end of ids, which must be no term. Returns how many it wrote.
-unsafe fn select(ids: &[u32], lo: u32, len: u32, at: bool, out: &mut [u32]) -> usize {
-    let lo = _mm256_set1_epi32(lo as i32);
-    let top = _mm256_set1_epi32(len as i32 - 1);
-    let pick = _mm256_set1_epi32(-(at as i32));
-    let mut place = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-    let mut n = 0;
-    for k in (0..ids.len()).step_by(8) {
-        let x = _mm256_loadu_si256(ids.as_ptr().add(k).cast());
-        let d = _mm256_sub_epi32(x, lo);
-        let inside = _mm256_cmpeq_epi32(_mm256_min_epu32(d, top), d);
-        let m = _mm256_movemask_ps(_mm256_castsi256_ps(inside)) as u64;
-        let lanes = _pext_u64(0x0706_0504_0302_0100, _pdep_u64(m, 0x0101_0101_0101_0101) * 255);
-        let order = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(lanes as i64));
-        let v = _mm256_blendv_epi8(x, place, pick);
-        _mm256_storeu_si256(out.as_mut_ptr().add(n).cast(), _mm256_permutevar8x32_epi32(v, order));
-        n += m.count_ones() as usize;
-        place = _mm256_add_epi32(place, _mm256_set1_epi32(8));
-    }
-    n * (len > 0) as usize
-}
-
-enum Docs<'a> {
-    List(Vec<u32>),
-    Bits(Cow<'a, [u64]>),
-}
-
-fn has(bits: &[u64], d: u32) -> bool {
-    bits[d as usize / 64] >> (d % 64) & 1 != 0
-}
-
-fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
-    use Docs::*;
-    let bit = |d: u32| (d as usize / 64, 1u64 << (d % 64));
-    match (cur, op, term) {
-        (Bits(mut a), _, Bits(b)) => {
-            for (x, &y) in a.to_mut().iter_mut().zip(b.iter()) {
-                *x = match op {
-                    b'A' => *x & y,
-                    b'O' => *x | y,
-                    _ => *x & !y,
-                };
-            }
-            Bits(a)
-        }
-        (Bits(b), b'A', List(mut v)) | (List(mut v), b'A' | b'N', Bits(b)) => {
-            (v.retain(|&d| has(&b, d) == (op == b'A')), List(v)).1
-        }
-        (Bits(mut a), _, List(b)) | (List(b), _, Bits(mut a)) => {
-            let x = a.to_mut();
-            for (w, m) in b.into_iter().map(bit) {
-                x[w] = if op == b'O' { x[w] | m } else { x[w] & !m };
-            }
-            Bits(a)
-        }
-        (List(mut a), b'A' | b'N', List(b)) if a.len() * 16 < b.len() => {
-            let mut j = 0;
-            a.retain(|&d| {
-                j += b[j..].partition_point(|&x| x < d);
-                (j < b.len() && b[j] == d) == (op == b'A')
-            });
-            List(a)
-        }
-        (List(a), _, List(b)) if a.len() + b.len() > if op == b'O' { 2048 } else { BIG } => {
-            let mut bits = vec![0u64; words];
-            b.iter().for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
-            apply(List(a), op, Bits(Cow::Owned(bits)), words)
-        }
-        (List(a), b'O', List(b)) => {
-            let (mut v, mut i, mut j) = (Vec::with_capacity(a.len() + b.len()), 0, 0);
-            while i < a.len() && j < b.len() {
-                let (x, y) = (a[i], b[j]);
-                v.push(x.min(y));
-                (i, j) = (i + (x <= y) as usize, j + (y <= x) as usize);
-            }
-            v.extend_from_slice(&a[i..]);
-            v.extend_from_slice(&b[j..]);
-            List(v)
-        }
-        (List(mut a), _, List(b)) => {
-            let (mut i, mut j, mut k) = (0, 0, 0);
-            while i < a.len() && j < b.len() {
-                let (x, y) = (a[i], b[j]);
-                a[k] = x;
-                k += if op == b'A' { x == y } else { x < y } as usize;
-                (i, j) = (i + (x <= y) as usize, j + (y <= x) as usize);
-            }
-            let rest = if op == b'A' { 0 } else { a.len() - i };
-            (a.copy_within(i..i + rest, k), a.truncate(k + rest));
-            List(a)
-        }
-    }
-}
-
-unsafe fn bit_sums(b: &[u64]) -> (u64, u64) {
-    const NIB: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
-    let nib = _mm256_broadcastsi128_si256(_mm_loadu_si128(NIB.as_ptr().cast()));
-    let (low, z) = (_mm256_set1_epi8(0x0F), _mm256_setzero_si256());
-    let h = |v: __m256i| _mm256_shuffle_epi8(nib, _mm256_and_si256(v, low));
-    let pop = |v: __m256i| _mm256_sad_epu8(_mm256_add_epi8(h(v), h(_mm256_srli_epi16::<4>(v))), z);
-    let sel = |k: usize| _mm256_set1_epi64x(!(u64::MAX / ((1u64 << (1 << k)) + 1)) as i64);
-    let (mut acc, mut word) = ([z; 8], _mm256_setr_epi64x(0, 1, 2, 3));
-    for q in b.chunks_exact(4) {
-        let v = _mm256_loadu_si256(q.as_ptr().cast());
-        let c = pop(v);
-        acc[6] = _mm256_add_epi64(acc[6], c);
-        acc[7] = _mm256_add_epi64(acc[7], _mm256_mul_epu32(c, word));
-        for k in 0..6 {
-            acc[k] = _mm256_add_epi64(acc[k], pop(_mm256_and_si256(v, sel(k))));
-        }
-        word = _mm256_add_epi64(word, _mm256_set1_epi64x(4));
-    }
-    let total = |k: usize| -> u64 { std::mem::transmute::<_, [u64; 4]>(acc[k]).iter().sum() };
-    let sum = 64 * total(7) + (0..6).map(|k| total(k) << k).sum::<u64>();
-    (total(6), sum)
-}
-
-// v in decimal after a space (or none, first on a line), without the
-// formatting machinery: 600,000 numbers are written.
-fn num(out: &mut String, space: bool, mut v: u64) {
-    let (mut buf, mut i) = ([b' '; 21], 21);
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
-    }
-    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i - space as usize..]) });
-}
-
-fn line(out: &mut String, docs: &Docs) {
-    match docs {
-        Docs::List(v) => {
-            let sum: u64 = v.iter().map(|&d| d as u64).sum();
-            (num(out, false, v.len() as u64), num(out, true, sum));
-            v.iter().take(10).for_each(|&d| num(out, true, d as u64));
-        }
-        Docs::Bits(b) => {
-            let (count, sum) = unsafe { bit_sums(b) };
-            (num(out, false, count), num(out, true, sum));
-            let mut rem = 10;
-            for (w, &x) in b.iter().enumerate() {
-                let mut m = x;
-                while m != 0 && rem > 0 {
-                    num(out, true, w as u64 * 64 + m.trailing_zeros() as u64);
-                    (m, rem) = (m & (m - 1), rem - 1);
-                }
-                if rem == 0 {
-                    break;
-                }
-            }
-        }
-    }
-    out.push('\n');
-}
-
-fn walk(s: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, &[u32])) -> u32 {
-    let (mut p, end) = (s.as_ptr(), s.as_ptr_range().end);
-    let mut doc = first;
-    let mut buf = Doc(vec![0; LAG], vec![0; LAG]);
-    while p < end {
-        unsafe {
-            while *p != b'\t' {
-                p = p.add(1);
-            }
-            let ids;
-            (p, ids) = buf.read(p, t);
-            f(doc, ids);
-        }
-        doc += 1;
-    }
-    doc - first
-}
-
-#[derive(Default)]
-struct Units {
-    chunks: Vec<Vec<u16>>,
-    at: usize,
-    end: usize,
-    prev: u32,
-}
-
-impl Units {
-    fn put(&mut self, x: u16) {
-        if self.at == self.end {
-            self.grow();
-        }
-        (unsafe { *(self.at as *mut u16) = x }, self.at += 2);
-    }
-
+impl Engine {
+    /// The rest of the probe, past full lines.
     #[cold]
-    #[inline(never)]
-    fn grow(&mut self) {
-        self.finish();
-        let c = Vec::<u16>::with_capacity(1 << 15);
-        (self.at, self.end) = (c.as_ptr() as usize, c.as_ptr() as usize + 2 * c.capacity());
-        self.chunks.push(c);
-    }
-
-    fn add(&mut self, offset: u32, doc: u32) {
-        let gap = doc - std::mem::replace(&mut self.prev, doc);
-        self.put((offset << 4 | gap.min(GAP)) as u16);
-        if gap >= GAP {
-            self.put(gap as u16);
+    unsafe fn lookup_far(buckets: *const TermLine, hash: u64) -> u32 {
+        let mut index = line_index(hash);
+        loop {
+            let bucket = &*buckets.add(index);
+            match bucket.tags.iter().position(|&tag| tag == hash as u32) {
+                Some(slot) => return bucket.actions[slot],
+                None if bucket.actions[LINE_SLOTS] == 0 => return 0,
+                None => index = (index + 1) % LINES,
+            }
         }
     }
 
-    // Calls f with each unit's term (its index in the bucket) and document.
-    fn each(&self, mut f: impl FnMut(usize, u32)) {
-        let (mut doc, mut term) = (0u32, NONE);
-        for &x in self.chunks.iter().flatten() {
-            if term == NONE {
-                term = (x >> 4) as u32;
-                if x as u32 & GAP == GAP {
+    /// A fresh chunk of rows in a shard, tagged with its slice.
+    #[cold]
+    unsafe fn new_chunk(&self, shard: usize, claim: usize) -> (*mut u32, *mut u32) {
+        let offset = self.shard_fill[shard].fetch_add(ROW_CHUNK, Relaxed);
+        let at = self.rows.add(shard * (self.text.len() + 4096) + offset);
+        *at = claim as u32 + 1;
+        (at.add(1), at.add(ROW_CHUNK))
+    }
+
+    /// Tokenizes a slice, looks up its tokens, checks phrases and writes rows and bits.
+    unsafe fn scan_claim<const SAMPLE: bool>(&self, claim: usize, b: &mut Bench) -> usize {
+        let (start, mut doc) = line_at_64(self.text, self.docs, claim * SLICE);
+        let end = line_at_64(self.text, self.docs, claim * SLICE + SLICE).0;
+        if start >= end {
+            return 0;
+        }
+        let (first_doc, text) = (doc, self.text.as_ptr());
+
+        let mut cursors = [(null_mut(), null_mut()); ROW_SHARDS];
+        let (mut token_count, mut end_count, mut line_count) = (0, 0, 0);
+        let (mut at, mut carry, mut first_token) = (start, 0u64, true);
+
+        let byte = |value: u8| _mm256_set1_epi8(value as i8);
+        let (floor_lower, ceil_lower) = (byte(b'a' - 1), byte(b'z' + 1));
+        let (floor_digit, ceil_digit) = (byte(b'0' - 1), byte(b'9' + 1));
+        let (fold, newline) = (byte(0x20), byte(b'\n'));
+        let between = |x, floor, ceil| {
+            _mm256_and_si256(_mm256_cmpgt_epi8(x, floor), _mm256_cmpgt_epi8(ceil, x))
+        };
+
+        while at < end {
+            let batch_end = (at + TEXT_BATCH).min(end);
+            while at < batch_end {
+                let classify = |at: usize| {
+                    let chunk = _mm256_loadu_si256(text.add(at).cast());
+                    let lower = _mm256_or_si256(chunk, fold);
+                    let letters = between(lower, floor_lower, ceil_lower);
+                    let digits = between(chunk, floor_digit, ceil_digit);
+                    (
+                        _mm256_movemask_epi8(_mm256_or_si256(letters, digits)) as u32 as u64,
+                        _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, newline)) as u32 as u64,
+                    )
+                };
+                let (inside_low, breaks_low) = classify(at);
+                let (inside_high, breaks_high) = classify(at + 32);
+                let mut inside = inside_low | inside_high << 32;
+                let mut breaks = breaks_low | breaks_high << 32;
+                if at + 64 > end {
+                    let keep = (1u64 << (end - at)).wrapping_sub(1);
+                    inside &= keep;
+                    breaks &= keep;
+                }
+                let shifted = inside << 1 | carry;
+                carry = inside >> 63;
+                let mut opened = inside & !shifted;
+                let mut closed = !inside & shifted;
+                while breaks != 0 {
+                    let before = opened & ((1u64 << breaks.trailing_zeros()) - 1);
+                    b.lines[line_count] = (token_count + before.count_ones() as usize) as u32;
+                    line_count += 1;
+                    breaks &= breaks - 1;
+                }
+                let (found, ended) = (opened.count_ones() as usize, closed.count_ones() as usize);
+                let first_in = |bits: u64| (at + bits.trailing_zeros() as usize) as u32;
+                for extra in 0..12 {
+                    *b.starts.get_unchecked_mut(token_count + extra) = first_in(opened);
+                    *b.ends.get_unchecked_mut(end_count + extra) = first_in(closed);
+                    opened &= opened.wrapping_sub(1);
+                    closed &= closed.wrapping_sub(1);
+                }
+                for extra in 12..found {
+                    b.starts[token_count + extra] = first_in(opened);
+                    opened &= opened - 1;
+                }
+                for extra in 12..ended {
+                    b.ends[end_count + extra] = first_in(closed);
+                    closed &= closed - 1;
+                }
+                token_count += found;
+                end_count += ended;
+                at += 64;
+            }
+
+            let ready = b.lines[line_count.saturating_sub(1)] as usize;
+            let mut token = 0;
+            if first_token && ready > 0 {
+                first_token = false;
+                token = 1;
+                b.hashes[0] = 0;
+            }
+            let (starts, ends, hashes) =
+                (b.starts.as_ptr(), b.ends.as_ptr(), b.hashes.as_mut_ptr());
+            let span = |i: usize| (*starts.add(i) as usize, *ends.add(i) as usize);
+            let mut i = token;
+            while i + 1 < ready {
+                let (from_a, to_a) = span(i);
+                let (from_b, to_b) = span(i + 1);
+                let (len_a, len_b) = (to_a - from_a, to_b - from_b);
+                let (a, b) = (text.add(from_a), text.add(from_b));
+                (*hashes.add(i), *hashes.add(i + 1)) = if (len_a | len_b) > 16 {
+                    (token_hash(a, len_a), token_hash(b, len_b))
+                } else {
+                    hash_two(a, len_a, b, len_b)
+                };
+                i += 2;
+            }
+            if i < ready {
+                let (from, to) = span(i);
+                *hashes.add(i) = token_hash(text.add(from), to - from);
+            }
+            let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
+            let batch_doc = doc;
+            let buckets = self.buckets;
+            let (bitmap_hits, list_actions) =
+                (b.bitmap_hits.as_mut_ptr(), b.list_actions.as_mut_ptr());
+            let acts = b.acts.as_mut_ptr();
+            for line in 0..line_count {
+                let to = b.lines[line] as usize;
+                let from = token;
+                for t in from..to {
+                    let ahead = line_index(*hashes.add(t + PREFETCH_GAP));
+                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
+                    *acts.add(t) = lookup(buckets, *hashes.add(t));
+                }
+                let mut t = from;
+                while t < to {
+                    let v = _mm256_loadu_si256(acts.add(t).cast());
+                    let valid = if to - t >= 8 {
+                        255
+                    } else {
+                        (1u32 << (to - t)) - 1
+                    };
+                    let bitmap_count = _mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32 & valid;
+                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+                        v,
+                        _mm256_setzero_si256(),
+                    ))) as u32
+                        & valid;
+                    let pick = |mask: u32| {
+                        _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                            LEFT_PACK[mask as usize].as_ptr().cast(),
+                        ))
+                    };
+                    _mm256_storeu_si256(
+                        bitmap_hits.add(heavy_count).cast(),
+                        _mm256_permutevar8x32_epi32(v, pick(bitmap_count)),
+                    );
+                    heavy_count += bitmap_count.count_ones() as usize;
+                    _mm256_storeu_si256(
+                        list_actions.add(list_count).cast(),
+                        _mm256_permutevar8x32_epi32(v, pick(list)),
+                    );
+                    list_count += list.count_ones() as usize;
+                    let tagged = _mm256_and_si256(v, _mm256_set1_epi32(CHECK_FLAG as i32));
+                    if _mm256_testz_si256(tagged, tagged) == 0 {
+                        for u in t..(t + 8).min(to) {
+                            let action = *acts.add(u);
+                            if action & CHECK_FLAG != 0 {
+                                *b.check_hits.get_unchecked_mut(anchor_count) =
+                                    (action as u64) << 40 | (doc as u64) << 20 | u as u64;
+                                anchor_count += 1;
+                            }
+                        }
+                    }
+                    t += 8;
+                }
+                token = to;
+                *b.bitmap_ends.get_unchecked_mut(line) = heavy_count as u32;
+                *b.list_ends.get_unchecked_mut(line) = list_count as u32;
+                if line + 1 < line_count {
+                    doc += 1;
+                    b.hashes[to] = 0;
+                    token = to + 1;
+                }
+            }
+            let mut phrase_count = 0;
+            for (i, &hit) in b.check_hits[..anchor_count].iter().enumerate() {
+                let later = |ahead: usize| (b.check_hits[i + ahead] >> 40) as usize;
+                _mm_prefetch::<_MM_HINT_T0>(self.terms.add(later(8).wrapping_sub(1)).cast());
+                if let Some(term) = later(4).checked_sub(1) {
+                    let first = (*self.terms.add(term)).phrases as usize;
+                    _mm_prefetch::<_MM_HINT_T0>(self.phrases.add(first.wrapping_sub(1)).cast());
+                }
+                let token = hit as usize & ((1 << 20) - 1);
+                let mut next = (*self.terms.add((hit >> 40) as usize - 1)).phrases;
+                while next != 0 {
+                    let phrase = &*self.phrases.add(next as usize - 1);
+                    next = phrase.next;
+                    let (len, pivot) = (phrase.len as usize, phrase.pivot as usize);
+                    if token >= pivot
+                        && token - pivot + len <= ready
+                        && b.hashes[token - pivot..token - pivot + len] == phrase.words[..len]
+                    {
+                        b.window_hits[phrase_count] =
+                            (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
+                        phrase_count += 1;
+                    }
+                }
+            }
+            if !SAMPLE {
+                let (words, mut from) = (self.bitmap_count().div_ceil(64), 0);
+                for line in 0..line_count {
+                    let to = b.bitmap_ends[line] as usize;
+                    let rel = (batch_doc as usize + line
+                        - self.phase_first[claim / SLICES_PER_PHASE] as usize)
+                        % 64;
+                    let row = &mut b.group[rel * words..(rel + 1) * words];
+                    for &action in &b.bitmap_hits[from..to] {
+                        let id = (action & !BITMAP_FLAG) as usize;
+                        row[id / 64] |= 1 << (id % 64);
+                    }
+                    from = to;
+                    if rel == 63 {
+                        self.transpose_group(b.group, claim, batch_doc as usize + line);
+                    }
+                }
+            }
+            let mut emit = |hit: u64| {
+                let term = ((hit >> 32) as u32 & !CHECK_FLAG) - 1;
+                if SAMPLE {
+                    b.counts[term as usize] += 1;
+                    return;
+                }
+                let shard = term as usize & (ROW_SHARDS - 1);
+                let cursor = cursors.get_unchecked_mut(shard);
+                if cursor.0 == cursor.1 {
+                    *cursor = self.new_chunk(shard, claim);
+                }
+                *cursor.0 = ((term >> ROW_SHARDS.trailing_zeros()) + 1) << DOC_ID_BITS | hit as u32;
+                cursor.0 = cursor.0.add(1);
+            };
+            let mut from = 0;
+            for line in 0..line_count {
+                let to = b.list_ends[line] as usize;
+                let doc = (batch_doc as usize + line) as u64;
+                for &action in &b.list_actions[from..to] {
+                    emit((action as u64) << 32 | doc);
+                }
+                from = to;
+            }
+            for &hit in &b.window_hits[..phrase_count] {
+                emit(hit);
+            }
+            b.lines[0] = 0;
+            line_count = line_count.min(1);
+            b.starts.copy_within(ready..token_count, 0);
+            token_count -= ready;
+            b.ends.copy_within(ready..end_count, 0);
+            end_count -= ready;
+        }
+        if !SAMPLE {
+            self.transpose_group(b.group, claim, doc as usize);
+        }
+        doc - first_doc + 1
+    }
+
+    /// Terms that have a bitmap.
+    fn bitmap_count(&self) -> usize {
+        self.prep[3].load(Relaxed).min(MAX_BITMAPS)
+    }
+
+    /// Moves 64 documents' bitmap rows into the bitmaps, one 64x64 transpose per word.
+    unsafe fn transpose_group(&self, group: &mut [u64], claim: usize, doc: usize) {
+        let phase = claim / SLICES_PER_PHASE;
+        let rel = doc - self.phase_first[phase] as usize;
+        let (bitmap_count, out) = (self.bitmap_count(), self.bitmap_at(0, phase).add(rel / 64));
+        let words = bitmap_count.div_ceil(64);
+        for k in 0..words {
+            let mut m: [u64; 64] =
+                std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
+            for width in [32usize, 16, 8, 4, 2, 1] {
+                let mask = u64::MAX / ((1 << width) + 1);
+                for r in (0..64).filter(|r| r & width == 0) {
+                    let t = ((m[r] >> width) ^ m[r + width]) & mask;
+                    m[r + width] ^= t;
+                    m[r] ^= t << width;
+                }
+            }
+            for (t, &bits) in m.iter().enumerate().take(bitmap_count - k * 64) {
+                *out.add((k * 64 + t) * self.bitmap_words) |= bits;
+            }
+        }
+    }
+
+    /// Waits for every worker: spin briefly, then sleep on a futex.
+    fn sync_all(&self) {
+        let epoch = self.epoch.load(Acquire);
+        if self.waiting.fetch_add(1, AcqRel) as usize + 1 == self.shares.len() {
+            self.waiting.store(0, Relaxed);
+            self.epoch.fetch_add(1, Release);
+            unsafe { syscall(202, self.epoch.as_ptr(), 129, i32::MAX) };
+            return;
+        }
+        for _ in 0..3000 {
+            if self.epoch.load(Acquire) != epoch {
+                return;
+            }
+            std::hint::spin_loop();
+        }
+        while self.epoch.load(Acquire) == epoch {
+            unsafe { syscall(202, self.epoch.as_ptr(), 128, epoch, 0) };
+        }
+    }
+
+    /// Runs jobs from a shared counter until it passes count.
+    fn take_jobs(&self, counter: &AtomicUsize, count: usize, job: impl FnMut(usize)) {
+        (0..)
+            .map(|_| counter.fetch_add(1, Relaxed))
+            .take_while(|&next| next < count)
+            .for_each(job);
+    }
+
+    /// Gives each phrase its rarest word in the sample as the word that triggers its check.
+    unsafe fn choose_anchors(&self, slice: usize) {
+        let count = self.prep[5].load(Relaxed);
+        for index in count * slice / PLAN_PARTS..count * (slice + 1) / PLAN_PARTS {
+            let phrase = &mut *self.phrases.add(index);
+            let terms = phrase.words[..phrase.len as usize].iter();
+            let terms = terms.map(|&hash| lookup(self.buckets, hash) as usize - 1);
+            let (pivot, term) = (terms.enumerate())
+                .min_by_key(|&(_, term)| self.sample[term].load(Relaxed))
+                .unwrap();
+            let anchor = &mut (*self.terms.add(term)).phrases;
+            phrase.pivot = pivot as u32;
+            phrase.next = AtomicU32::from_ptr(anchor).swap(index as u32 + 1, Relaxed);
+        }
+    }
+
+    /// Sets each term's scan action once anchors and bitmaps are chosen.
+    unsafe fn finish_actions(&self, slice: usize) {
+        let docs = self.prep[4].load(Relaxed);
+        for index in LINES * slice / PLAN_PARTS..LINES * (slice + 1) / PLAN_PARTS {
+            let bucket = &mut *self.buckets.add(index);
+            for action in &mut bucket.actions[..LINE_SLOTS] {
+                if *action == 0 {
                     continue;
                 }
-                doc += x as u32 & GAP;
-            } else {
-                doc += x as u32;
+                let id = *action as usize - 1;
+                let term = &mut *self.terms.add(id);
+                if term.phrases != 0 {
+                    *action |= CHECK_FLAG;
+                } else if !term.in_bool {
+                    *action = 0;
+                } else if self.sample[id].load(Relaxed) as usize * 32 >= docs {
+                    let bitmap_count = self.prep[3].fetch_add(1, Relaxed);
+                    if bitmap_count < MAX_BITMAPS {
+                        *action = BITMAP_FLAG | bitmap_count as u32;
+                        (term.bitmap_count, term.first) = (true, bitmap_count as u32);
+                    }
+                }
             }
-            f(std::mem::replace(&mut term, NONE) as usize, doc);
         }
     }
 
-    fn finish(&mut self) {
-        if let Some(c) = self.chunks.last_mut() {
-            unsafe { c.set_len((self.at - c.as_ptr() as usize) / 2) };
+    /// Turns one shard's rows into sorted, deduplicated postings for the phase.
+    unsafe fn shard_postings(&self, shard: usize, phase: usize) {
+        let base = self.phase_first[phase];
+        let region = self.rows.add(shard * (self.text.len() + 4096));
+        let shard_fill = self.shard_fill[shard].load(Relaxed);
+        let mut chunks: Vec<(u32, u32)> = (0..shard_fill)
+            .step_by(ROW_CHUNK)
+            .map(|at| (*region.add(at), at as u32))
+            .collect();
+        chunks.sort_unstable();
+        let term_count = self.term_count.load(Relaxed);
+        let terms = term_count.div_ceil(ROW_SHARDS) + 1;
+        for id in (shard..term_count).step_by(ROW_SHARDS) {
+            (*self.terms.add(id)).count = 0;
+        }
+        let mut cursors = vec![0u32; terms];
+        each_row(region, &chunks, |low, _| {
+            *cursors.get_unchecked_mut(low) += 1
+        });
+        let lists = cursors.iter().filter(|&&size| size > 0).count();
+        let total = cursors.iter().sum::<u32>() as usize + lists * SENTINELS;
+        let mut at = self.phase[phase][3].fetch_add(total, Relaxed) as u32;
+        for cursor in cursors.iter_mut().filter(|cursor| **cursor > 0) {
+            let size = *cursor;
+            *cursor = at + SENTINELS as u32;
+            *self.postings.add(*cursor as usize - 1) = u16::MAX;
+            at += size + SENTINELS as u32;
+        }
+        let firsts = cursors.clone();
+        each_row(region, &chunks, |low, doc| {
+            let cursor = cursors.get_unchecked_mut(low);
+            let slot = self.postings.add(*cursor as usize);
+            *slot = (doc - base) as u16;
+            *cursor += (*slot.sub(1) != *slot) as u32;
+        });
+        for low in (0..terms).filter(|&low| firsts[low] > 0) {
+            let info = &mut *self.terms.add(low * ROW_SHARDS + shard);
+            info.first = firsts[low] - SENTINELS as u32;
+            info.count = cursors[low] - firsts[low];
+        }
+        std::ptr::write_bytes(region, 0, shard_fill);
+        self.shard_fill[shard].store(0, Relaxed);
+        let bitmap_count = self.bitmap_count();
+        let (from, to) = (
+            bitmap_count * shard / ROW_SHARDS,
+            bitmap_count * (shard + 1) / ROW_SHARDS,
+        );
+        let first = self.bitmap_at(from as u32, phase + 1);
+        std::ptr::write_bytes(first, 0, (to - from) * self.bitmap_words);
+    }
+
+    /// Bitmap of a term in a phase; two sets alternate between phases.
+    unsafe fn bitmap_at(&self, index: u32, phase: usize) -> *mut u64 {
+        let set = (phase & 1) * MAX_BITMAPS + index as usize;
+        self.bitmaps.add(set * self.bitmap_words)
+    }
+
+    /// A term's documents in a phase.
+    unsafe fn docs_of(&self, term: u32, phase: usize) -> Docs {
+        let info = &*self.terms.add(term as usize);
+        if info.bitmap_count {
+            let bits = self.bitmap_at(info.first, phase);
+            return Docs::Bits(std::slice::from_raw_parts(bits, self.bitmap_words));
+        }
+        let docs = self.postings.add(info.first as usize + SENTINELS);
+        Docs::List(std::slice::from_raw_parts(docs, info.count as usize))
+    }
+
+    /// One query on one phase, left to right.
+    unsafe fn eval_bool(&self, steps: &[(Op, u32)], phase: usize, scratch: &mut Spare) -> Docs {
+        let mut current = self.docs_of(steps[0].1, phase);
+        for &(op, term) in &steps[1..] {
+            if op != Op::Or && matches!(current, Docs::List([])) {
+                continue;
+            }
+            current = step(op, current, self.docs_of(term, phase), scratch);
+        }
+        current
+    }
+
+    /// Answers a batch of queries on a phase into their running results.
+    unsafe fn answer_batch(&self, (share, first, batch): Job, phase: usize, scratch: &mut Spare) {
+        let base = self.phase_first[phase];
+        let end = (first + QUERIES_PER_JOB).min(share.queries.len());
+        let tallies = share.tallies.as_ptr() as *mut Running;
+        let steps_of = |at: usize| &share.steps[share.queries[at].clone()];
+        let prefetch = |at: usize, lists: bool| {
+            for &(_, term) in (at < end).then(|| steps_of(at)).unwrap_or_default() {
+                let info = &*self.terms.add(term as usize);
+                if !lists {
+                    _mm_prefetch::<_MM_HINT_T0>((info as *const TermInfo).cast());
+                } else if !info.bitmap_count {
+                    let list = self.postings.add(info.first as usize);
+                    for line in 0..(info.count as usize).div_ceil(32).min(6) {
+                        _mm_prefetch::<_MM_HINT_T0>(list.add(line * 32).cast());
+                    }
+                }
+            }
+        };
+        prefetch(first, false);
+        prefetch(first + 1, false);
+        for index in first..end {
+            prefetch(index + 2, false);
+            prefetch(index + 1, true);
+            let steps = steps_of(index);
+            let tally = &mut *tallies.add(index);
+            match self.eval_bool(steps, phase, scratch) {
+                Docs::List(list) => tally.add_docs(base, list),
+                Docs::Bits(bits) => tally.add_bitmap(base, bits),
+            }
+        }
+        if phase + 1 == self.phase_first.len() - 1 {
+            let mut out = Vec::with_capacity(QUERIES_PER_JOB * 64);
+            for index in first..end {
+                (*tallies.add(index)).write(&mut out);
+            }
+            *self.outputs[batch].lock().unwrap() = out;
+        }
+    }
+
+    /// Parses this worker's part of the query file and interns its terms.
+    unsafe fn parse_part(&self, k: usize) -> QueryPart {
+        let (size, shares) = (self.queries.len(), self.shares.len());
+        let start = |k: usize| match k * size / shares {
+            0 => 0,
+            at => self.queries[at - 1..]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(size, |n| at + n),
+        };
+        let (mut parsed, mut ids, mut op) = (QueryPart::default(), 0..0, Op::And);
+        let (mut at, end, base) = (start(k), start(k + 1), self.queries.as_ptr());
+        while at < end {
+            let stop = memchr(base.add(at), b'\n' as i32, end - at);
+            let len = if stop.is_null() {
+                end - at
+            } else {
+                stop.offset_from(base) as usize - at
+            };
+            let line = &self.queries[at..at + len];
+            at += len + 1;
+            if line.is_empty() {
+                continue;
+            }
+            let phrase = line[0] == b'P';
+            let body = &line[if phrase { 8 } else { 5 }..line.len() - phrase as usize];
+            let (first, mut words, mut count) = (parsed.steps.len(), [0; WINDOW_MAX], 0);
+            for word in body.split(|&c| c == b' ') {
+                match word {
+                    b"AND" => op = Op::And,
+                    b"OR" => op = Op::Or,
+                    b"NOT" => op = Op::Not,
+                    _ => {
+                        let hash = token_hash(word.as_ptr(), word.len());
+                        let term = intern_term(self, &mut ids, hash);
+                        if phrase {
+                            words[count] = hash;
+                            count += 1;
+                        } else {
+                            (*self.terms.add(term as usize)).in_bool = true;
+                            parsed.steps.push((op, term));
+                        }
+                    }
+                }
+            }
+            if phrase {
+                let term = next_id(self, &mut ids);
+                parsed.steps.push((Op::And, term));
+                let slot = &mut *self.phrases.add(self.prep[5].fetch_add(1, Relaxed));
+                (slot.term, slot.len, slot.words) = (term, count as u32, words);
+            }
+            parsed.queries.push(first..parsed.steps.len());
+        }
+        parsed.tallies = lazy_slice(parsed.queries.len());
+        parsed
+    }
+
+    /// The worker: parse, sample, plan, then scan, build and answer each phase.
+    unsafe fn run_worker(&self, id: usize) {
+        let tokens = (1 << 19) + 32;
+        let mut next = self.arena.add(id * WORKER_BYTES);
+        let mut buffers = Bench {
+            starts: carve(&mut next, tokens),
+            ends: carve(&mut next, tokens),
+            lines: carve(&mut next, TEXT_BATCH / 2 + 64),
+            hashes: carve(&mut next, tokens + PREFETCH_GAP),
+            bitmap_hits: carve(&mut next, tokens),
+            bitmap_ends: carve(&mut next, TEXT_BATCH / 2 + 64),
+            group: carve(&mut next, 64 * MAX_BITMAPS / 64),
+            window_hits: carve(&mut next, tokens),
+            acts: carve(&mut next, tokens + 8),
+            list_actions: carve(&mut next, tokens + 8),
+            list_ends: carve(&mut next, TEXT_BATCH / 2 + 64),
+            check_hits: carve(&mut next, tokens),
+            counts: carve(&mut next, MAX_TERMS),
+        };
+        self.shares[id].set(self.parse_part(id)).ok();
+        self.sync_all();
+        self.take_jobs(&self.prep[0], 12, |claim| {
+            self.prep[4].fetch_add(self.scan_claim::<true>(claim, &mut buffers), Relaxed);
+        });
+        let terms = self.term_count.load(Relaxed);
+        for (total, &part) in self.sample.iter().zip(&buffers.counts[..terms]) {
+            total.fetch_add(part, Relaxed);
+        }
+        release(buffers.counts.as_ptr().cast(), MAX_TERMS * 4);
+        self.sync_all();
+        self.take_jobs(&self.prep[1], PLAN_PARTS, |slice| {
+            self.choose_anchors(slice)
+        });
+        self.sync_all();
+        self.take_jobs(&self.prep[2], PLAN_PARTS, |part| self.finish_actions(part));
+        self.sync_all();
+
+        let mut units = Vec::new();
+        for share in self.shares.iter().map(|share| share.get().unwrap()) {
+            for first in (0..share.queries.len()).step_by(QUERIES_PER_JOB) {
+                units.push((share, first, units.len()));
+            }
+        }
+        let mut scratch = Spare {
+            bits: vec![0; self.bitmap_words],
+            marks: vec![0; self.bitmap_words],
+            ..Default::default()
+        };
+        let phases = self.phase_first.len() - 1;
+        for stage in 0..=phases {
+            if stage < phases {
+                self.take_jobs(&self.phase[stage][0], SLICES_PER_PHASE, |claim| {
+                    self.scan_claim::<false>(stage * SLICES_PER_PHASE + claim, &mut buffers);
+                });
+            }
+            if stage > 0 {
+                self.take_jobs(&self.phase[stage - 1][2], units.len(), |batch| {
+                    self.answer_batch(units[batch], stage - 1, &mut scratch)
+                });
+            }
+            if stage == phases {
+                break;
+            }
+            self.sync_all();
+            if stage + 1 == phases {
+                let page =
+                    |n: usize| (self.text.len() * n / self.shares.len()).div_ceil(4096) * 4096;
+                release(self.text.as_ptr().add(page(id)), page(id + 1) - page(id));
+            }
+            assert!(self.phase_first[stage + 1] - self.phase_first[stage] < u16::MAX as u32);
+            self.take_jobs(&self.phase[stage][1], ROW_SHARDS, |shard| {
+                self.shard_postings(shard, stage)
+            });
+            self.sync_all();
         }
     }
 }
 
-fn main() {
-    unsafe { mallopt(-3, 1 << 16) };
-    std::thread::spawn(start);
-    let qtext = map("/data/queries.txt");
-    let n = (qtext.len() / 8).next_power_of_two().max(4);
-    // Mapped on its own and handed back after the scan. Every token's lookup
-    // lands on a random line of it, so it is put on 2 MB pages (one TLB entry
-    // instead of 512), faulted in before huge pages are turned off for the rest,
-    // where a page written only in part would cost memory.
-    let slot = unsafe {
-        let len = (n * 8).next_multiple_of(1 << 21);
-        let raw = mmap(std::ptr::null_mut(), len + (1 << 21), 3, 0x22, -1, 0);
-        let p = raw.add(raw.align_offset(1 << 21));
-        (madvise(p, len, 14), std::ptr::write_volatile(p, 0));
-        prctl(41, 1u64, 0u64, 0u64, 0u64);
-        std::slice::from_raw_parts_mut(p.cast(), n)
+/// Visits a shard's rows in document order.
+#[inline(always)]
+unsafe fn each_row(region: *const u32, chunks: &[(u32, u32)], mut visit: impl FnMut(usize, u32)) {
+    for &(_, at) in chunks {
+        for i in 1..ROW_CHUNK {
+            let row = *region.add(at as usize + i);
+            if row == 0 {
+                break;
+            }
+            visit(
+                (row >> DOC_ID_BITS) as usize - 1,
+                row & ((1 << DOC_ID_BITS) - 1),
+            );
+        }
+    }
+}
+
+/// The id at the start of a line.
+unsafe fn line_id(line: *const u8) -> usize {
+    let digits = (0..).map(|i| *line.add(i)).take_while(|&c| c != b'\t');
+    digits.fold(0, |id, digit| id * 10 + (digit - b'0') as usize)
+}
+
+/// The first line at or after a position whose id is a multiple of 64.
+unsafe fn line_at_64(text: &[u8], docs: usize, at: usize) -> (usize, usize) {
+    let (base, len) = (text.as_ptr(), text.len());
+    let past_line =
+        |from: usize| memchr(base.add(from), b'\n' as i32, len - from) as usize - base as usize + 1;
+    let mut line = at;
+    if at > 0 && at < len && *base.add(at - 1) != b'\n' {
+        line = past_line(at);
+    }
+    while line < len {
+        let id = line_id(base.add(line));
+        if id % 64 == 0 {
+            return (line, id);
+        }
+        line = past_line(line);
+    }
+    (len, docs)
+}
+
+/// AND or NOT of two lists: binary search for a far shorter one, else marks.
+unsafe fn keep_by(a: &[u16], b: &[u16], keep: bool, out: &mut Vec<u16>, marks: &mut [u64]) {
+    out.reserve(a.len().max(b.len()));
+    let target = out.as_mut_ptr();
+    let mut found = 0;
+    if a.len() * 16 <= b.len() {
+        for &doc in a {
+            let present = b.binary_search(&doc).is_ok();
+            *target.add(found) = doc;
+            found += (present == keep) as usize;
+        }
+    } else {
+        let (marked, tested) = if keep { (a, b) } else { (b, a) };
+        for &doc in marked {
+            *marks.get_unchecked_mut(doc as usize / 64) |= 1 << (doc % 64);
+        }
+        for &doc in tested {
+            let present = *marks.get_unchecked(doc as usize / 64) >> (doc % 64) & 1;
+            *target.add(found) = doc;
+            found += (present == keep as u64) as usize;
+        }
+        for &doc in marked {
+            *marks.get_unchecked_mut(doc as usize / 64) = 0;
+        }
+    }
+    out.set_len(found);
+}
+
+/// OR of two lists.
+fn merge_or(a: &[u16], b: &[u16], out: &mut Vec<u16>) {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        out.push(x.min(y));
+        i += (x <= y) as usize;
+        j += (y <= x) as usize;
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+}
+
+/// One step of a query; big results become a bitmap.
+unsafe fn step(op: Op, current: Docs, term: Docs, scratch: &mut Spare) -> Docs {
+    let swap = match (op, current, term) {
+        (Op::And, Docs::Bits(_), Docs::List(_)) => true,
+        (Op::And, Docs::List(a), Docs::List(b)) => b.len() < a.len(),
+        _ => false,
     };
-    let mut terms = Terms { slot, n: 0 };
-    // A line's first word gives the query's kind; in BOOL every other word
-    // after it is an operator, kept as its first letter after its left term.
-    let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
-    let (mut p, end) = (qtext.as_ptr(), qtext.as_ptr_range().end);
-    while p < end {
-        let (from, mut k, mut phrase) = (ids.len() as u32, 0, false);
-        p = unsafe {
-            words(p, end, |w, len| {
-                match k {
-                    0 => phrase = *w == b'P',
-                    _ if !phrase && k % 2 == 0 => *ops.last_mut().unwrap() = *w,
-                    _ => (ids.push(hash(w, len)), ops.push(0)).1,
+    let (a, b) = [(current, term), (term, current)][swap as usize];
+    scratch.lists.swap(0, 1);
+    let out = &mut scratch.lists[0];
+    out.clear();
+    let bits = &mut scratch.bits;
+    let (words, keep, marks) = (bits.len(), op == Op::And, &mut scratch.marks);
+    match (op, a, b) {
+        (Op::And | Op::Not, Docs::List(a), Docs::List(b)) => keep_by(a, b, keep, out, marks),
+        (Op::And | Op::Not, Docs::List(a), Docs::Bits(b)) => {
+            let held = |doc: u16| *b.get_unchecked(doc as usize / 64) >> (doc % 64) & 1 == 1;
+            out.extend(a.iter().filter(|&&doc| held(doc) == keep));
+        }
+        (Op::Or, Docs::List(a), Docs::List(b)) if a.len() + b.len() < words => merge_or(a, b, out),
+        _ => {
+            let mark = |bits: &mut [u64], docs: &[u16], clear: bool| {
+                for &doc in docs {
+                    let word = bits.get_unchecked_mut(doc as usize / 64);
+                    let bit = 1 << (doc % 64);
+                    *word = if clear { *word & !bit } else { *word | bit };
                 }
-                k += 1;
-            })
-        };
-        if k > 0 {
-            spans.push((phrase, from, ids.len() as u32));
-        }
-    }
-    // The terms' hashes come first, so each insert's slot is fetched 16 ahead.
-    let slot = terms.slot.as_ptr();
-    let mut ids: Vec<u32> = (0..ids.len())
-        .map(|k| {
-            let ahead = ids.get(k + 16).map_or(0, |&h| h as usize & (terms.slot.len() - 4));
-            unsafe { _mm_prefetch::<_MM_HINT_T0>(slot.add(ahead).cast()) };
-            terms.insert(ids[k])
-        })
-        .collect();
-    let nterms = terms.n;
-    let text = map("/data/docs.txt");
-    let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
-    for c in &mut cut[1..THREADS] {
-        while *c < text.len() && text[*c - 1] != b'\n' {
-            *c += 1;
-        }
-    }
-    let mut last_line = text.len().saturating_sub(1);
-    while last_line > 0 && text[last_line - 1] != b'\n' {
-        last_line -= 1;
-    }
-    let ndocs = (!text.is_empty()) as usize * (number(text, last_line) as usize + 1);
-    let first_doc = |c: usize| text.get(c).map_or(ndocs as u32, |_| number(text, c));
-    let firsts: Vec<u32> = cut[..THREADS].iter().map(|&c| first_doc(c)).collect();
-
-    let (nbits, a0, lists, nkeep, anchored, astart) = {
-        let mut in_bool = vec![false; nterms];
-        for &(_, from, to) in spans.iter().filter(|s| !s.0) {
-            ids[from as usize..to as usize].iter().for_each(|&id| in_bool[id as usize] = true);
-        }
-        let samples = on_threads(|t| {
-            let (mut df, mut last) = (vec![0u32; nterms + 1], vec![0u16; nterms + 1]);
-            let sample = &text[cut[t]..cut[t] + (cut[t + 1] - cut[t]) / 64];
-            let n = walk(sample, 0, &terms, |doc, toks| {
-                let mark = (doc + 1) as u16;
-                for i in toks.iter().map(|&id| (id as usize).min(nterms)) {
-                    if std::mem::replace(&mut last[i], mark) != mark {
-                        df[i] += 1;
-                    }
-                }
-            });
-            (n as usize, df)
-        });
-        let sampled: usize = samples.iter().map(|s| s.0).sum();
-        let mut df = vec![0u32; nterms + 1];
-        for (_, d) in samples {
-            df.iter_mut().zip(d).for_each(|(a, b)| *a += b);
-        }
-        let (mut anchored, mut anchor) = (vec![], vec![false; nterms]);
-        for (q, &(_, from, to)) in spans.iter().enumerate().filter(|s| s.1 .0) {
-            let rarity = |&j: &u32| df[ids[j as usize] as usize];
-            let j = (from..to).min_by_key(rarity).unwrap();
-            let a = ids[j as usize];
-            (anchored.push((a, q as u32, j - from)), anchor[a as usize] = true);
-        }
-        let class = |i: usize| match (in_bool[i], anchor[i]) {
-            (true, false) => (df[i] as usize * 32 <= sampled) as usize,
-            (true, true) => 2,
-            (false, true) => 3,
-            (false, false) => 4,
-        };
-        // Terms are numbered by class, in query order within one.
-        let mut at = [0; 6];
-        (0..nterms).for_each(|i| at[class(i) + 1] += 1);
-        (1..6).for_each(|c| at[c] += at[c - 1]);
-        let [nbits, a0, lists, nkeep] = [at[1], at[2], at[3], at[4]];
-        let new: Vec<u32> = (0..nterms).map(|i| (at[class(i)], at[class(i)] += 1).0 as u32).collect();
-        terms.renumber(&new);
-        ids.iter_mut().for_each(|id| *id = new[*id as usize]);
-        // The anchors' phrases, anchor by anchor in query order.
-        let mut astart = vec![0; nkeep - a0 + 1];
-        anchored.iter().for_each(|a| astart[new[a.0 as usize] as usize - a0 + 1] += 1);
-        (1..astart.len()).for_each(|k| astart[k] += astart[k - 1]);
-        let (mut at, mut sorted) = (astart.clone(), vec![(0, 0, 0); anchored.len()]);
-        for &(a, q, j) in &anchored {
-            let k = &mut at[new[a as usize] as usize - a0];
-            (sorted[*k], *k) = ((new[a as usize], q, j), *k + 1);
-        }
-        let anchored = sorted;
-        (nbits, a0, lists, nkeep, anchored, astart)
-    };
-    // Each anchor's first phrase in one 16-byte head, read where the anchor
-    // is met: the query, the term at the window's other end, and the anchor's
-    // place in the phrase, its length and the number of further phrases.
-    let heads: Vec<[u32; 4]> = (0..nkeep - a0)
-        .map(|k| {
-            let (_, q, j) = anchored[astart[k]];
-            let (_, from, to) = spans[q as usize];
-            let e = if j == 0 { to - from - 1 } else { 0 };
-            let more = (astart[k + 1] - astart[k] - 1) as u32;
-            [q, ids[(from + e) as usize], j | e << 8 | more << 16, 0]
-        })
-        .collect();
-
-    let words = ndocs.div_ceil(256) * 4;
-    let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
-    let found = Mutex::new(vec![]);
-    let scans = on_threads(|t| {
-        let (mut mine, mut kept, mut anchors) = (vec![], vec![0; 1 << 12], vec![0; 1 << 12]);
-        let mut dense = vec![0; 1 << 12];
-        let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
-        let first = firsts[t];
-        let (mut pending, mut block) = (vec![0u64; nbits], first as usize / 64);
-        let flush = |pending: &mut [u64], w: usize| {
-            for (b, x) in pending[..nbits].iter_mut().enumerate() {
-                if *x != 0 {
-                    bits[b * words + w].fetch_or(std::mem::take(x), Relaxed);
-                }
-            }
-        };
-        let share = &text[cut[t]..cut[t + 1]];
-        walk(share, first, &terms, |doc, toks| {
-            if doc as usize / 64 != block {
-                let w = std::mem::replace(&mut block, doc as usize / 64);
-                flush(&mut pending, w);
-            }
-            let (bit, off, nanchors) = (1u64 << (doc % 64), doc - first, nkeep - a0);
-            let (a0, nbits, nlists) = (a0 as u32, nbits as u32, (lists - nbits) as u32);
-            for v in [&mut kept, &mut anchors, &mut dense] {
-                v.resize(v.len().max(toks.len() + 8), 0);
-            }
-            // The anchors' places (their heads are fetched while the rest
-            // runs), the bitmap terms, and every occurrence of a list term,
-            // repeats in a document too (under 1% of them), which the lists
-            // drop when built.
-            let na = unsafe { select(toks, a0, nanchors as u32, true, &mut anchors) };
-            for &at in &anchors[..na] {
-                let k = (toks[at as usize] - a0) as usize;
-                unsafe { _mm_prefetch::<_MM_HINT_T0>(heads.as_ptr().add(k).cast()) };
-            }
-            let nd = unsafe { select(toks, 0, nbits, false, &mut dense) };
-            for &id in &dense[..nd] {
-                unsafe { *pending.get_unchecked_mut(id as usize) |= bit };
-            }
-            let n = unsafe { select(toks, nbits, nlists, false, &mut kept) };
-            for &at in &anchors[..na] {
-                let at = at as usize;
-                let k = (toks[at] - a0) as usize;
-                let mut check = |q: u32, j: u32| {
-                    let (_, from, to) = spans[q as usize];
-                    let s = at.wrapping_sub(j as usize);
-                    if toks.get(s..s.wrapping_add((to - from) as usize)) == Some(&ids[from as usize..to as usize]) {
-                        mine.push((q, doc));
-                    }
-                };
-                // The first phrase is turned down on its other end's term
-                // unless that matches; further ones are compared whole.
-                let [q, end, info, _] = heads[k];
-                let (j, e) = (info & 255, info >> 8 & 255);
-                if toks.get((at + e as usize).wrapping_sub(j as usize)) == Some(&end) {
-                    check(q, j);
-                }
-                for &(_, q, j) in &anchored[astart[k] + 1..][..(info >> 16) as usize] {
-                    check(q, j);
-                }
-            }
-            for &i in &kept[..n] {
-                buckets[i as usize % BUCKETS].add(i / BUCKETS as u32, off);
-            }
-        });
-        flush(&mut pending, block);
-        // The share is not read again: its pages go now, on every thread,
-        // rather than all of the file's on one thread at exit.
-        let page = |n: usize| share.as_ptr() as usize + n & !4095;
-        let (a, b) = (page(4095), page(share.len()));
-        unsafe { madvise(a as *mut u8, b.saturating_sub(a), 4) };
-        buckets.iter_mut().for_each(Units::finish);
-        found.lock().unwrap().extend(mine);
-        Mutex::new(buckets)
-    });
-    unsafe { munmap(terms.slot.as_mut_ptr().cast(), terms.slot.len() * 8) };
-
-    // Each thread counts its documents per list term (a term's units are in
-    // document order, so a repeat follows its first), then writes them.
-    let counts = on_threads(|t| {
-        let (mut count, mut last) = (vec![0u16; lists], vec![NONE; lists.div_ceil(BUCKETS)]);
-        for (b, units) in scans[t].lock().unwrap().iter().enumerate() {
-            last.fill(NONE);
-            units.each(|k, doc| {
-                count[b + k * BUCKETS] += (std::mem::replace(&mut last[k], doc) != doc) as u16;
-            });
-        }
-        count
-    });
-    // Each thread's counts are copied in order; the stretches are then laid
-    // out bucket by bucket, reading one 24-byte row per term.
-    let (mut seg, mut start, mut end) = (vec![0u16; lists * THREADS], vec![0u32; lists], 0);
-    for (t, c) in counts.iter().enumerate() {
-        (0..lists).for_each(|i| seg[i * THREADS + t] = c[i]);
-    }
-    for i in (0..BUCKETS).flat_map(|b| (b..lists).step_by(BUCKETS)) {
-        (start[i], end) = (end, end + seg[i * THREADS..][..THREADS].iter().map(|&n| n as u32).sum::<u32>());
-    }
-    let post: Vec<AtomicU16> = unsafe { std::mem::transmute(vec![0u16; end as usize]) };
-    on_threads(|t| {
-        let buckets = std::mem::take(&mut *scans[t].lock().unwrap());
-        let (mut cursor, mut last) = (vec![0u32; lists.div_ceil(BUCKETS)], vec![NONE; lists.div_ceil(BUCKETS)]);
-        for (b, units) in buckets.into_iter().enumerate() {
-            for (c, i) in cursor.iter_mut().zip((b..lists).step_by(BUCKETS)) {
-                let before: u32 = seg[i * THREADS..][..t].iter().map(|&n| n as u32).sum();
-                *c = start[i] + before;
-            }
-            last.fill(NONE);
-            units.each(|k, doc| {
-                if std::mem::replace(&mut last[k], doc) != doc {
-                    (post[cursor[k] as usize].store(doc as u16, Relaxed), cursor[k] += 1);
-                }
-            });
-        }
-    });
-    let post: Vec<u16> = unsafe { std::mem::transmute(post) };
-    let bits: Vec<u64> = unsafe { std::mem::transmute(bits) };
-    let mut found = found.into_inner().unwrap();
-    (found.sort_unstable(), found.dedup());
-
-    unsafe { mallopt(-3, 64 << 20) };
-    let docs = |id: u32| match id as usize {
-        i if i < nbits => Docs::Bits(Cow::Borrowed(&bits[i * words..(i + 1) * words])),
-        i => {
-            let mut at = start[i] as usize;
-            let segs = &seg[i * THREADS..][..THREADS];
-            let mut v = Vec::with_capacity(segs.iter().map(|&n| n as usize).sum());
-            for (&n, &first) in segs.iter().zip(&firsts) {
-                v.extend(post[at..at + n as usize].iter().map(|&d| first + d as u32));
-                at += n as usize;
-            }
-            Docs::List(v)
-        }
-    };
-    let n = spans.len().div_ceil(64);
-    let chunks: Vec<Mutex<String>> = (0..n).map(|_| Mutex::default()).collect();
-    let next = AtomicUsize::new(0);
-    on_threads(|_| loop {
-        let k = next.fetch_add(1, Relaxed);
-        let Some(chunk) = chunks.get(k) else { return };
-        let mut out = String::new();
-        for (q, &(phrase, from, to)) in spans.iter().enumerate().skip(k * 64).take(64) {
-            let r = from as usize..to as usize;
-            let (tids, ops) = (&ids[r.clone()], &ops[r]);
-            let set = if phrase {
-                let at = found.partition_point(|m| m.0 < q as u32);
-                let end = at + found[at..].partition_point(|m| m.0 == q as u32);
-                Docs::List(found[at..end].iter().map(|m| m.1).collect())
-            } else {
-                let (cur, steps) = (docs(tids[0]), ops.iter().zip(&tids[1..]));
-                steps.fold(cur, |cur, (&op, &id)| match &cur {
-                    Docs::List(v) if v.is_empty() && op != b'O' => cur,
-                    _ => apply(cur, op, docs(id), words),
-                })
             };
-            line(&mut out, &set);
+            match a {
+                Docs::Bits(source) if source.as_ptr() != bits.as_ptr() => {
+                    bits.copy_from_slice(source)
+                }
+                Docs::Bits(_) => {}
+                Docs::List(docs) => {
+                    bits.fill(0);
+                    mark(bits, docs, false);
+                }
+            }
+            match b {
+                Docs::List(docs) => mark(bits, docs, op == Op::Not),
+                Docs::Bits(other) => {
+                    for (word, &other) in bits.iter_mut().zip(other) {
+                        *word = match op {
+                            Op::And => *word & other,
+                            Op::Or => *word | other,
+                            Op::Not => *word & !other,
+                        };
+                    }
+                }
+            }
+            return Docs::Bits(std::slice::from_raw_parts(bits.as_ptr(), words));
         }
-        *chunk.lock().unwrap() = out;
-    });
-    let file = std::fs::File::create("/out/results.txt").expect("/out/results.txt");
-    let mut out = std::io::BufWriter::with_capacity(1 << 21, file);
-    for c in chunks {
-        std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
-    std::io::Write::flush(&mut out).unwrap();
-    unsafe { _exit(0) };
+    Docs::List(std::slice::from_raw_parts(out.as_ptr(), out.len()))
+}
+
+/// Writes a number and a space.
+fn push_num(out: &mut Vec<u8>, mut value: u64) {
+    let from = out.len();
+    while out.len() == from || value > 0 {
+        out.push(b'0' + (value % 10) as u8);
+        value /= 10;
+    }
+    out[from..].reverse();
+    out.push(b' ');
+}
+
+/// Finds or adds a term, from any thread, by compare-exchange on its tag.
+unsafe fn intern_term(run: &Engine, ids: &mut std::ops::Range<u32>, hash: u64) -> u32 {
+    let mut index = line_index(hash);
+    loop {
+        let bucket = &mut *run.buckets.add(index);
+        for slot in 0..LINE_SLOTS {
+            let tag = AtomicU32::from_ptr(&mut bucket.tags[slot]);
+            let action = AtomicU32::from_ptr(&mut bucket.actions[slot]);
+            let mut seen = tag.load(Acquire);
+            if seen == 0 {
+                seen = match tag.compare_exchange(0, hash as u32, AcqRel, Acquire) {
+                    Ok(_) => {
+                        let term = next_id(run, ids);
+                        action.store(term + 1, Release);
+                        return term;
+                    }
+                    Err(other) => other,
+                };
+            }
+            if seen == hash as u32 {
+                while action.load(Acquire) == 0 {
+                    std::hint::spin_loop();
+                }
+                return action.load(Acquire) - 1;
+            }
+        }
+        AtomicU32::from_ptr(&mut bucket.actions[LINE_SLOTS]).store(SPILL, Relaxed);
+        index = (index + 1) % LINES;
+    }
+}
+
+/// A new term id, taken in runs to spare the shared counter.
+unsafe fn next_id(run: &Engine, ids: &mut std::ops::Range<u32>) -> u32 {
+    ids.next().unwrap_or_else(|| {
+        let first = run.term_count.fetch_add(ID_RUN, Relaxed) as u32;
+        *ids = first + 1..first + ID_RUN as u32;
+        first
+    })
+}
+
+/// A batch of queries: their part, the first one, and the output slot.
+type Job<'a> = (&'a QueryPart, usize, usize);
+
+/// A worker's parsed queries and their running results.
+#[derive(Default)]
+struct QueryPart {
+    queries: Vec<std::ops::Range<usize>>,
+    steps: Vec<(Op, u32)>,
+    tallies: &'static mut [Running],
+}
+
+/// Starts workers as a binary tree, each spawning two before working.
+fn start_tree<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    run: &'env Engine,
+    id: usize,
+) {
+    for child in (2 * id + 1..2 * id + 3).filter(|&c| c < run.shares.len()) {
+        scope.spawn(move || start_tree(scope, run, child));
+    }
+    unsafe { run.run_worker(id) };
+}
+
+/// Maps the inputs, sets up the shared state, runs the workers, writes the file.
+fn main() {
+    let threads = thread::available_parallelism().map_or(12, |n| n.get());
+    unsafe {
+        let [text, queries] = ["/data/docs.txt", "/data/queries.txt"].map(|path| map_input(path));
+        let last_line = text.rsplit(|&c| c == b'\n').nth(1);
+        let docs = last_line.map_or(0, |line| line_id(line.as_ptr()) + 1);
+        assert!(docs < 1 << DOC_ID_BITS);
+        let phases = text.len().div_ceil(SLICES_PER_PHASE * SLICE).max(1);
+        let phase_first: Vec<u32> = (0..=phases)
+            .map(|phase| line_at_64(text, docs, phase * SLICES_PER_PHASE * SLICE).1 as u32)
+            .collect();
+        let widest = phase_first.windows(2).fold(0, |m, w| m.max(w[1] - w[0]));
+        let bitmap_words = (widest as usize / 64 + 2).next_multiple_of(4);
+        let batches = queries.len() / (7 * QUERIES_PER_JOB) + threads;
+        let run = Engine {
+            text,
+            docs,
+            bitmap_words,
+            buckets: reserve_region(LINES, true),
+            terms: reserve_region(MAX_TERMS, true),
+            term_count: AtomicUsize::new(0),
+            queries,
+            shares: (0..threads).map(|_| OnceLock::new()).collect(),
+            phrases: reserve_region(MAX_TERMS, false),
+            sample: lazy_slice(MAX_TERMS),
+            prep: [0; 6].map(AtomicUsize::new),
+            phase: (0..phases).map(|_| Default::default()).collect(),
+            phase_first,
+            waiting: Default::default(),
+            epoch: Default::default(),
+            bitmaps: reserve_region(2 * MAX_BITMAPS * bitmap_words, true),
+            rows: reserve_region(ROW_SHARDS * (text.len() + 4096), false),
+            shard_fill: (0..ROW_SHARDS).map(|_| AtomicUsize::new(0)).collect(),
+            postings: reserve_region(text.len() + HUGE_PAGE, true),
+            outputs: (0..batches).map(|_| Mutex::default()).collect(),
+            arena: reserve_region(threads * WORKER_BYTES, false),
+        };
+        run.buckets.cast::<u8>().write_volatile(0);
+        prctl(41, 1, 0, 0, 0);
+
+        thread::scope(|s| start_tree(s, &run, 0));
+
+        let outputs = run
+            .outputs
+            .iter()
+            .map(|part| std::mem::take(&mut *part.lock().unwrap()));
+        let text: Vec<u8> = outputs.collect::<Vec<_>>().concat();
+        File::create("/out/results.txt")
+            .unwrap()
+            .write_all(&text)
+            .unwrap();
+    }
 }
