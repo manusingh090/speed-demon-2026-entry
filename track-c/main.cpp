@@ -1,7 +1,8 @@
 // Speed Demon 2026, Track C (Join).
 //
-// Both files are memory-mapped, and every phase is cut into pieces that any
-// thread of one pool claims; a phase starts once the one before is done:
+// Both files are memory-mapped, and the tables read at random sit on 2 MB
+// pages. Every phase is cut into pieces that any thread of one pool claims; a
+// phase starts once the one before is done:
 //  1. regions.csv is split by lines; each thread flags the country codes it
 //     sees. Countries get indices 1..N in code order (0 is _UNMATCHED).
 //  2. Each thread fills its slice of a direct table region_id -> country index.
@@ -26,9 +27,11 @@
 #include <immintrin.h>
 #include <string>
 #include <mutex>
+#include <new>
+#include <span>
 #include <string_view>
 #include <sys/mman.h>
-#include <sys/prctl.h>
+#include <pthread.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -39,38 +42,56 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
 
-// Zero-filled anonymous memory; pages are charged only once touched.
-template <class T>
-T* zeroed(size_t n) {
-    void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) { perror("mmap"); _exit(1); }
-    return static_cast<T*>(p);
+// A fatal error: what failed (and errno's reason), then exit status 1.
+[[noreturn]] void die(const char* what) {
+    perror(what);
+    _exit(1);
 }
 
-// A table that every thread writes all over is populated up front: faulting
-// it in page by page from twelve threads at once made the threads queue on
-// the kernel's page-table locks (about 12% of all cycles), and each page was
-// faulted twice, once on its first read (the shared zero page) and again on
-// its first write. Thread t of n populates its share of the n pieces in one
-// call, so the work is spread too. (Without MADV_POPULATE_WRITE the pages
-// are simply faulted in later.)
+// The tables read at random (the region table, the name table and the
+// bitsets), and the threads' totals, are carved in turn out of one
+// zero-filled block on 2 MB pages. A
+// record reads all three at random; on 4 KB pages (about 1,350 of them) nearly
+// every such read missed the first-level TLB, and one in twelve walked the
+// page tables.
+constexpr size_t HUGE_PAGE = 2 << 20;
+char *arena_start, *arena, *arena_end;
+
+void make_arena(size_t bytes) {
+    bytes = (bytes + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
+    auto* p = static_cast<char*>(mmap(nullptr, bytes + HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == MAP_FAILED) die("mmap");
+    arena = arena_start = reinterpret_cast<char*>((uintptr_t(p) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
+    arena_end = arena + bytes;
+    madvise(arena, bytes, MADV_HUGEPAGE);
+}
+
 template <class T>
-void populate_share(T* p, size_t n, int t, int nthreads) {
-    const size_t pages = (n * sizeof(T) + 4095) / 4096, from = pages * t / nthreads, to = pages * (t + 1) / nthreads;
-    if (to > from) madvise(reinterpret_cast<char*>(p) + from * 4096, (to - from) * 4096, MADV_POPULATE_WRITE);
+T* zeroed(size_t n) {
+    T* p = reinterpret_cast<T*>(arena);
+    arena += (n * sizeof(T) + 4095) & ~size_t(4095);
+    if (arena > arena_end) die("arena");
+    return p;
+}
+
+// The arena is populated before use, each 2 MB page by one thread (thread t
+// of n takes pages t, t + n, ...): faulted in as the threads reach it, each
+// page would be read first (mapping the shared zero page) and written later,
+// and threads faulting one 2 MB page at once each get one allocated, all but
+// one then freed.
+void populate_arena(int t, int nthreads) {
+    for (char* p = arena_start + t * HUGE_PAGE; p < arena_end; p += nthreads * HUGE_PAGE)
+        madvise(p, HUGE_PAGE, MADV_POPULATE_WRITE);
 }
 
 // Map a file over a spare zero page, so 64-byte loads past its end are safe.
 const char* map_file(const char* path, size_t& size) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror(path); _exit(1); }
+    if (fd < 0) die(path);
     size = lseek(fd, 0, SEEK_END);
     auto* p = static_cast<char*>(
         mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
-        perror("mmap");
-        _exit(1);
-    }
+    if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) die("mmap");
     close(fd);
     return p;
 }
@@ -149,9 +170,6 @@ public:
             }
         }
     }
-
-    // Each of n threads populates its share up front (see zeroed).
-    void populate(int t, int n) const { populate_share(slots_, SLOTS, t, n); }
 
 private:
     std::atomic<u32>* slots_ = zeroed<std::atomic<u32>>(SLOTS);  // 0 = free
@@ -379,10 +397,13 @@ void put_money(std::string& out, i64 cents) {
 }
 
 int main() {
-    // With transparent huge pages, a block written only in part can be backed
-    // by a whole 2 MB page; plain pages keep memory to what is written.
-    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 6);  // probe: one thread per core
+    // Small stacks: an 8 MB one could be backed by a whole 2 MB page once
+    // touched, with transparent huge pages always on.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 << 10);
+    pthread_setattr_default_np(&attr);
+    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
     const char* records = map_file("/data/records.csv", size);
@@ -391,6 +412,7 @@ int main() {
     // the last line holds the largest id.
     const char* last = static_cast<const char*>(memrchr(regions, '\n', rsize - 1)) + 1;
     const size_t nregions = atoll(last) + 1;
+    make_arena(nregions + 4096 + NameTable::SLOTS * 4 + 256 * NamesSeen::WORDS * 8 + nthreads * sizeof(std::array<Totals, 256>) + 4096);
     u8* country_of = zeroed<u8>(nregions);  // 0 = no such region
     std::vector<size_t> rcut = split(regions, strchr(regions, '\n') - regions + 1, rsize, nthreads, "\n");
     std::vector<std::atomic<u8>> present(1 << 15);
@@ -400,7 +422,7 @@ int main() {
     auto number_countries = [&] {
         for (u32 k = 0; k < present.size(); ++k)
             if (present[k]) codes.push_back(k), index_of[k] = codes.size();
-        if (codes.size() > 255) { fputs("too many countries\n", stderr); _exit(1); }
+        if (codes.size() > 255) die("more than 255 countries");
     };
 
     // records.csv: skip the BOM and header, then split after CRLFs into eight
@@ -409,30 +431,29 @@ int main() {
     size_t start = size ? static_cast<const char*>(memchr(records, '\n', size)) - records + 1 : 0;
     const int pieces = 8 * nthreads;
     std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
-    std::vector<std::array<Totals, 256>> totals(nthreads);
+    std::span<std::array<Totals, 256>> totals(zeroed<std::array<Totals, 256>>(nthreads), nthreads);  // set up by each thread
     NameTable names;
     NamesSeen seen;
 
-    // Populate tables and flag countries; populate bitsets and fill the region
-    // table; parse records.
+    // Populate the tables and flag countries; fill the region table; parse
+    // records.
     Phase flag{.pieces = nthreads}, fill{.pieces = nthreads}, parse{.pieces = pieces};
     std::vector<std::thread> pool;
     for (int t = 0; t < nthreads; ++t)
         pool.emplace_back([&, t] {
             flag.run([&](int k) {
-                populate_share(country_of, nregions, k, nthreads);
-                names.populate(k, nthreads);
+                populate_arena(k, nthreads);
                 for (const char* p = regions + rcut[k]; p < regions + rcut[k + 1];)
                     present[region_line(p).second].store(1, std::memory_order_relaxed);
             });
             std::call_once(numbered, number_countries);
             fill.run([&](int k) {
-                populate_share(seen.bits, (codes.size() + 1) * NamesSeen::WORDS, k, nthreads);
                 for (const char* p = regions + rcut[k]; p < regions + rcut[k + 1];) {
                     auto [id, c] = region_line(p);
                     country_of[id] = index_of[c];
                 }
             });
+            new (&totals[t]) std::array<Totals, 256>();
             parse.run([&](int k) {
                 // Map the piece's pages in one call rather than by a fault
                 // every 16 pages as the parse reaches them.
@@ -476,7 +497,7 @@ int main() {
         out += '\n';
     }
     FILE* f = fopen("/out/aggregates.txt", "wb");
-    if (!f) { perror("/out/aggregates.txt"); return 1; }
+    if (!f) die("/out/aggregates.txt");
     fwrite(out.data(), 1, out.size(), f);
     fclose(f);
     return 0;
