@@ -11,8 +11,10 @@
 //!    the adjacency list is built with no atomics and no cache misses beyond
 //!    the writes themselves.
 //! 3. Renumber for locality. Node ids are a random relabelling, so each thread
-//!    cuts the road network into compact blobs of 512 nodes grown by BFS, and
-//!    the graph is copied into that numbering, then reversed.
+//!    cuts the road network into compact blobs of 512 nodes grown by BFS,
+//!    copying each node's edges into its own region of the new edge array as
+//!    it orders it; one pass then maps the heads to new ids and counts the
+//!    in-degrees, and the graph is reversed.
 //! 4. Bidirectional Dijkstra per query, with 4-ary heaps and distances kept in
 //!    pages handed out on first touch, as u32 unless the answer may not fit.
 //!    A target with no in-edge is -1 at once. The graph's pages are handed
@@ -428,7 +430,7 @@ fn main() {
     let mut i = 0;
     let n = number(text, &mut i) as usize;
     number(text, &mut i);
-    let hb = 32 - (n as u32 | 1).leading_zeros(); // bits for a node id
+    let hb = 32 - ((n + 8 * nt) as u32 | 1).leading_zeros(); // bits for a node id, padding ids included
     let (hmask, big) = ((1u32 << hb) - 1, u32::MAX >> hb);
     let sh = PART_BITS.min(hb);
     let parts = (n >> sh) + 1;
@@ -537,13 +539,19 @@ fn main() {
     };
     let (first_v, link_v) = (first, link);
     let (first, link) = (&first_v, &link_v[..]);
-    // Each thread's chain of nodes, with their out-degrees.
-    let chains: Vec<(Vec<u32>, Vec<u32>, u32)> = on_threads(nt, |t| {
+    // As a thread orders a node it also appends the node's edge words (heads
+    // still old ids) to its own region of the new edge array, so the graph is
+    // copied into the new order on the way, in sequential writes. Region t
+    // starts at t * m in one zeroed reservation, of which only the pages
+    // written are ever touched. Returns each chain and its heavy weights.
+    assert!(nt * m < 1 << 32, "edge positions must fit 32 bits");
+    let mut adj = vec![0u32; nt * m];
+    let ar = Raw::of(&mut adj);
+    let chains: Vec<(Vec<u32>, Vec<(u32, u32)>)> = on_threads(nt, |t| {
         drop_pages(&filed[t].offs, 0, 1); // the parse output is read no more
         drop_pages(&filed[t].words, 0, 1);
-        let (mut ord, mut seeds) = (Vec::with_capacity(n / nt + BLOB), Vec::new());
-        let (mut degs, mut edges) = (Vec::with_capacity(n / nt + BLOB), 0);
-        let mut scan = share(n, t, nt).start;
+        let (mut ord, mut seeds, mut heavy2) = (Vec::with_capacity(n / nt + BLOB), Vec::new(), Vec::new());
+        let (mut scan, mut at) = (share(n, t, nt).start, t * m);
         // Fetch the offsets 8 queue entries ahead, the edges 4 ahead and the
         // claim flags of their heads 2 ahead.
         let ahead = |ord: &Vec<u32>, i: usize| {
@@ -553,6 +561,19 @@ fn main() {
                 let u = u as usize;
                 (first.at(u)..first.at(u + 1)).for_each(|e| prefetch(&claimed[(link[e as usize] & hmask) as usize]))
             });
+        };
+        // Copies u's edge words to the region; returns them for the caller.
+        let mut copy = |u: usize, at: &mut usize| {
+            let (lo, hi) = (first.at(u), first.at(u + 1));
+            for e in lo..hi {
+                let x = link[e as usize];
+                if x >> hb == big {
+                    heavy2.push((*at as u32, heavy_weight(&heavy, e)));
+                }
+                unsafe { *ar.at(*at) = x };
+                *at += 1;
+            }
+            &link[lo as usize..hi as usize]
         };
         loop {
             let mut seed = None;
@@ -568,113 +589,89 @@ fn main() {
                 }
                 scan += 1;
             }
-            let Some(seed) = seed else { return (ord, degs, edges) };
+            let Some(seed) = seed else { return (ord, heavy2) };
             let (blob, mut i) = (ord.len(), ord.len());
             ord.push(seed);
             while i < ord.len() && ord.len() - blob < BLOB {
                 ahead(&ord, i);
-                let u = ord[i] as usize;
-                let (lo, hi) = (first.at(u), first.at(u + 1));
-                (_, edges) = (degs.push(hi - lo), edges + hi - lo);
-                for e in lo..hi {
-                    let v = link[e as usize] & hmask;
-                    if ord.len() - blob < BLOB && claim(v) {
-                        ord.push(v);
+                for &x in copy(ord[i] as usize, &mut at) {
+                    if ord.len() - blob < BLOB && claim(x & hmask) {
+                        ord.push(x & hmask);
                     }
                 }
                 i += 1;
             }
             for i in i..ord.len() {
                 ahead(&ord, i);
-                let u = ord[i] as usize;
-                let (lo, hi) = (first.at(u), first.at(u + 1));
-                (_, edges) = (degs.push(hi - lo), edges + hi - lo);
-                for e in lo..hi {
-                    let v = link[e as usize] & hmask;
-                    if claimed[v as usize].load(Relaxed) == 0 {
-                        seeds.push(v);
+                for &x in copy(ord[i] as usize, &mut at) {
+                    if claimed[(x & hmask) as usize].load(Relaxed) == 0 {
+                        seeds.push(x & hmask);
                     }
                 }
             }
         }
     });
+    drop((filed, claimed, link_v));
 
-    drop(filed);
-
-    // New ids and offsets: each thread's chain in turn (every node is in one).
-    let (mut id_v, mut off_v) = (vec![0u32; n], vec![0u32; n + 1]);
-    let mut start = vec![(0, 0); nt + 1]; // a chain's first id and first edge
-    for (t, (ord, _, edges)) in chains.iter().enumerate() {
-        start[t + 1] = (start[t].0 + ord.len() as u32, start[t].1 + edges);
+    // New ids: each thread's chain in turn (every node is in one), then at
+    // least one padding id, up to a whole group of 8, so no group of packed
+    // offsets spans two regions. Padding ids have no edges, except that the
+    // last one's row runs on to the next region; nothing reads it, as no edge
+    // leads to a padding id and no query starts there. A node's row starts
+    // where the previous one in its chain ends, its degree read off the old
+    // offsets.
+    let (mut start, lens) = (vec![0; nt + 1], chains.iter().map(|c| c.0.len()).collect::<Vec<_>>());
+    for t in 0..nt {
+        start[t + 1] = start[t] + (lens[t] + 1).next_multiple_of(8);
     }
+    let n2 = start[nt];
+    let (mut id_v, mut off_v) = (vec![0u32; n], vec![0u32; n2 + 1]);
     let (ir, or) = (Raw::of(&mut id_v), Raw::of(&mut off_v));
-    on_threads(nt, |t| {
-        let ((ord, degs, _), (mut k, mut e)) = (&chains[t], start[t]);
-        for (&u, &d) in ord.iter().zip(degs) {
-            unsafe { (*ir.at(u as usize), *or.at(k as usize)) = (k, e) };
-            (k, e) = (k + 1, e + d);
+    let ends_at: Vec<usize> = on_threads(nt, |t| {
+        let (mut k, mut e) = (start[t], t * m);
+        for &u in &chains[t].0 {
+            unsafe { (*ir.at(u as usize), *or.at(k)) = (k as u32, e as u32) };
+            (k, e) = (k + 1, e + (first.at(u as usize + 1) - first.at(u as usize)) as usize);
         }
+        (k..start[t + 1] + (t + 1 == nt) as usize).for_each(|k| unsafe { *or.at(k) = e as u32 });
+        e
     });
-    off_v[n] = m as u32;
-    drop((claimed, chains));
+    let mut heavy2: Vec<(u32, u32)> = chains.into_iter().flat_map(|c| c.1).collect();
+    heavy2.sort_unstable();
+    drop((first_v, heavy));
     let off = Offs::pack(nt, &off_v);
     drop(off_v);
 
-    // The graph in the new numbering: each edge's head mapped (weight bits
-    // kept), with the random reads started early. A thread walks its share of
-    // the old edge list with a cursor, each node's degree read off the new
-    // offsets, so the old offsets can go first.
-    let cursor: Vec<u32> = (0..nt).map(|t| first.at(share(n, t, nt).start)).collect();
-    drop(first_v);
+    // Each edge's head mapped to its new id (weight bits kept), each thread
+    // over its own region, with in-degrees counted into roff[v + 2] on the
+    // way. Summed, roff[v + 1] is where v's in-edges start; as v's cursor
+    // while they are placed it ends at v's end, the start of v + 1.
     let id = &id_v[..];
-    let mut adj = vec![0u32; m];
-    let ar = Raw::of(&mut adj);
-    let off = &off;
-    let mut heavy2: Vec<(u32, u32)> = on_threads(nt, |t| {
-        let (mut out, r, mut e) = (Vec::new(), share(n, t, nt), cursor[t]);
-        for u in r.clone() {
-            if u + 8 < r.end {
-                prefetch(&off.rel[id[u + 8] as usize]);
-            }
-            if u + 4 < r.end {
-                prefetch(unsafe { ar.at(off.at(id[u + 4] as usize) as usize) });
-            }
-            for j in off.at(id[u] as usize)..off.at(id[u] as usize + 1) {
-                if let Some(&y) = link.get(e as usize + 24) {
-                    prefetch(&id[(y & hmask) as usize]);
-                }
-                let x = link[e as usize];
-                if x >> hb == big {
-                    out.push((j, heavy_weight(&heavy, e)));
-                }
-                unsafe { *ar.at(j as usize) = id[(x & hmask) as usize] | (x & !hmask) };
-                e += 1;
-            }
-        }
-        out
-    })
-    .concat();
-    heavy2.sort_unstable();
-    // Queries in the new numbering (sorted later), then the old graph and the
-    // id map go, freed by all threads before the reverse graph is allocated.
-    let ends: Vec<(u32, u32)> = queries.iter().map(|&(s, t)| (id[s as usize], id[t as usize])).collect();
-    on_threads(nt, |t| (drop_pages(link, t, nt), drop_pages(id, t, nt)));
-    drop((heavy, link_v, id_v));
-
-    // The reverse graph in the same format: in-degrees counted into
-    // roff[v + 2] and summed, so roff[v + 1] is where v's in-edges start; as
-    // v's cursor while they are placed it ends at v's end, the start of v + 1.
-    let adj = &adj;
-    let mut roff_v = vec![0u32; n + 2];
+    let mut roff_v = vec![0u32; n2 + 2];
     let rr = Raw::of(&mut roff_v);
     let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
-    on_threads(nt, |t| share(n, t, nt).for_each(|u| (off.at(u)..off.at(u + 1)).for_each(|e| { bump((adj[e as usize] & hmask) as usize + 2); })));
+    on_threads(nt, |t| {
+        for p in t * m..ends_at[t] {
+            if p + 16 < ends_at[t] {
+                prefetch(&id[(unsafe { *ar.at(p + 16) } & hmask) as usize]);
+            }
+            let x = unsafe { *ar.at(p) };
+            let v = id[(x & hmask) as usize];
+            unsafe { *ar.at(p) = v | (x & !hmask) };
+            bump(v as usize + 2);
+        }
+    });
+    // Queries in the new numbering (sorted later), then the id map goes.
+    let ends: Vec<(u32, u32)> = queries.iter().map(|&(s, t)| (id[s as usize], id[t as usize])).collect();
+    drop(id_v);
     prefix_sum(nt, &mut roff_v);
+    let adj = &adj;
+    let off = &off;
     let mut radj = vec![0u32; m];
     let rar = Raw::of(&mut radj);
     let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
         let mut out = Vec::new();
-        for u in share(n, t, nt) {
+        for u in start[t]..start[t] + lens[t] {
             for e in off.at(u)..off.at(u + 1) {
                 let x = adj[e as usize];
                 let j = bump((x & hmask) as usize + 1);
@@ -688,7 +685,7 @@ fn main() {
     })
     .concat();
     rheavy.sort_unstable();
-    let roff = Offs::pack(nt, &roff_v[..n + 1]);
+    let roff = Offs::pack(nt, &roff_v[..n2 + 1]);
     drop(roff_v);
 
     // 4. Queries sorted so neighbouring searches share cached pages.
@@ -699,8 +696,8 @@ fn main() {
     let ansr = Raw::of(&mut ans);
     let next = AtomicUsize::new(0);
     on_threads(nt, |th| {
-        let mut narrow: [Side<u32>; 2] = [Side::new(n), Side::new(n)];
-        let mut wide: [Side<u64>; 2] = [Side::new(n), Side::new(n)];
+        let mut narrow: [Side<u32>; 2] = [Side::new(n2), Side::new(n2)];
+        let mut wide: [Side<u64>; 2] = [Side::new(n2), Side::new(n2)];
         loop {
             let q = next.fetch_add(1, Relaxed);
             let Some(&i) = order.get(q) else {
