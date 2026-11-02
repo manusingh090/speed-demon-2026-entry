@@ -83,6 +83,7 @@ Best run: **run-387221618ac3**, 0.0190 s, 14.45 MiB, 400 counted lines, 86.04 po
 | 65 | Step 62 with each hour's text unmapped (`MADV_DONTNEED` on the shared output mapping) by the thread that wrote it, right after writing it, instead of all 10 MB of it by one thread at exit | run-030d7c2f06ec | 0.0199 s | 13.95 MiB | 85.67 |
 | 66 | Back to step 62's code (no board run of its own: superseded by step 67) | | | | |
 | 67 | Step 62 with guided pieces: of the 96 pieces of the log, the first 48 are 1.5 times the average size, the next 24 0.75 and the last 24 0.25 | run-6a4ac4034f74 | 0.0194 s | 13.91 MiB | 85.94 |
+| 68 | Experiment: the separate version's whole design in C++ (see "Measured after step 67" below), put on the box once although it was slower locally | pending | | | |
 
 ## Local measurements
 
