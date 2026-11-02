@@ -307,10 +307,16 @@ int main() {
   std::vector<size_t> cut(pieces + 1, size);
   std::vector<int> first(pieces + 1, HOURS * 60);
   cut[0] = 0;
-  for (int k = 1; k < pieces; ++k)
-    for (cut[k] = std::max(cut[k - 1], size * k / pieces);
+  // Guided sizes: the first half of the pieces are 1.5 times the average, the
+  // next quarter 0.75 and the last quarter 0.25, so the parse ends on small
+  // pieces and the threads run out of it close together.
+  for (int k = 1; k < pieces; ++k) {
+    double f = double(k) / pieces;
+    f = f <= 0.5 ? 1.5 * f : f <= 0.75 ? 0.375 + 0.75 * f : 0.75 + 0.25 * f;
+    for (cut[k] = std::max(cut[k - 1], size_t(size * f));
          cut[k] < size && log[cut[k] - 1] != '\n';)
       ++cut[k];
+  }
   for (int k = 0; k < pieces; ++k)
     if (cut[k] < size)
       first[k] = hour_of(log + cut[k]) * 60 + (log[cut[k] + 14] - '0') * 10 +

@@ -71,7 +71,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 63 | Step 62 with the parse in batches of 8 lines and three stages: decode and hash every line, load every line's table slot, then confirm the names and file the records | run-27928bcc100e | 0.0233 s | 14.6 MiB | 83.57 |
 | 64 | Back to step 62's code (no board run of its own: superseded by step 65) | | | | |
 | 65 | Step 62 with each hour's text unmapped (`MADV_DONTNEED` on the shared output mapping) by the thread that wrote it, right after writing it, instead of all 10 MB of it by one thread at exit | run-030d7c2f06ec | 0.0199 s | 13.95 MiB | 85.67 |
-| 66 | Back to step 62's code | pending | | | |
+| 66 | Back to step 62's code (no board run of its own: superseded by step 67) | | | | |
+| 67 | Step 62 with guided pieces: of the 96 pieces of the log, the first 48 are 1.5 times the average size, the next 24 0.75 and the last 24 0.25 | pending | | | |
 
 ## Local measurements
 
@@ -242,6 +243,8 @@ Step 58 is a new program built on that floor. The pieces are claimed in order, a
 **Step 64 to 65: the output's teardown.** The text goes straight into a shared mapping of the output file, about 2,500 pages, and their page-table entries were all removed by the exit, on one thread, inside the measured time (the same cost that step 18 took off the log's mapping). Now each thread drops the range of an hour's text from the mapping as soon as it has written it. On a shared mapping of a tmpfs file `MADV_DONTNEED` only removes the entries: the text stays in the file's pages, and a thread still writing a neighbouring hour into a page so dropped just maps it again with its contents. Three `perf stat -r 10` rounds: the same instructions and kernel cycles (the work only moves), wall time lower in all three (0.0348, 0.0234, 0.0217 s against 0.0437, 0.0243, 0.0225). Same hash on all eight datasets. Four lines more.
 
 **Step 65 on the board, and step 66.** run-030d7c2f06ec: 0.0199 s and 13.95 MiB against step 62's 0.0198 s and 13.8 MiB, so the output mapping's teardown was not costing the box anything it can show (its exit unmaps 2,500 entries in well under its spread). Step 66 is step 62's code again, two lines shorter.
+
+**Step 66 to 67: guided pieces.** The 96 pieces are claimed in order, and the parse ends when the last thread finishes its last piece: with equal pieces of about 2.5 MB (some 1.5 ms of work on the box) the threads stop up to a piece apart, and the hours still open wait for the slowest. Step 59 shrank the pieces towards the end, but together with the futex sleep, and its two runs (0.0250 and 0.0212 s) could not tell either change apart. Now the pieces alone follow guided self-scheduling (Polychronopoulos and Kuck, 1987) in three fixed steps, as Track C's step 52 does: 1.5, 0.75 and 0.25 times the average size, so the parse ends on small pieces. Hours close by where the first unparsed piece starts, and the larger early pieces could keep more of them open, but the peak did not move (median 15.4 MiB over five alternating local runs each). Laptop: 0.611G against 0.612G user instructions, wall time lower in three of three `perf stat -r 10` rounds (0.0319, 0.0277, 0.0236 s against 0.0668, 0.0319, 0.0252). Same hash on all eight datasets. Three lines more.
 
 ## Tried and kept out
 
