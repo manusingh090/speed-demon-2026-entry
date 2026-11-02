@@ -389,6 +389,7 @@ int main() {
     const Ranking &rank = ranking();
     const u32 ne = rank.by_rank.size();
     u32 *keys = records + h * per_hour, *sorted = keys + filled[h], total = 0;
+    madvise(sorted, filled[h] * 4, MADV_POPULATE_WRITE); // one call, no faults
     u32 low[1024] = {}, mid[1024] = {}, top[ID_MASK + 1] = {},
         errors[ID_MASK + 1] = {};
     big.clear();
