@@ -138,6 +138,8 @@ Every step from the reference to your final version, each with the live-board ru
 
 **Step 54 on the board.** run-e23bf4dd1e99: 0.0233 s and 8.84 MiB, 81.35 points, inside the spread of steps 48 and 49 (0.0228 to 0.0239 s). The hints cost no code, so they stay while later pushes sample them again.
 
+**Measured after step 54 and kept out: dense name numbers.** An idea from reading another Rust entry's design: give each name a dense number (each thread takes numbers 32 at a time) and store it in the name table's slot beside a 47-bit tag of the key, so a 64-bit slot holds both and one compare-and-swap claims it. A country's bitset row then needs a bit per name rather than one per slot (104,384 bits a row instead of 131,072, 3.1 MB in all instead of 3.9), so the name table (16,384 buckets of eight slots, 1 MB) moves onto the same two 2 MB pages, and the per-thread totals move off them to ordinary pages. Written in our own code: correct on all six datasets and one hash in 12 repeated full runs, but 5% more instructions (1,172M against 1,116M: the 64-bit tags need a shift and two four-lane compares where 32-bit tags took one eight-lane compare, and names spilled past a full bucket take the out-of-line path), 4 to 10% more cycles in three `perf stat -r 10` rounds, no memory saved (local peak median 9.9 MB against 9.5), and 23 more lines. Track C is bound by instructions on the box, so it was not pushed.
+
 ## Tried and kept out
 
 - **Reading records with `pread` into a per-thread buffer** (64 KB, 256 KB, 1 MB) instead of through the mapping, so the parse reads from L2: same instructions, no faster (the kernel's copy costs what the page faults did), 1 to 3 MB more.
