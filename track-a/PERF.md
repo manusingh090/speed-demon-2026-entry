@@ -57,7 +57,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Back to step 47's code | pending | | | |
 | 50 | Groups of 16 or fewer sorted by Batcher's 63-pair odd-even merge network (its first 19 pairs for 8 or fewer) instead of three chained selections | run-dabeae4d5c50 | 0.0214 s | 17.4 MiB | 84.30 |
 | 51 | Step 50 with the log fetched 1 KB ahead of each line with the non-temporal prefetch hint | run-0d7c54395879 | 0.0207 s | 17.7 MiB | 84.59 |
-| 52 | Groups of more than 128 records partitioned eight at a time with AVX2 (lookup-table compress into two buffers) | pending | | | |
+| 52 | Groups of more than 128 records partitioned eight at a time with AVX2 (lookup-table compress into two buffers) | run-8a311a6f0910 | 0.0203 s | 18.4 MiB | 83.96 |
+| 53 | Step 52 with the permutation tables replaced by BMI2 (`pdep` spreads the mask to bytes, `pext` gathers the lane indices) and a shorter recursion | pending | | | |
 
 ## Local measurements
 
@@ -195,6 +196,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 51 on the board.** run-0d7c54395879 (from a later commit carrying step 51's Track A code): 0.0207 s, 17.7 MiB, 362 lines, 84.59 points, the second fastest Track A run so far, at less memory than the best (0.0203 s, 18.1 MiB). Also measured after it and dropped: 2 KB and 4 KB prefetch distances (no better than 1 KB), and non-temporal stores for the records (user cycles 3% higher, wall time mixed).
 
 **Step 51 to 52: big groups partitioned eight at a time.** Groups of more than 128 records hold 55% of the records, and the scalar partition there costs about five cycles a value. A group that size now has its three ranks found by an AVX2 partition in the manner of Intel's x86-simd-sort and Google's vqsort: eight values compared with the pivot at once (unsigned, by flipping the sign bits), two lookup-table permutations packing the smaller lanes and the others to the front of two vectors, and full 8-lane stores appending them to two buffers, so no step waits on an earlier store. The larger side is copied back behind the smaller one and only the sides holding a wanted rank go on; sides of 64 or fewer, or rounds where the pivot is the minimum, finish with the in-place selections. A standalone test checked it against a full sort on 200,000 random groups (600,000 ranks), with heavy duplicates and values next to 0 and 2^32 - 1; in that test it was about twice as fast as the chained selections at 1,000 and 9,000 values and level at 100, so it starts above 128. Same hash on all six datasets and 10 repeated full runs; four `perf stat` rounds against step 51: 632M user instructions against 675M, cycles 346 to 351M against 363 to 388M.
+
+**Step 52 on the board, and step 53.** run-8a311a6f0910: 0.0203 s (level with the best run), 18.4 MiB, but 439 lines against 362, 83.96 points: the two 256-entry permutation tables and their generator cost 77 formatted lines, which took about as much from K as the 2% faster run gave. Step 53 keeps the method and drops the tables: the 8-bit compare mask is spread to one byte per lane with `pdep` and the lane indices are gathered with `pext` (the standard table-free AVX2 compress on BMI2 hardware), and the recursion is shorter. The standalone test passed again (600,000 ranks); there it is slightly slower than the tables but still faster than the chained selections (10.8 against 16.9 ms at 1,000 values, 8.2 against 15.8 ms at 9,000). Same hash on all six datasets and 10 repeated full runs; peak 18.3 MB locally, level with step 51. 398 counted lines against 432.
 
 ## Tried and kept out
 

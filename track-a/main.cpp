@@ -110,88 +110,53 @@ inline void select(u32 *a, u32 n, u32 k) {
   }
 }
 
-// Values at three ranks of a big group, partitioned eight at a time with AVX2.
-// Each round compares eight values with the pivot (unsigned, by flipping the
-// sign bits), and two lookup-table permutations pack the smaller ones to the
-// front of one vector and the rest to the front of another; full stores then
-// append them to two buffers, so no step waits on a store. The larger side is
-// copied back behind the smaller one, and only the sides holding a wanted
-// rank go on. Small or lopsided sides finish with the in-place selections.
-struct Pack {
-  alignas(32) u32 lo[256][8], hi[256][8];
-  constexpr Pack() : lo{}, hi{} {
-    for (int m = 0; m < 256; ++m) {
-      int a = 0, b = 0;
-      for (int i = 0; i < 8; ++i)
-        if (m >> i & 1)
-          lo[m][a++] = i;
-      for (int i = 0; i < 8; ++i)
-        if (!(m >> i & 1))
-          hi[m][b++] = i;
-      for (int i = 0; a < 8; ++i)
-        if (!(m >> i & 1))
-          lo[m][a++] = i;
-      for (int i = 0; b < 8; ++i)
-        if (m >> i & 1)
-          hi[m][b++] = i;
-    }
-  }
-};
-static constexpr Pack pack;
+// Packs the lanes of v whose bit in byte mask m is set to the front, using
+// BMI2 to gather their indices (no lookup table).
+inline __m256i compress(__m256i v, u64 m) {
+  u64 idx = _pext_u64(0x0706050403020100, m);
+  return _mm256_permutevar8x32_epi32(
+      v, _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(idx)));
+}
 
 // Puts the values at ranks r[0] < ... < r[m - 1] of a[0, n) at those places
-// of a. lows and highs have room for n + 8 values each.
+// of a; lows and highs have room for n + 8 values. Each round compares eight
+// values with the pivot at once (unsigned, by flipping the sign bits) and
+// appends the smaller and the other lanes, packed, to the two buffers with
+// full stores, so no step waits on an earlier one. Only the sides holding a
+// wanted rank go on; small sides, or a round whose pivot is the smallest
+// value, finish with the in-place selections.
 inline void vranks(u32 *a, u32 n, const u32 *r, int m, u32 *lows, u32 *highs) {
-  if (n <= 64) {
-    for (u32 from = 0, t = 0; t < u32(m); ++t)
-      if (r[t] >= from)
-        select(a + from, n - from, r[t] - from), from = r[t] + 1;
-    return;
-  }
-  u32 x = a[0], y = a[n / 2], z = a[n - 1];
+  u32 x = a[0], y = a[n / 2], z = a[n - 1], lo = 0, hi = 0, i = 0;
   u32 pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
   const __m256i flip = _mm256_set1_epi32(int(0x80000000)),
                 p = _mm256_set1_epi32(int(pivot ^ 0x80000000));
-  u32 lo = 0, hi = 0, i = 0;
-  for (; i + 8 <= n; i += 8) {
+  for (; n > 64 && i + 8 <= n; i += 8) {
     __m256i v = _mm256_loadu_si256((const __m256i *)(a + i));
-    int mask = _mm256_movemask_ps(
+    u32 lt = _mm256_movemask_ps(
         _mm256_castsi256_ps(_mm256_cmpgt_epi32(p, _mm256_xor_si256(v, flip))));
-    _mm256_storeu_si256(
-        (__m256i *)(lows + lo),
-        _mm256_permutevar8x32_epi32(
-            v, _mm256_load_si256((const __m256i *)pack.lo[mask])));
-    _mm256_storeu_si256(
-        (__m256i *)(highs + hi),
-        _mm256_permutevar8x32_epi32(
-            v, _mm256_load_si256((const __m256i *)pack.hi[mask])));
-    int k = __builtin_popcount(mask);
-    lo += k, hi += 8 - k;
+    u64 bytes = _pdep_u64(lt, 0x0101010101010101) * 0xFF;
+    _mm256_storeu_si256((__m256i *)(lows + lo), compress(v, bytes));
+    _mm256_storeu_si256((__m256i *)(highs + hi), compress(v, ~bytes));
+    lo += __builtin_popcount(lt), hi += 8 - __builtin_popcount(lt);
   }
-  for (; i < n; ++i) {
-    u32 v = a[i];
-    lows[lo] = v, highs[hi] = v;
-    lo += v < pivot, hi += v >= pivot;
-  }
-  if (lo == 0) { // the pivot is the smallest value: no progress this way
+  if (n <= 64 || lo == 0) {
     for (u32 from = 0, t = 0; t < u32(m); ++t)
-      if (r[t] >= from)
-        select(a + from, n - from, r[t] - from), from = r[t] + 1;
+      select(a + from, n - from, r[t] - from), from = r[t] + 1;
     return;
   }
-  // lows then highs, back in a; lows and highs are free again.
+  for (; i < n; ++i)
+    lows[lo] = highs[hi] = a[i], lo += a[i] < pivot, hi += a[i] >= pivot;
   memcpy(a, lows, lo * 4), memcpy(a + lo, highs, hi * 4);
   int split = 0;
   while (split < m && r[split] < lo)
     ++split;
+  u32 want[3];
+  for (int t = split; t < m; ++t)
+    want[t - split] = r[t] - lo;
   if (split > 0)
     vranks(a, lo, r, split, lows, highs);
-  if (split < m) {
-    u32 want[3];
-    for (int t = split; t < m; ++t)
-      want[t - split] = r[t] - lo;
+  if (split < m)
     vranks(a + lo, hi, want, m - split, lows, highs);
-  }
 }
 
 // Writes the values at ranks r[0] <= r[1] <= r[2] of a[0, n) to v. A group
