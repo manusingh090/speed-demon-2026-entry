@@ -120,7 +120,8 @@ The decisions that mattered, in order of what they bought:
 | 101 | Back to step 99's code | no run of its own (superseded by step 102) | | | |
 | 102 | The phased design of step 100, rewritten here: new names and comments, the output in one write, query lines found with `memchr` | run-438ac1f6e97f | 0.095 | 41.1 | 78.24 |
 | 102, again | Step 102's code, measured with a later commit (5afe647) that only changed this log | run-be2f78572d3a | 0.091 | 41.4 | 78.70 |
-| 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | queued at the time of writing | | | |
+| 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | run-e1bf8b3072c9 | 0.097 | 39.9 | 77.93 |
+| 104 | Back to step 102's code (256 KiB slices, 200 to a phase, a 12-slice sample) | no run of its own | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -441,6 +442,8 @@ Checked locally: the same hash on all six datasets and the dense-token test; pea
 **Step 102 on the board.** run-438ac1f6e97f (commit 3982047): 0.0946 s against 0.1102 s for step 99 (14% faster), 41.1 MiB against 47.8, 1,103 counted lines, K 36.71, 78.24 points, the best Track B run so far. The speed and memory more than paid for the 364 extra lines.
 
 **Step 103.** The team's next settings for the phased design: workers take 1 MiB slices of the corpus instead of 256 KiB, 50 to a phase (still about 50 MiB), so a worker claims a quarter as often and starts a quarter as many slice boundaries (each one a search for the next line whose id is a multiple of 64); the sample is 3 of these slices, the same 3 MiB as twelve before. Same hash on all six datasets and the dense-token test.
+
+**Step 103 on the board.** run-e1bf8b3072c9: 0.0973 s at 39.9 MiB, against 0.0946 and 0.0907 s at 41.1 and 41.4 MiB for step 102's code: 1.5 MiB less, but slower (fewer, larger slices leave the last workers of a phase with more to finish while the others wait), so 77.93 points against 78.24 and 78.70. Step 104 is step 102's code again.
 
 ## What the profile said, step by step
 
