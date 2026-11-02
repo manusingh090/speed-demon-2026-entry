@@ -116,22 +116,34 @@ struct Names {
     return {text + id * STRIDE, length[id]};
   }
 
-  // The id of the name of length n at s, whose first 64 bytes are v0, v1.
-  u32 find(const char *s, u32 n, __m256i v0, __m256i v1) {
+  // A CRC of the first and last eight bytes of the name of length n at s.
+  static u32 hash(const char *s, u32 n) {
     u64 a, b;
     memcpy(&a, s, 8), memcpy(&b, s + n - 8, 8);
     if (n < 8)
       a = _bzhi_u64(a, 8 * n), b = 0;
-    for (u32 h = _mm_crc32_u64(_mm_crc32_u64(n, a), b);; ++h) {
+    return _mm_crc32_u64(_mm_crc32_u64(n, a), b);
+  }
+
+  // Whether slot value v names the n bytes at s, whose first 64 are v0, v1.
+  bool is(u32 v, const char *s, u32 n, __m256i v0, __m256i v1) const {
+    if (v - 1 >= MAX)
+      return false;
+    const char *e = text + (v - 1) * STRIDE;
+    u64 eq = eq64(v0, v1, load(e), load(e + 32));
+    return n < 64 ? (~eq & _bzhi_u64(~u64(0), n + 1)) == 0
+                  : ~eq == 0 && (~eq64(load(s + 64), load(s + 96),
+                                       load(e + 64), load(e + 96)) &
+                                 _bzhi_u64(~u64(0), n - 63)) == 0;
+  }
+
+  // The id of the name of length n at s with hash h, first probing slot h.
+  u32 find(const char *s, u32 n, u32 h, __m256i v0, __m256i v1) {
+    for (;; ++h) {
       u32 v = slot[h % SLOTS].load(std::memory_order_acquire);
-      if (v - 1 >= MAX) [[unlikely]]
+      if (v - 1 >= MAX)
         return insert(h, s, n);
-      const char *e = text + (v - 1) * STRIDE;
-      u64 eq = eq64(v0, v1, load(e), load(e + 32));
-      if (n < 64 ? (~eq & _bzhi_u64(~u64(0), n + 1)) == 0
-                 : ~eq == 0 && (~eq64(load(s + 64), load(s + 96),
-                                      load(e + 64), load(e + 96)) &
-                                _bzhi_u64(~u64(0), n - 63)) == 0)
+      if (is(v, s, n, v0, v1))
         return v - 1;
     }
   }
@@ -213,64 +225,82 @@ struct Parser {
     u32 *c = nullptr, *lim = nullptr;
     int h = -1;
     u64 stamp = 0, at;
+    struct Item {
+      const char *p, *name, *ne;
+      u32 n, lat, hash;
+    } item[8];
+    u32 slot[8];
     const char *block = p;
-    for (u64 ends = eq64(load(block), load(block + 32), lf, lf); p < end;
-         ends &= ends - 1) {
-      while (!ends) {
-        // The log streams through once; fetching it 1 KB ahead with the
-        // non-temporal hint keeps it from pushing the endpoint table and the
-        // names out of the core's caches.
-        _mm_prefetch(block + 1024, _MM_HINT_NTA);
-        block += 64, ends = eq64(load(block), load(block + 32), lf, lf);
+    for (u64 ends = eq64(load(block), load(block + 32), lf, lf); p < end;) {
+      int m = 0;
+      for (; m < 8 && p < end; ends &= ends - 1) {
+        while (!ends) {
+          // The log streams through once; fetching it 1 KB ahead with the
+          // non-temporal hint keeps it from pushing the endpoint table and
+          // the names out of the core's caches.
+          _mm_prefetch(block + 1024, _MM_HINT_NTA);
+          block += 64, ends = eq64(load(block), load(block + 32), lf, lf);
+        }
+        const char *e = block + __builtin_ctzll(ends);
+        u32 method = _mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i *)(p + 28)), space16));
+        u32 tail = _mm_movemask_epi8(_mm_cmpeq_epi8(
+            _mm_loadu_si128((const __m128i *)(e - 16)), space16));
+        const char *name = p + 29 + __builtin_ctz(method);
+        u32 len = __builtin_clz(tail) - 16; // digits after the last space
+        const char *ne = e - len - 5;       // the space before the status
+        // Up to 8 digits are decoded in one word: the 8 bytes before the
+        // LF, with those below the digits cleared so they read as leading
+        // zeros, combined 2, 4 and 8 at a time with multiplies. Longer ones
+        // (rare) go digit by digit.
+        u32 lat = 0;
+        if (len <= 8) [[likely]] {
+          u64 digits;
+          memcpy(&digits, e - 8, 8);
+          digits = digits >> (64 - 8 * len) << (64 - 8 * len) &
+                   0x0F0F0F0F0F0F0F0F;
+          digits = (digits * 2561) >> 8 & 0x00FF00FF00FF00FF;
+          digits = (digits * 6553601) >> 16 & 0x0000FFFF0000FFFF;
+          lat = (digits * 42949672960001) >> 32;
+        } else
+          for (const char *d = e - len; d < e; ++d)
+            lat = lat * 10 + *d - '0';
+        u32 n = ne - name;
+        item[m++] = {p, name, ne, n, lat, Names::hash(name, n)};
+        p = e + 1;
       }
-      const char *e = block + __builtin_ctzll(ends);
-      memcpy(&at, p + 5, 8);
-      if (at != stamp) [[unlikely]] {
-        if (h >= 0)
-          cur[h] = c, stop[h] = lim, --active[h];
-        h = hour_of(p), stamp = at;
-        ++active[h];
-        if (closed[h]) // too late for this pass
-          return late.store(true);
-        c = cur[h], lim = stop[h];
-      }
-      u32 method = _mm_movemask_epi8(_mm_cmpeq_epi8(
-          _mm_loadu_si128((const __m128i *)(p + 28)), space16));
-      u32 tail = _mm_movemask_epi8(_mm_cmpeq_epi8(
-          _mm_loadu_si128((const __m128i *)(e - 16)), space16));
-      const char *name = p + 29 + __builtin_ctz(method);
-      u32 len = __builtin_clz(tail) - 16; // digits after the last space
-      const char *ne = e - len - 5;       // the space before the status
-      u32 n = ne - name;
-      // Up to 8 digits are decoded in one word: the 8 bytes before the LF,
-      // with those below the digits cleared so they read as leading zeros,
-      // combined 2, 4 and 8 at a time with multiplies. Longer ones (rare) go
-      // digit by digit.
-      u32 lat = 0;
-      if (len <= 8) [[likely]] {
-        u64 digits;
-        memcpy(&digits, e - 8, 8);
-        digits = digits >> (64 - 8 * len) << (64 - 8 * len) & 0x0F0F0F0F0F0F0F0F;
-        digits = (digits * 2561) >> 8 & 0x00FF00FF00FF00FF;
-        digits = (digits * 6553601) >> 16 & 0x0000FFFF0000FFFF;
-        lat = (digits * 42949672960001) >> 32;
-      } else
-        for (const char *d = e - len; d < e; ++d)
-          lat = lat * 10 + *d - '0';
-      u32 key = (endpoints.find(name, n, load(name), load(name + 32)) + 1) |
-                (ne[1] == '5' ? ERR : 0);
-      p = e + 1;
-      if (lat >= PACKED_MAX) [[unlikely]] {
-        if (lim - c < 2) // the pair stays in one block
-          c = lim;
-        if (c == lim)
+      for (int i = 0; i < m; ++i)
+        slot[i] = endpoints.slot[item[i].hash % Names::SLOTS].load(
+            std::memory_order_acquire);
+      for (int i = 0; i < m; ++i) {
+        const Item &it = item[i];
+        memcpy(&at, it.p + 5, 8);
+        if (at != stamp) [[unlikely]] {
+          if (h >= 0)
+            cur[h] = c, stop[h] = lim, --active[h];
+          h = hour_of(it.p), stamp = at;
+          ++active[h];
+          if (closed[h]) // too late for this pass
+            return late.store(true);
+          c = cur[h], lim = stop[h];
+        }
+        __m256i v0 = load(it.name), v1 = load(it.name + 32);
+        u32 id = endpoints.is(slot[i], it.name, it.n, v0, v1)
+                     ? slot[i] - 1
+                     : endpoints.find(it.name, it.n, it.hash, v0, v1);
+        u32 key = (id + 1) | (it.ne[1] == '5' ? ERR : 0), lat = it.lat;
+        if (lat >= PACKED_MAX) [[unlikely]] {
+          if (lim - c < 2) // the pair stays in one block
+            c = lim;
+          if (c == lim)
+            c = claim(h), lim = c + BLOCK;
+          *c++ = ESCAPE | key, *c++ = lat;
+          continue;
+        }
+        if (c == lim) [[unlikely]]
           c = claim(h), lim = c + BLOCK;
-        *c++ = ESCAPE | key, *c++ = lat;
-        continue;
+        *c++ = lat << KEY_BITS | key;
       }
-      if (c == lim) [[unlikely]]
-        c = claim(h), lim = c + BLOCK;
-      *c++ = lat << KEY_BITS | key;
     }
     if (h >= 0)
       cur[h] = c, stop[h] = lim, --active[h];
