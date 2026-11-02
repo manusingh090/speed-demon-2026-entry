@@ -248,6 +248,8 @@ Step 58 is a new program built on that floor. The pieces are claimed in order, a
 
 **Step 67 on the board.** run-6a4ac4034f74: 0.0194 s, 13.91 MiB, 403 lines, 85.94 points: the fastest Track A run so far (step 62: 0.0198 s), in a push where Track D's unchanged code ran 9% slower than its usual, so the box was if anything slow. A second run of the same code follows.
 
+**Step 67's second run.** run-96d23fd675ca: 0.0193 s and 13.97 MiB, 85.97 points. Two runs at 0.0193 to 0.0194 s against 0.0196 to 0.0199 s for steps 58 to 65, so the guided pieces stay.
+
 ## Tried and kept out
 
 - **The hour phase priced by switching parts off** (laptop, user-mode `perf stat`): the three selections per group are 135M of 685M user instructions and about 80M of 410M cycles; placing each latency at its group's cursor about 20M cycles more. **Counting sort by endpoint and latency octave** (16 octaves of bit length), so each percentile is found in a known octave and selected among that octave's latencies only (the median's octave holds about a fifth of a group): correct, but 683M instructions against 685M and the same cycles, as the octave is computed twice a record and the counting table is 16 times larger; 2 MB more at peak. Kept out.

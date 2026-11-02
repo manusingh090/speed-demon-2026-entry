@@ -372,16 +372,11 @@ struct Phase {
 };
 
 // Cuts of [from, size) into n ranges, each starting just after a delimiter.
-// Guided: the first half of the ranges are 1.5 times the average size, the
-// next quarter 0.75 and the last quarter 0.25, so threads taking them in turn
-// run out of work close together instead of waiting on one last big piece.
-std::vector<size_t> split(const char* data, size_t from, size_t size, int n, const char* delim, bool guided = false) {
+std::vector<size_t> split(const char* data, size_t from, size_t size, int n, const char* delim) {
     std::vector<size_t> cut(n + 1, size);
     cut[0] = from;
     for (int t = 1; t < n; ++t) {
-        double f = double(t) / n;
-        if (guided) f = f <= 0.5 ? 1.5 * f : f <= 0.75 ? 0.375 + 0.75 * f : 0.75 + 0.25 * f;
-        size_t c = std::max(cut[t - 1], from + size_t((size - from) * f));
+        size_t c = std::max(cut[t - 1], from + (size - from) * t / n);
         auto* hit = static_cast<const char*>(memmem(data + c, size - c, delim, strlen(delim)));
         cut[t] = hit ? hit - data + strlen(delim) : size;
     }
@@ -441,7 +436,7 @@ int main() {
     // (more first sightings of names) is evened out by the others.
     size_t start = static_cast<const char*>(memchr(records, '\n', size)) - records + 1;
     const int pieces = 8 * nthreads;
-    std::vector<size_t> cut = split(records, start, size, pieces, "\r\n", true);
+    std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
     NameTable names;
 
     // Populate tables and flag countries; populate bitsets and fill the region
