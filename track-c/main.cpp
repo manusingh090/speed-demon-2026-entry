@@ -196,7 +196,11 @@ struct NamesSeen {
     // would fetch the line shared, then the OR would fetch it again exclusive.
     bool mark(u32 c, u32 name) {
         u64 bit = u64(1) << name % 64;
-        return !(word(c, name).fetch_or(bit, std::memory_order_relaxed) & bit);
+        // Probe: a plain read-modify-write, no lock (racy: can lose a bit).
+        u64& w = reinterpret_cast<u64&>(word(c, name));
+        u64 old = w;
+        w = old | bit;
+        return !(old & bit);
     }
 };
 
