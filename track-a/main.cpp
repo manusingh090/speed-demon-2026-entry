@@ -110,13 +110,99 @@ inline void select(u32 *a, u32 n, u32 k) {
   }
 }
 
+// Values at three ranks of a big group, partitioned eight at a time with AVX2.
+// Each round compares eight values with the pivot (unsigned, by flipping the
+// sign bits), and two lookup-table permutations pack the smaller ones to the
+// front of one vector and the rest to the front of another; full stores then
+// append them to two buffers, so no step waits on a store. The larger side is
+// copied back behind the smaller one, and only the sides holding a wanted
+// rank go on. Small or lopsided sides finish with the in-place selections.
+struct Pack {
+  alignas(32) u32 lo[256][8], hi[256][8];
+  constexpr Pack() : lo{}, hi{} {
+    for (int m = 0; m < 256; ++m) {
+      int a = 0, b = 0;
+      for (int i = 0; i < 8; ++i)
+        if (m >> i & 1)
+          lo[m][a++] = i;
+      for (int i = 0; i < 8; ++i)
+        if (!(m >> i & 1))
+          hi[m][b++] = i;
+      for (int i = 0; a < 8; ++i)
+        if (!(m >> i & 1))
+          lo[m][a++] = i;
+      for (int i = 0; b < 8; ++i)
+        if (m >> i & 1)
+          hi[m][b++] = i;
+    }
+  }
+};
+static constexpr Pack pack;
+
+// Puts the values at ranks r[0] < ... < r[m - 1] of a[0, n) at those places
+// of a. lows and highs have room for n + 8 values each.
+inline void vranks(u32 *a, u32 n, const u32 *r, int m, u32 *lows, u32 *highs) {
+  if (n <= 64) {
+    for (u32 from = 0, t = 0; t < u32(m); ++t)
+      if (r[t] >= from)
+        select(a + from, n - from, r[t] - from), from = r[t] + 1;
+    return;
+  }
+  u32 x = a[0], y = a[n / 2], z = a[n - 1];
+  u32 pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
+  const __m256i flip = _mm256_set1_epi32(int(0x80000000)),
+                p = _mm256_set1_epi32(int(pivot ^ 0x80000000));
+  u32 lo = 0, hi = 0, i = 0;
+  for (; i + 8 <= n; i += 8) {
+    __m256i v = _mm256_loadu_si256((const __m256i *)(a + i));
+    int mask = _mm256_movemask_ps(
+        _mm256_castsi256_ps(_mm256_cmpgt_epi32(p, _mm256_xor_si256(v, flip))));
+    _mm256_storeu_si256(
+        (__m256i *)(lows + lo),
+        _mm256_permutevar8x32_epi32(
+            v, _mm256_load_si256((const __m256i *)pack.lo[mask])));
+    _mm256_storeu_si256(
+        (__m256i *)(highs + hi),
+        _mm256_permutevar8x32_epi32(
+            v, _mm256_load_si256((const __m256i *)pack.hi[mask])));
+    int k = __builtin_popcount(mask);
+    lo += k, hi += 8 - k;
+  }
+  for (; i < n; ++i) {
+    u32 v = a[i];
+    lows[lo] = v, highs[hi] = v;
+    lo += v < pivot, hi += v >= pivot;
+  }
+  if (lo == 0) { // the pivot is the smallest value: no progress this way
+    for (u32 from = 0, t = 0; t < u32(m); ++t)
+      if (r[t] >= from)
+        select(a + from, n - from, r[t] - from), from = r[t] + 1;
+    return;
+  }
+  // lows then highs, back in a; lows and highs are free again.
+  memcpy(a, lows, lo * 4), memcpy(a + lo, highs, hi * 4);
+  int split = 0;
+  while (split < m && r[split] < lo)
+    ++split;
+  if (split > 0)
+    vranks(a, lo, r, split, lows, highs);
+  if (split < m) {
+    u32 want[3];
+    for (int t = split; t < m; ++t)
+      want[t - split] = r[t] - lo;
+    vranks(a + lo, hi, want, m - split, lows, highs);
+  }
+}
+
 // Writes the values at ranks r[0] <= r[1] <= r[2] of a[0, n) to v. A group
 // of 16 or fewer (four in five groups) is padded to 16 and sorted by Batcher's
 // odd-even merge network, 63 min/max pairs with no branch on the data; its
 // first 19 pairs already sort the first 8 places, so a group of 8 or fewer
-// stops there. Otherwise each rank is selected among the values left above
-// the one before.
-inline void percentiles(u32 *a, u32 n, const u32 *r, u32 *v) {
+// stops there. A group of more than 128 (two records in five sit in one) is
+// partitioned eight at a time; the rest select each rank among the values left
+// above the one before. lows and highs have room for the group plus 8.
+inline void percentiles(u32 *a, u32 n, const u32 *r, u32 *v, u32 *lows,
+                        u32 *highs) {
   if (n <= 16) {
     static constexpr int net[63][2] = {
         {0, 1},   {2, 3},   {0, 2},   {1, 3},   {1, 2},   {4, 5},   {6, 7},
@@ -140,9 +226,12 @@ inline void percentiles(u32 *a, u32 n, const u32 *r, u32 *v) {
       v[t] = s[r[t]];
     return;
   }
-  for (u32 from = 0, t = 0; t < 3; ++t)
-    if (r[t] >= from)
-      select(a + from, n - from, r[t] - from), from = r[t] + 1;
+  if (n > 128) // its three ranks are then distinct
+    vranks(a, n, r, 3, lows, highs);
+  else
+    for (u32 from = 0, t = 0; t < 3; ++t)
+      if (r[t] >= from)
+        select(a + from, n - from, r[t] - from), from = r[t] + 1;
   for (int t = 0; t < 3; ++t)
     v[t] = a[r[t]];
 }
@@ -401,7 +490,8 @@ int main() {
       {
         const u32 ne = names.size(), ids = endpoints.next_id;
         std::vector<u32> start(ids), errors(ids), cursor(ids);
-        std::unique_ptr<u32[]> latency(new u32[most]);
+        std::unique_ptr<u32[]> latency(new u32[most]), lows(new u32[most + 8]),
+            highs(new u32[most + 8]);
         for (int i; (i = claim++) < HOURS;) {
           int h = order[i];
           std::fill(start.begin(), start.end(), 0);
@@ -426,7 +516,7 @@ int main() {
             u32 *a = latency.get() + start[id], r50 = (50 * n + 99) / 100 - 1,
                 r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
             u32 ranks[3] = {r50, r95, r99}, v[3];
-            percentiles(a, n, ranks, v);
+            percentiles(a, n, ranks, v, lows.get(), highs.get());
             Line &l = ((Line *)(lines + h * hour_bytes))[count[h]++];
             l = {e, n, v[0], v[1], v[2], errors[id]};
             sz += 28 + names[e].size();

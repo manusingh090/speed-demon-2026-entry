@@ -57,6 +57,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 49 | Back to step 47's code | pending | | | |
 | 50 | Groups of 16 or fewer sorted by Batcher's 63-pair odd-even merge network (its first 19 pairs for 8 or fewer) instead of three chained selections | run-dabeae4d5c50 | 0.0214 s | 17.4 MiB | 84.30 |
 | 51 | Step 50 with the log fetched 1 KB ahead of each line with the non-temporal prefetch hint | run-0d7c54395879 | 0.0207 s | 17.7 MiB | 84.59 |
+| 52 | Groups of more than 128 records partitioned eight at a time with AVX2 (lookup-table compress into two buffers) | pending | | | |
 
 ## Local measurements
 
@@ -192,6 +193,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 50 on the board, and step 51.** run-dabeae4d5c50: 0.0214 s, 17.4 MiB (the lowest Track A memory so far), 361 lines, 84.30 points. Measured and dropped: storing each group's ppm in its line and skipping the division when it has no 5xx (most groups), so the text phase does not divide again: 1M fewer instructions, cycles level. Kept for step 51: an instruction profile of the parse puts 17% of its samples just after the endpoint table's slot load, as if the table and the name arena (about 125 KB together) are pushed out of the core's caches by the 239 MB of log streaming past them. Each line now fetches the log 1 KB ahead with `prefetchnta`, which brings the data near the core while disturbing the outer caches less. Same hash on all six datasets and 10 repeated full runs; three `perf stat` rounds: user cycles 367 to 373M against 377 to 390M (512 bytes ahead gave 371 to 379M), 3M more instructions.
 
 **Step 51 on the board.** run-0d7c54395879 (from a later commit carrying step 51's Track A code): 0.0207 s, 17.7 MiB, 362 lines, 84.59 points, the second fastest Track A run so far, at less memory than the best (0.0203 s, 18.1 MiB). Also measured after it and dropped: 2 KB and 4 KB prefetch distances (no better than 1 KB), and non-temporal stores for the records (user cycles 3% higher, wall time mixed).
+
+**Step 51 to 52: big groups partitioned eight at a time.** Groups of more than 128 records hold 55% of the records, and the scalar partition there costs about five cycles a value. A group that size now has its three ranks found by an AVX2 partition in the manner of Intel's x86-simd-sort and Google's vqsort: eight values compared with the pivot at once (unsigned, by flipping the sign bits), two lookup-table permutations packing the smaller lanes and the others to the front of two vectors, and full 8-lane stores appending them to two buffers, so no step waits on an earlier store. The larger side is copied back behind the smaller one and only the sides holding a wanted rank go on; sides of 64 or fewer, or rounds where the pivot is the minimum, finish with the in-place selections. A standalone test checked it against a full sort on 200,000 random groups (600,000 ranks), with heavy duplicates and values next to 0 and 2^32 - 1; in that test it was about twice as fast as the chained selections at 1,000 and 9,000 values and level at 100, so it starts above 128. Same hash on all six datasets and 10 repeated full runs; four `perf stat` rounds against step 51: 632M user instructions against 675M, cycles 346 to 351M against 363 to 388M.
 
 ## Tried and kept out
 
