@@ -87,7 +87,8 @@ Best run: **run-387221618ac3**, 0.0190 s, 14.45 MiB, 400 counted lines, 86.04 po
 | 69 | Back to step 67's code | no run of its own (step 67's code ran again in later pushes, run-ba1f73e5dfaa: 0.0192 s) | | | |
 | 70 | Step 67 with no cap on the early text: once no piece is left to claim, every idle thread writes the next placed hour while the last hours finish | run-810c04655ec5 | 0.0191 | 14.16 | 86.07 |
 | 71 | Step 70 with each hour's output range backed by one `MADV_POPULATE_WRITE` call before its text is formatted, instead of a page fault per page | run-7f6a46f87af4 | 0.0189 | 14.14 | 86.16 |
-| 72 | Step 71 with each closed hour's sort scratch (the free rest of its region) backed by one `MADV_POPULATE_WRITE` call before the first radix pass scatters into it | pending | | | |
+| 72 | Step 71 with each closed hour's sort scratch (the free rest of its region) backed by one `MADV_POPULATE_WRITE` call before the first radix pass scatters into it | run-252be982f045 (commit f1f9fe6, a later push carrying step 72's Track A code; Tracks B and C ran 21% and 12% slow in it) | 0.0214 | 14.57 | 84.67 |
+| 72b | Step 72's code again, to see it in a run where the box is not slow | pending | | | |
 
 ## Local measurements
 
