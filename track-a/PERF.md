@@ -264,6 +264,8 @@ Step 58 is a new program built on that floor. The pieces are claimed in order, a
 
 **Step 67's fourth run.** run-aba89b13a729 (commit cdc8e93, which changed comments and documentation only, so the same binary): 0.0243 s and 13.89 MiB, 83.54 points, against 0.0193 to 0.0196 s in the three runs before. Track C's unchanged code ran its slowest time in weeks in the same push (0.0245 s), while B and D ran their usual times, so this is the box's spread on these two short tracks, not the code; four runs of step 67 give a median of 0.0195 s.
 
+**Step 67's fifth run.** run-715d4ebda786 (commit e5c91b3, documentation only): 0.0195 s, 14.43 MiB, 85.73 points, back with the first three; Track C's code ran its usual 0.0233 s in the same push.
+
 ## Tried and kept out
 
 - **The hour phase priced by switching parts off** (laptop, user-mode `perf stat`): the three selections per group are 135M of 685M user instructions and about 80M of 410M cycles; placing each latency at its group's cursor about 20M cycles more. **Counting sort by endpoint and latency octave** (16 octaves of bit length), so each percentile is found in a known octave and selected among that octave's latencies only (the median's octave holds about a fifth of a group): correct, but 683M instructions against 685M and the same cycles, as the octave is computed twice a record and the counting table is 16 times larger; 2 MB more at peak. Kept out.
