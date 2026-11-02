@@ -22,9 +22,9 @@ const ANONYMOUS: i32 = 0x4022;
 
 const HUGE_PAGE: usize = 1 << 21;
 // Bytes of text a worker takes at once.
-const SLICE: usize = 1 << 17;
+const SLICE: usize = 1 << 18;
 // Slices per phase: postings are rebuilt every this many.
-const PHASE_SLICES: usize = 400;
+const PHASE_SLICES: usize = 200;
 // Postings before each list, holding a value no document has.
 const SENTINELS: usize = 1;
 const PLAN_PARTS: usize = 16;
@@ -900,7 +900,7 @@ impl Engine {
         };
         self.shares[id].set(self.parse_part(id)).ok();
         self.sync_all();
-        self.take_jobs(&self.prep[0], 24, |claim| {
+        self.take_jobs(&self.prep[0], 12, |claim| {
             self.prep[4].fetch_add(self.scan_claim::<true>(claim, &mut buffers), Relaxed);
         });
         let terms = self.term_count.load(Relaxed);
