@@ -13,9 +13,10 @@
 // hour's own region. A thread unmaps each piece once parsed.
 //
 // Hours. The log is in about clock order, so an hour is closed as soon as
-// the first unparsed piece starts two hours after it. Its records are then
-// radix-sorted by endpoint rank and latency, so each group comes out sorted
-// and its percentiles are read off by index, and the region is handed back.
+// the first unparsed piece starts 30 minutes into the next hour. Its records
+// are then radix-sorted by endpoint rank and latency, so each group comes out
+// sorted and its percentiles are read off by index, and the region is handed
+// back.
 // Only the hours still open hold records. A line for an hour already closed
 // is caught (each hour counts the threads filing into it), and the pass is
 // then redone with every hour held open to the end.
@@ -300,10 +301,11 @@ int main() {
   per_hour = (size / 13 / BLOCK + nt + 2) * BLOCK;
   records = (u32 *)mmap(nullptr, HOURS * per_hour * 4, 3,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-  // Pieces start at line starts; first[k] is the hour of piece k's first line.
+  // Pieces start at line starts; first[k] is the time of piece k's first line,
+  // in minutes from the span's start.
   const int pieces = 8 * nt;
   std::vector<size_t> cut(pieces + 1, size);
-  std::vector<int> first(pieces + 1, HOURS);
+  std::vector<int> first(pieces + 1, HOURS * 60);
   cut[0] = 0;
   for (int k = 1; k < pieces; ++k)
     for (cut[k] = std::max(cut[k - 1], size * k / pieces);
@@ -311,7 +313,8 @@ int main() {
       ++cut[k];
   for (int k = 0; k < pieces; ++k)
     if (cut[k] < size)
-      first[k] = hour_of(log + cut[k]);
+      first[k] = hour_of(log + cut[k]) * 60 + (log[cut[k] + 14] - '0') * 10 +
+                 log[cut[k] + 15] - '0';
 
   // Hour h's count[h] lines sit from lines + h * hour_bytes, each hour on
   // pages of its own, handed back once the hour's text is written.
@@ -429,8 +432,10 @@ int main() {
   };
 
   // The pass. Each thread closes and finishes the next hour once the first
-  // piece not yet parsed starts two hours after it (or every piece is
-  // parsed, if a pass was too late), and otherwise parses the next piece.
+  // piece not yet parsed starts 30 minutes into the hour after it (the log's
+  // shards send an hour's last lines 5 to 10 minutes after it ends; a later
+  // one costs a second pass) or every piece is parsed (in a second pass),
+  // and otherwise parses the next piece.
   std::vector<Parser> parsers(nt);
   std::vector<char> parsed(pieces + 1);
   int front = 0, next_piece = 0, next_hour = 0, passes = 1;
@@ -461,7 +466,7 @@ int main() {
             while (front < pieces && parsed[front])
               ++front;
             if (next_hour < HOURS &&
-                (front == pieces || (stream && first[front] >= next_hour + 2)))
+                (front == pieces || (stream && first[front] >= (next_hour + 1) * 60 + 30)))
               h = next_hour++, closed[h] = true;
             else if (next_piece < pieces)
               k = next_piece++;
