@@ -206,6 +206,7 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 54 on the board, and step 55.** run-b114f738369d: 0.0204 s, 17.4 MiB, 406 lines, 84.42 points. Lined up, the AVX2 selection of steps 52 to 54 bought about 2% of time on the box (0.0203 to 0.0204 s against step 51's 0.0207 s), about 1% of K, for about 40 formatted lines, about 1.6% of K, so it goes; the in-region escapes of step 54 cost one line for 0.4 to 0.6 MB, so they stay. Step 55 is step 51 with step 54's escapes: same hash on all six datasets and 10 repeated full runs, peak 17.7 MB against 18.3 MB for step 51 locally, 356 counted lines.
 
 **Step 55 on the board.** run-2ffb5eb89fd7: 16.75 MiB, the lowest Track A memory so far, but 0.0242 s, 17% slower than step 51's 0.0207 s, in a run where the other tracks ran their usual times. That is beyond the spread seen for unchanged A code, so this push only logs it and gives the same code a second run before deciding.
+The second run of the same code (run-4998b051e55d, from a later commit) took 0.0210 s at 17.2 MiB, 84.51 points, so the first was noise; step 55's code stays.
 
 ## Tried and kept out
 
