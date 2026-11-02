@@ -218,52 +218,16 @@ impl Len for u64 {
     const MAX: Self = u64::MAX;
 }
 
-/// A 4-ary min-heap of (key, node): it only ever holds the live frontier, so
-/// it stays small, and four children share one cache line.
-#[derive(Default)]
-struct Heap<T>(Vec<(T, u32)>);
-
-impl<T: Len> Heap<T> {
-    fn push(&mut self, k: T, u: u32) {
-        let h = &mut self.0;
-        let mut i = h.len();
-        h.push((k, u));
-        while i > 0 && h[(i - 1) / 4].0 > k {
-            h[i] = h[(i - 1) / 4];
-            i = (i - 1) / 4;
-        }
-        h[i] = (k, u);
-    }
-    /// The smallest entry (the heap must not be empty). The last entry sifts
-    /// down from the root, unchecked: every index read is below n.
-    fn pop(&mut self) -> (T, u32) {
-        let x = self.0.pop().unwrap();
-        let Some(&top) = self.0.first() else { return x };
-        let (h, n, mut i) = (self.0.as_mut_ptr(), self.0.len(), 0);
-        unsafe {
-            while 4 * i + 1 < n {
-                let c = 4 * i + 1;
-                let m = (c + 1..n.min(c + 4)).fold(c, |m, j| if (*h.add(j)).0 < (*h.add(m)).0 { j } else { m });
-                if (*h.add(m)).0 >= x.0 {
-                    break;
-                }
-                (*h.add(i), i) = (*h.add(m), m);
-            }
-            *h.add(i) = x;
-        }
-        top
-    }
-}
-
-const SPAN: usize = 2048; // keys the bucket queue covers ahead of its minimum
+const SPAN: usize = 4096; // keys the bucket queue covers ahead of its minimum
 const NIL: u32 = u32::MAX;
 
 /// A monotone priority queue for Dijkstra (Dial's buckets, circular): a key
 /// less than SPAN above the current minimum goes into bucket key % SPAN, which
 /// then holds that key only, as a list threaded through one entry array whose
 /// freed slots are reused; a bitmap finds the next nonempty bucket. Keys
-/// further ahead (edges of SPAN or more, rare here) wait in a heap. Push and
-/// pop take a few instructions where a heap's pop sifts through every level.
+/// further ahead (only the injected heavy edges here) wait in a short list. Push
+/// and pop take a few instructions where a heap's pop sifts through every
+/// level.
 struct Queue {
     cur: u64, // the smallest key queued, once min has run
     len: usize,
@@ -271,18 +235,19 @@ struct Queue {
     head: Vec<u32>,        // bucket -> its first entry
     ent: Vec<(u32, u32)>,  // (node, next entry in its bucket or free list)
     free: u32,
-    far: Heap<u64>,
+    far: Vec<(u64, u32)>,
 }
 
 impl Queue {
     fn new() -> Self {
-        Queue { cur: 0, len: 0, bits: [0; SPAN / 64], head: vec![NIL; SPAN], ent: Vec::new(), free: NIL, far: Heap::default() }
+        Queue { cur: 0, len: 0, bits: [0; SPAN / 64], head: vec![NIL; SPAN], ent: Vec::new(), free: NIL, far: Vec::new() }
     }
     /// Queues node v at key k, never below the current minimum.
+    #[inline(always)]
     fn push(&mut self, k: u64, v: u32) {
         self.len += 1;
         if k - self.cur >= SPAN as u64 {
-            return self.far.push(k, v);
+            return self.far.push((k, v));
         }
         let b = k as usize % SPAN;
         let e = (v, self.head[b]);
@@ -298,6 +263,7 @@ impl Queue {
         self.bits[b / 64] |= 1 << (b % 64);
     }
     /// The smallest key queued, which becomes the current minimum.
+    #[inline(always)]
     fn min(&mut self) -> Option<u64> {
         if self.len == 0 {
             return None;
@@ -312,7 +278,7 @@ impl Queue {
             w => Some(w.trailing_zeros() as usize),
         }
         .map_or(INF, |g| self.cur + g as u64);
-        if let Some(&(k, _)) = self.far.0.first() {
+        if let Some(&(k, _)) = self.far.iter().min() {
             gap = gap.min(k);
         }
         self.cur = gap;
@@ -320,12 +286,14 @@ impl Queue {
     }
     /// Takes an entry at the current minimum (min must have found one); also
     /// returns the next node in its bucket, if any.
+    #[inline(always)]
     fn pop(&mut self) -> (u64, u32, Option<u32>) {
         self.len -= 1;
         let b = self.cur as usize % SPAN;
         let i = self.head[b];
         if i == NIL {
-            let (k, v) = self.far.pop();
+            let j = (0..self.far.len()).min_by_key(|&j| self.far[j]).unwrap();
+            let (k, v) = self.far.swap_remove(j);
             return (k, v, None);
         }
         let (v, next) = self.ent[i as usize];
@@ -345,7 +313,7 @@ impl Queue {
         }
         (self.cur, self.len, self.free) = (0, 0, NIL);
         self.ent.clear();
-        self.far.0.clear();
+        self.far.clear();
     }
 }
 
@@ -699,7 +667,7 @@ fn main() {
             }
         }
     });
-    drop((filed, claimed, link_v));
+    drop(filed);
 
     // New ids: each thread's chain in turn (every node is in one), then at
     // least one padding id, up to a whole group of 8, so no group of packed
@@ -716,6 +684,8 @@ fn main() {
     let (mut id_v, mut off_v) = (vec![0u32; n], vec![0u32; n2 + 1]);
     let (ir, or) = (Raw::of(&mut id_v), Raw::of(&mut off_v));
     let ends_at: Vec<usize> = on_threads(nt, |t| {
+        // Arrays read no more go back on every thread rather than on one.
+        (drop_pages(link, t, nt), drop_pages(&claimed, t, nt));
         let (mut k, mut e) = (start[t], t * m);
         for &u in &chains[t].0 {
             unsafe { (*ir.at(u as usize), *or.at(k)) = (k as u32, e as u32) };
@@ -724,11 +694,11 @@ fn main() {
         (k..start[t + 1] + (t + 1 == nt) as usize).for_each(|k| unsafe { *or.at(k) = e as u32 });
         e
     });
+    drop((claimed, link_v));
     let mut heavy2: Vec<(u32, u32)> = chains.into_iter().flat_map(|c| c.1).collect();
     heavy2.sort_unstable();
     drop((first_v, heavy));
     let off = Offs::pack(nt, &off_v);
-    drop(off_v);
 
     // Each edge's head mapped to its new id (weight bits kept), each thread
     // over its own region, with in-degrees counted into roff[v + 2] on the
@@ -739,6 +709,7 @@ fn main() {
     let rr = Raw::of(&mut roff_v);
     let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
     on_threads(nt, |t| {
+        drop_pages(&off_v, t, nt);
         for p in t * m..ends_at[t] {
             if p + 16 < ends_at[t] {
                 prefetch(&id[(unsafe { *ar.at(p + 16) } & hmask) as usize]);
@@ -751,13 +722,14 @@ fn main() {
     });
     // Queries in the new numbering (sorted later), then the id map goes.
     let ends: Vec<(u32, u32)> = queries.iter().map(|&(s, t)| (id[s as usize], id[t as usize])).collect();
-    drop(id_v);
+    drop(off_v);
     prefix_sum(nt, &mut roff_v);
     let adj = &adj;
     let off = &off;
     let mut radj = vec![0u32; m];
     let rar = Raw::of(&mut radj);
     let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
+        drop_pages(id, t, nt);
         let mut out = Vec::new();
         for u in start[t]..start[t] + lens[t] {
             for e in off.at(u)..off.at(u + 1) {
@@ -772,9 +744,9 @@ fn main() {
         out
     })
     .concat();
+    drop(id_v);
     rheavy.sort_unstable();
     let roff = Offs::pack(nt, &roff_v[..n2 + 1]);
-    drop(roff_v);
 
     // 4. Queries sorted so neighbouring searches share cached pages.
     let mut order: Vec<usize> = (0..ends.len()).collect();
@@ -784,6 +756,7 @@ fn main() {
     let ansr = Raw::of(&mut ans);
     let next = AtomicUsize::new(0);
     on_threads(nt, |th| {
+        drop_pages(&roff_v, th, nt);
         let mut narrow: [Side<u32>; 2] = [Side::new(n2), Side::new(n2)];
         let mut wide: [Side<u64>; 2] = [Side::new(n2), Side::new(n2)];
         loop {
@@ -806,6 +779,7 @@ fn main() {
             unsafe { *ansr.at(i) = best.0 };
         }
     });
+    drop(roff_v);
     // Free the graph on every thread at once rather than at exit on one.
     on_threads(nt, |t| [adj, &radj].iter().for_each(|b| drop_pages(b, t, nt)));
 
