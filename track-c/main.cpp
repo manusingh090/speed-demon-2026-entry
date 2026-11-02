@@ -28,8 +28,6 @@
 #include <string>
 #include <mutex>
 #include <new>
-#include <span>
-#include <string_view>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <thread>
@@ -47,17 +45,18 @@ using i64 = int64_t;
     _exit(1);
 }
 
-// Zero-filled anonymous memory; pages are charged only once touched. A huge
-// block sits on 2 MB pages (whole ones, aligned); the rest refuse them, as
+// Zero-filled anonymous memory; pages are charged only once touched. Every
+// block is reserved in whole 2 MB pages, aligned (untouched address space
+// costs nothing); a huge one sits on 2 MB pages, the rest refuse them, as
 // the box runs huge pages always on.
 constexpr size_t HUGE_PAGE = 2 << 20;
 template <class T>
 T* zeroed(size_t n, bool huge = false) {
-    const size_t bytes = huge ? (n * sizeof(T) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1) : n * sizeof(T);
-    auto* p = static_cast<char*>(mmap(nullptr, bytes + huge * HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    if (p == MAP_FAILED) die("mmap");
-    if (huge) p = reinterpret_cast<char*>((uintptr_t(p) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
-    madvise(p, bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+    const size_t bytes = (n * sizeof(T) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
+    auto p = uintptr_t(mmap(nullptr, bytes + HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (p == uintptr_t(MAP_FAILED)) die("mmap");
+    p = (p + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
+    madvise(reinterpret_cast<void*>(p), bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     return reinterpret_cast<T*>(p);
 }
 
@@ -114,9 +113,9 @@ u64 digits(const char* s, const char* e) { return fold(load8(e - 8), e - s); }
 // share those 32 bits and meet in one group: with 100,000 names and about ten
 // keys per group probed, a chance of about 1 in 10,000 per dataset. At 4 bytes
 // a slot the table is 512 KB, and eight slots share a cache line.
-class NameTable {
-public:
-    static constexpr u32 BITS = 17, SLOTS = 1 << BITS;  // the pool holds 100,000 names
+struct NameTable {
+    // The pool holds 100,000 names.
+    static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
 
     static u64 mix(u64 a, u64 b) {
         unsigned __int128 p = (unsigned __int128)a * b;
@@ -165,7 +164,6 @@ public:
     // Each of n threads populates its share up front (see populate_share).
     void populate(int t, int n) const { populate_share(slots_, SLOTS, t, n); }
 
-private:
     std::atomic<u32>* slots_ = zeroed<std::atomic<u32>>(SLOTS);  // 0 = free
 };
 
@@ -181,7 +179,8 @@ struct alignas(64) Totals {
 // by all threads. Most marks are first sightings, so they are atomic ORs.
 struct NamesSeen {
     static constexpr u32 WORDS = NameTable::SLOTS / 64;
-    std::atomic<u64>* bits = nullptr;  // a row per country, set once the countries are known
+    // A row per country, set once the countries are known.
+    std::atomic<u64>* bits = nullptr;
 
     std::atomic<u64>& word(u32 c, u32 name) { return bits[c * WORDS + name / 64]; }
 
@@ -216,10 +215,12 @@ struct Numbers {
     __m256i shift = _mm256_set_epi64x(64, 8 * (9 - (amount_end - amount_at)), 8 * (8 - (region_end - region_at)),
                                       8 * (8 - (id_end - id_at)));
     v = _mm256_and_si256(v, _mm256_sllv_epi64(_mm256_set1_epi8(0x0F), shift));
-    v = _mm256_maddubs_epi16(v, _mm256_set1_epi16(0x010A));        // 10 * first + second
-    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x00010064));        // 100 * first + second
-    v = _mm256_packus_epi32(v, v);                                  // the quads as 16-bit words
-    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x00012710));        // 10000 * first + second
+    // 10 * first + second, then 100 * first + second, the quads packed to
+    // 16-bit words, then 10000 * first + second.
+    v = _mm256_maddubs_epi16(v, _mm256_set1_epi16(0x010A));
+    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x00010064));
+    v = _mm256_packus_epi32(v, v);
+    v = _mm256_madd_epi16(v, _mm256_set1_epi32(0x00012710));
     __m128i lo = _mm256_castsi256_si128(v);
     return {u32(_mm_cvtsi128_si32(lo)), u32(_mm_extract_epi32(lo, 1)),
             u32(_mm_cvtsi128_si32(_mm256_extracti128_si256(v, 1)))};
@@ -249,7 +250,8 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         u32 country, id;
     } marks[LAG];
     u64 n = 0, last = UINT64_MAX;  // records started; all of them once known
-    auto advance = [&]() __attribute__((always_inline)) {  // retire ring slot n % LAG
+    // Retires ring slot n % LAG.
+    auto advance = [&]() __attribute__((always_inline)) {
         u32 k = n % LAG;
         if (n >= 2 * LAG && n - 2 * LAG < last) totals[marks[k].country].distinct += seen.mark(marks[k].country, marks[k].id);
         if (n >= LAG && n - LAG < last) {
@@ -371,13 +373,13 @@ struct Phase {
 };
 
 // Cuts of [from, size) into n ranges, each starting just after a delimiter.
-std::vector<size_t> split(const char* data, size_t from, size_t size, int n, std::string_view delim) {
+std::vector<size_t> split(const char* data, size_t from, size_t size, int n, const char* delim) {
     std::vector<size_t> cut(n + 1, size);
     cut[0] = from;
     for (int t = 1; t < n; ++t) {
         size_t c = std::max(cut[t - 1], from + (size - from) * t / n);
-        auto* hit = static_cast<const char*>(memmem(data + c, size - c, delim.data(), delim.size()));
-        cut[t] = hit ? hit - data + delim.size() : size;
+        auto* hit = static_cast<const char*>(memmem(data + c, size - c, delim, strlen(delim)));
+        cut[t] = hit ? hit - data + strlen(delim) : size;
     }
     return cut;
 }
@@ -396,7 +398,7 @@ int main() {
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256 << 10);
     pthread_setattr_default_np(&attr);
-    const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
+    int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
     size_t rsize, size;
     const char* regions = map_file("/data/regions.csv", rsize);
     const char* records = map_file("/data/records.csv", size);
@@ -413,7 +415,7 @@ int main() {
     std::once_flag numbered;
     NamesSeen seen;
     using CountryTotals = std::array<Totals, 256>;
-    std::span<CountryTotals> totals;  // set up by each thread
+    CountryTotals* totals = nullptr;  // one per thread, set up by each
     char* block = nullptr;  // the bitsets, then the totals
     size_t block_bytes = 0;
     auto number_countries = [&] {
@@ -427,7 +429,7 @@ int main() {
         // first-level TLB.
         block = zeroed<char>(block_bytes = rows * sizeof(u64) + nthreads * sizeof(CountryTotals), true);
         seen.bits = reinterpret_cast<std::atomic<u64>*>(block);
-        totals = {reinterpret_cast<CountryTotals*>(block + rows * sizeof(u64)), size_t(nthreads)};
+        totals = reinterpret_cast<CountryTotals*>(block + rows * sizeof(u64));
     };
 
     // records.csv: skip the BOM and header, then split after CRLFs into eight
@@ -478,8 +480,8 @@ int main() {
     for (u32 i = 1; i <= codes.size() + 1; ++i) {
         u32 c = i % (codes.size() + 1);  // countries 1..N, then _UNMATCHED (0)
         Totals sum;
-        for (const auto& per_thread : totals) {
-            const Totals& t = per_thread[c];
+        for (int k = 0; k < nthreads; ++k) {
+            const Totals& t = totals[k][c];
             sum.count += t.count;
             sum.id_sum += t.id_sum;
             sum.name_bytes += t.name_bytes;
@@ -501,9 +503,6 @@ int main() {
         for (u64 v : {sum.distinct, sum.name_bytes, sum.note_bytes}) out += ' ' + std::to_string(v);
         out += '\n';
     }
-    FILE* f = fopen("/out/aggregates.txt", "wb");
-    if (!f) die("/out/aggregates.txt");
-    fwrite(out.data(), 1, out.size(), f);
-    fclose(f);
-    return 0;
+    int fd = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || write(fd, out.data(), out.size()) != ssize_t(out.size())) die("/out/aggregates.txt");
 }
