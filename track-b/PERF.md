@@ -90,7 +90,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 83 | Measurement only: before exiting, wait ten times as long as mapping the term table took | run-02ebeca44f3b | 0.143 | 44.7 | 75.24 |
 | 84 | Measurement only: before exiting, wait twice as long as everything before the scan took | run-9c03805108ff | 0.177 | 44.9 | 72.88 |
 | 85 | Non-terms spread over 16 spare ids, `last` prefetched 8 tokens ahead in the callback, phrase windows checked on an end term kept in the anchor's entry, bitmap bits set once per document | run-5eeae6f0c8cf | 0.144 | 45.6 | 75.04 |
-| 86 | Back to step 80's code | pending | | | |
+| 86 | Back to step 80's code | run-26e4b60b0e60 | 0.139 | 44.7 | 75.58 |
+| 87 | Tokenizer rewritten around a linear hash buffer and a one-multiply hash; the per-document handler split into three short loops | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -341,6 +342,14 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 84 on the board, and step 85.** run-9c03805108ff: 0.1774 s against about 0.142 s, so twice the time before the scan is about 35 ms and the time itself about 17 ms, near what the laptop shows; step 82's single run was the outlier. Step 85 is a version written by hand from step 80: tokens that are no term are given one of 16 spare ids past the last term (`n + (i & 60)`) instead of one, so their marks do not all land on one word; the callback prefetches `last` for the token 8 ahead (the ids are followed by 8 zeros); each phrase anchor's entry carries the term at the window's other end, compared before the phrase is read; and a bitmap term's bit is set once per document, in the loop over new terms, instead of for every occurrence. As first written its posting streams grew in 16 KB chunks, below the 64 KB at which malloc maps blocks of their own, so the freed stream memory stayed in malloc's heap and the peak was 66 MB; with 64 KB chunks it is 47 MB as before. On the laptop it runs 133M fewer instructions but twice the mispredictions (the bitmap-or-list branch per new term), and cycles within noise of step 80. Same hash on all six datasets, 5 repeated full runs gave one hash.
 
 **Step 85 on the board, and step 86.** run-5eeae6f0c8cf: 0.1439 s at 45.6 MiB, 75.04, the same as step 80's 0.1431 s within the box's spread, with 14 more counted lines. Step 86 is step 80's code again.
+
+## Fifth session (Nov 2): instructions per token
+
+**Step 86 on the board.** run-26e4b60b0e60 (measured at commit e1e8def): 0.1389 s, 44.7 MiB, 638 counted lines, 75.58, the best Track B run so far.
+
+**Where the run goes now.** Each phase cut off with an early exit, counted with `perf stat` on the full data: everything before the scan 122M instructions (37M of them the serial query parse), the scan 4,917M (2,330M user cycles, 74% of the run), building the lists 480M, answering and writing 995M. The corpus has 36.3M tokens, so the scan retires 136 instructions per token: 88 in the tokenizer and lookups (a variant whose handler only sums the ids) and 48 in the per-document handler. On the box, which runs 12 threads on 6 cores, the cores already retire about 3 instructions per cycle between the two threads, so time there follows instructions, as steps 34 and 35 showed. The disassembly showed why the counts are high: the handler's fused loop kept 16 values live and reloaded most of them from the stack on every token (42 instructions per token), and the tokenizer rematerialized its constants, kept the lag ring on the stack and spent 25 instructions on the hash.
+
+**Step 87.** The tokenizer stores each token's hash in a linear per-thread buffer (after 8 spare zeros) and looks up the hash stored 8 tokens earlier, instead of a ring indexed modulo 8. The hash is the token's two zero-padded words, each XORed with a constant that has a byte no token can have (so neither factor is zero), folded by one 128-bit multiply (`mulx`, high XOR low); tokens over 16 bytes fold in two more words. The handler is three short loops over the document's ids, each with few enough live values to stay in registers: bitmap bits (non-bitmap tokens OR into eight spare words in turn, so no store waits on the previous one), list terms new to the document (marks now indexed by list position, so the array is the lists' size), and anchor positions. On the laptop: 5,881M instructions against 6,516M (-9.7%), user cycles 2 to 4% fewer over three interleaved rounds; the tokenizer alone 77 instructions per token against 88, the handler 39 against 48. 650 counted lines against 638. Same hash on all six datasets.
 
 ## What the profile said, step by step
 
