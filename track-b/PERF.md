@@ -95,7 +95,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 88 | Token ends found once per window, byte masks from a table, no mark prefetch, each anchor's first phrase in a prefetched 16-byte head | run-18961f21c438 | 0.128 | 45.1 | 76.23 |
 | 89 | The scan writes every list-term occurrence, with no per-term marks or counts; the lists are counted and deduplicated from its output | run-1406c8e99675 | 0.124 | 46.8 | 76.32 |
 | 90 | Term table of 1 MB instead of 2 MB (load 0.58) | run-9fbf4b590d0c | 0.133 | 48.4 | 75.40 |
-| 91 | Measurement only: step 89's code, the query parse kept as memory (a page per 4 us) and the serial setup after the sample as ten times its length in wait | pending | | | |
+| 91 | Measurement only: step 89's code, the query parse kept as memory (a page per 4 us) and the serial setup after the sample as ten times its length in wait | run-d59c352f1a2a | 0.188 | 55.2 | 71.04 |
+| 92 | Queries read with the documents' 64-byte class masks; one vector probe for lookups and inserts; anchor starts in one pass | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -370,6 +371,10 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 90 on the board.** run-9fbf4b590d0c: 0.1335 s against 0.1243 s, 48.4 MiB: the longer probes cost the box more than the misses saved, so fewer laptop misses is not a sure sign either. The 2 MB table is back.
 
 **Step 91** measures the time before the scan, which step 84 put at about 17 ms, now 13% of the run: step 89's code, with the time from the start of `main` to the end of the term inserts kept as memory (one touched 4 KB page per 4 us, held to the exit), and the time from the end of the sample to the start of the scan (summing the sampled counts, choosing anchors, sorting and renumbering the terms, the anchors' heads, the bitmaps' allocation) added before the exit as a wait ten times as long.
+
+**Step 91 on the board.** run-d59c352f1a2a (measured at commit 5e7ad66): 0.1884 s and 55.2 MiB against step 89's 0.1243 s and 46.8 MiB. 8.4 MiB more is 2,150 pages, so parsing the queries and inserting their terms takes about 8.6 ms on the box; 64 ms more time is ten times a serial setup of about 6.4 ms. About 15 ms of the 124 run on one thread while eleven wait. The laptop agrees on both once its cycles are scaled to 2.5 GHz: 17.7M user cycles for the parse and inserts (37M instructions), about 12M for the setup.
+
+**Step 92.** The query file was split byte by byte, line by line and then word by word, about 28 instructions per byte. It is now read like the documents, a 64-byte class mask at a time (`words`): a line's first word gives its kind, and in BOOL every other word after it is an operator, kept as its first letter. The window's stopping point, in both readers, is one expression (`nl.trailing_zeros().min(64 - (!word).leading_zeros())`: a line feed is never inside a word). Lookups and inserts share one vector probe that returns the slot of the term or of the first free one, so the insert's slot-by-slot loop is gone. And each anchor's first phrase is found in one pass over the sorted records (every anchor has a phrase) instead of a binary search per anchor. Parse and inserts on the laptop: 18.4M instructions against 36.9M, 11.4M user cycles against 17.7M, mispredictions 143K against 387K. The rest of the setup was tried as a counting sort on (class, sampled count) with the counts summed on all threads: the same 90M instructions to the scan's start, so it stayed out. 704 counted lines. Same hash on all six datasets.
 
 ## What the profile said, step by step
 

@@ -14,7 +14,6 @@ extern "C" {
 }
 
 const THREADS: usize = 12;
-static T1: OnceLock<std::time::Instant> = OnceLock::new();
 const NONE: u32 = u32::MAX;
 const BUCKETS: usize = 32;
 const GAP: u32 = 15;
@@ -98,7 +97,7 @@ struct Terms {
 }
 
 impl Terms {
-    fn find(&self, h: u64) -> u32 {
+    fn probe(&self, h: u64) -> usize {
         let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
         unsafe {
             let (tag, keep) = (_mm256_set1_epi64x((h & !ID_MASK) as i64), _mm256_set1_epi64x(!ID_MASK as i64));
@@ -108,12 +107,16 @@ impl Terms {
                 let found = _mm256_or_si256(hit, _mm256_cmpeq_epi64(v, _mm256_setzero_si256()));
                 let m = _mm256_movemask_pd(_mm256_castsi256_pd(found)) as usize;
                 if m != 0 {
-                    let s = *self.slot.get_unchecked(i + m.trailing_zeros() as usize);
-                    return ((s & ID_MASK) as u32).wrapping_sub(1); // u32::MAX if none
+                    return i + m.trailing_zeros() as usize;
                 }
                 i = (i + 4) & mask;
             }
         }
+    }
+
+    fn find(&self, h: u64) -> u32 {
+        let s = unsafe { *self.slot.get_unchecked(self.probe(h)) };
+        ((s & ID_MASK) as u32).wrapping_sub(1) // u32::MAX if none
     }
 
     fn renumber(&mut self, new: &[u32]) {
@@ -123,15 +126,11 @@ impl Terms {
     }
 
     fn insert(&mut self, h: u64) -> u32 {
-        let (mask, mut i) = (self.slot.len() - 1, h as usize & (self.slot.len() - 4));
-        while self.slot[i] != 0 {
-            if self.slot[i] >> ID_BITS == h >> ID_BITS {
-                return (self.slot[i] & ID_MASK) as u32 - 1;
-            }
-            i = (i + 1) & mask;
+        let i = self.probe(h);
+        if self.slot[i] == 0 {
+            (self.n += 1, self.slot[i] = (h & !ID_MASK) | self.n as u64);
         }
-        (self.n += 1, self.slot[i] = (h & !ID_MASK) | self.n as u64);
-        self.n as u32 - 1
+        (self.slot[i] & ID_MASK) as u32 - 1
     }
 }
 
@@ -171,7 +170,7 @@ impl Doc {
             // The window's tokens end at the line's end, or else before one
             // that reaches its last byte, which the next window starts with.
             // One that fills it is no term: it counts as one token of 48.
-            let mut next = if nl != 0 { nl.trailing_zeros() } else { 64 - (!word).leading_zeros() };
+            let mut next = nl.trailing_zeros().min(64 - (!word).leading_zeros());
             let mut m = _bzhi_u64(word, next);
             if next == 0 && nl == 0 {
                 while (*p.add(next as usize)).is_ascii_alphanumeric() {
@@ -195,6 +194,26 @@ impl Doc {
             p = p.add(next as usize);
         }
     }
+}
+
+// Calls f with each word (a run of letters and digits) of the line at p and
+// returns the next line's start; the words of a query file are short.
+unsafe fn words(mut p: *const u8, e: *const u8, mut f: impl FnMut(*const u8, usize)) -> *const u8 {
+    while p < e {
+        let (word, nl) = classes(p);
+        let next = nl.trailing_zeros().min(64 - (!word).leading_zeros());
+        let mut m = _bzhi_u64(word, next);
+        while m != 0 {
+            let (s, e) = (m.trailing_zeros(), m.wrapping_add(m & m.wrapping_neg()));
+            m &= e;
+            f(p.add(s as usize), (e.trailing_zeros() - s) as usize);
+        }
+        if nl != 0 {
+            return p.add(next as usize + 1);
+        }
+        p = p.add(next.max(1) as usize);
+    }
+    e
 }
 
 enum Docs<'a> {
@@ -409,7 +428,6 @@ impl Units {
 }
 
 fn main() {
-    let t0 = std::time::Instant::now();
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
@@ -426,17 +444,25 @@ fn main() {
         std::slice::from_raw_parts_mut(p.cast(), n)
     };
     let mut terms = Terms { slot, n: 0 };
+    // A line's first word gives the query's kind; in BOOL every other word
+    // after it is an operator, kept as its first letter after its left term.
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
-    for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
-        let (phrase, from) = (q[0] == b'P', ids.len() as u32);
-        let start = if phrase { 8 } else { 5 };
-        for (k, word) in q[start..q.len() - phrase as usize].split(|&b| b == b' ').enumerate() {
-            match !phrase && k % 2 == 1 {
-                true => *ops.last_mut().unwrap() = word[0],
-                false => (ids.push(unsafe { hash(word.as_ptr(), word.len()) }), ops.push(0)).1,
-            }
+    let (mut p, end) = (qtext.as_ptr(), qtext.as_ptr_range().end);
+    while p < end {
+        let (from, mut k, mut phrase) = (ids.len() as u32, 0, false);
+        p = unsafe {
+            words(p, end, |w, len| {
+                match k {
+                    0 => phrase = *w == b'P',
+                    _ if !phrase && k % 2 == 0 => *ops.last_mut().unwrap() = *w,
+                    _ => (ids.push(hash(w, len)), ops.push(0)).1,
+                }
+                k += 1;
+            })
+        };
+        if k > 0 {
+            spans.push((phrase, from, ids.len() as u32));
         }
-        spans.push((phrase, from, ids.len() as u32));
     }
     // The terms' hashes come first, so each insert's slot is fetched 16 ahead.
     let slot = terms.slot.as_ptr();
@@ -448,11 +474,6 @@ fn main() {
         })
         .collect();
     let nterms = terms.n;
-    {
-        let pages = t0.elapsed().as_micros() as usize / 4;
-        let p = unsafe { mmap(std::ptr::null_mut(), pages * 4096 + 4096, 3, 0x22, -1, 0) };
-        (0..pages).for_each(|k| unsafe { std::ptr::write_volatile(p.add(k * 4096), 1) });
-    }
     let text = map("/data/docs.txt");
     let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
     for c in &mut cut[1..THREADS] {
@@ -486,7 +507,6 @@ fn main() {
             });
             (n as usize, df)
         });
-        T1.set(std::time::Instant::now()).ok();
         let sampled: usize = samples.iter().map(|s| s.0).sum();
         let mut df = vec![0u32; nterms + 1];
         for (_, d) in samples {
@@ -518,8 +538,11 @@ fn main() {
         ids.iter_mut().for_each(|id| *id = new[*id as usize]);
         anchored.iter_mut().for_each(|a| a.0 = new[a.0 as usize]);
         anchored.sort_unstable();
-        let first_of = |i: usize| anchored.partition_point(|a| (a.0 as usize) < i);
-        let astart: Vec<usize> = (a0..=nkeep).map(first_of).collect();
+        // Every anchor has a phrase, so its last one marks where the next's start.
+        let mut astart = vec![0; nkeep - a0 + 1];
+        for (k, a) in anchored.iter().enumerate() {
+            astart[a.0 as usize - a0 + 1] = k + 1;
+        }
         (nbits, a0, lists, nkeep, anchored, astart)
     };
     // Each anchor's first phrase in one 16-byte head, read where the anchor
@@ -538,7 +561,6 @@ fn main() {
     let words = ndocs.div_ceil(256) * 4;
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
     let found = Mutex::new(vec![]);
-    let serial = T1.get().unwrap().elapsed();
     let scans = on_threads(|t| {
         let (mut mine, mut kept, mut anchors) = (vec![], vec![0; 1 << 12], vec![0; 1 << 12]);
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
@@ -705,6 +727,5 @@ fn main() {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
     std::io::Write::flush(&mut out).unwrap();
-    std::thread::sleep(serial * 10);
     unsafe { _exit(0) };
 }
