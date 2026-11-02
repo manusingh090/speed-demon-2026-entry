@@ -107,6 +107,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 100 | A phased design pushed as written outside this log with two small edits; withdrawn before its run | (withdrawn) | | | |
 | 101 | Back to step 99's code | (superseded by step 102 before its run) | | | |
 | 102 | The phased design of step 100, rewritten here: new names and comments, the output in one write, query lines found with `memchr` | run-438ac1f6e97f | 0.095 | 41.1 | 78.24 |
+| 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -425,6 +426,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 Checked locally: the same hash on all six datasets and the dense-token test; peak memory about 42 MB against 47.8 MB for step 99. Terms are told apart by 47 bits of the hash (15 for the line, 32 for the tag): a token that is no query term matches one with odds of about 3 in 10,000 over the whole corpus. 1,103 counted lines against 739, about 6% of K, so it must be over 12% faster on the box to gain; the laptop's wall times cannot tell.
 
 **Step 102 on the board.** run-438ac1f6e97f (commit 3982047): 0.0946 s against 0.1102 s for step 99 (14% faster), 41.1 MiB against 47.8, 1,103 counted lines, K 36.71, 78.24 points, the best Track B run so far. The speed and memory more than paid for the 364 extra lines.
+
+**Step 103.** The team's next settings for the phased design: workers take 1 MiB slices of the corpus instead of 256 KiB, 50 to a phase (still about 50 MiB), so a worker claims a quarter as often and starts a quarter as many slice boundaries (each one a search for the next line whose id is a multiple of 64); the sample is 3 of these slices, the same 3 MiB as twelve before. Same hash on all six datasets and the dense-token test.
 
 ## What the profile said, step by step
 
