@@ -1,38 +1,39 @@
 // Speed Demon 2026, Track A (Ingest).
 //
-// One pool of threads does everything in three phases.
+// One pool of threads, one pass over the log, each hour finished while the
+// rest of the log is still being parsed.
 //
 // Parse. The log is memory-mapped and cut into line-aligned pieces, eight per
-// thread, claimed in turn. The line ends of each 64-byte block are found at
+// thread, claimed in order. The line ends of each 64-byte block are found at
 // once, so no line waits on the parse of the one before; a line is then read
 // from both ends. The timestamp is always 27 bytes and the 72-hour span is
 // fixed, so a line's hour comes from its day and hour digits alone.
 // Endpoints are interned in one lock-free table shared by all threads, and
-// each line files a 4-byte record (latency, endpoint id, 5xx flag) under its
-// hour. A thread unmaps each piece once parsed, so the exit does not tear the
-// whole mapping down on one thread.
+// each line files a 4-byte record (latency, endpoint id, 5xx flag) in its
+// hour's own region. A thread unmaps each piece once parsed.
 //
-// Between the phases the last thread to arrive sorts the names, so each
-// endpoint id gets its rank in output order.
+// Hours. The log is in about clock order, so an hour is closed as soon as
+// the first unparsed piece starts two hours after it. Its records are then
+// radix-sorted by endpoint rank and latency, so each group comes out sorted
+// and its percentiles are read off by index, and the region is handed back.
+// Only the hours still open hold records. A line for an hour already closed
+// is caught (each hour counts the threads filing into it), and the pass is
+// then redone with every hour held open to the end.
 //
-// Hours. Threads claim hours. An hour's records are radix-sorted by endpoint
-// rank and latency, so each group comes out sorted and its percentiles are
-// read off by index. Each group keeps its numbers along with the exact size its
-// line will take, since a number's width is known without formatting it.
-//
-// Text. The last thread into the second barrier turns the sizes into offsets
-// and maps the output file at its final size; then every thread formats its
-// hours straight into it.
+// Text. Each group keeps its numbers and the exact size of its line. Once
+// every hour is done the sizes become offsets, the output is mapped at its
+// final size and every thread formats its hours straight into it: the text
+// is written only after the records are gone.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
-#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -44,11 +45,12 @@
 using u32 = uint32_t;
 using u64 = uint64_t;
 constexpr int HOURS = 72; // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
-// A record packs the latency above a 12-bit key: an 11-bit endpoint id and the
-// 5xx flag. Latencies of 2^20 - 1 us or more (about 1% of lines) do not fit.
+// A record packs the latency above a 12-bit key: the 5xx flag and the
+// endpoint id plus one, so a place never written (zero) is no record.
+// Latencies of 2^20 - 1 us or more (about 1% of lines) take two places: a
+// record whose latency field is all ones (ESCAPE), then the raw value.
 constexpr u32 KEY_BITS = 12, ERR = 1u << 11, ID_MASK = ERR - 1,
-              PACKED_MAX = (1u << 20) - 1, ESCAPE = PACKED_MAX << KEY_BITS,
-              SPARE = ~0u;
+              PACKED_MAX = (1u << 20) - 1, ESCAPE = PACKED_MAX << KEY_BITS;
 
 // The number of decimal digits in x, from its bit length.
 inline u32 width(u32 x) {
@@ -94,10 +96,10 @@ inline u64 eq64(__m256i a, __m256i b, __m256i x, __m256i y) {
 // (the slot holds BUSY until the name is written), so no thread reads a
 // half-written name.
 struct Names {
-  static constexpr u32 SLOTS = 1 << 13, MAX = 2047, STRIDE = 128,
+  static constexpr u32 SLOTS = 1 << 13, MAX = ID_MASK, STRIDE = 128,
                        BUSY = 0xFFFF;
   std::atomic<uint16_t> slot[SLOTS];
-  std::atomic<u32> ids{0}, count{0};
+  std::atomic<u32> ids{0};
   uint8_t length[MAX];
   alignas(64) char text[(MAX + 1) * STRIDE];
 
@@ -140,7 +142,7 @@ struct Names {
         memcpy(text + id * STRIDE, s, n);
         text[id * STRIDE + n] = ' ', length[id] = n;
         at.store(id + 1, std::memory_order_release);
-        return ++count, id;
+        return id;
       }
       if (length[v - 1] == n && !memcmp(text + (v - 1) * STRIDE, s, n))
         return v - 1;
@@ -150,16 +152,39 @@ struct Names {
 };
 static Names endpoints;
 
+// Endpoint ids in unsigned byte order of their names, and each id's place in
+// it (indexed by id plus one, as in a record). A ranking is kept for as long
+// as no name has been added since it was made.
+struct Ranking {
+  u32 ids;
+  std::vector<u32> by_rank;
+  std::vector<uint16_t> rank_of = std::vector<uint16_t>(ID_MASK + 1);
+
+  Ranking() : ids(endpoints.ids) {
+    std::vector<std::pair<std::string_view, u32>> by_name;
+    for (u32 i = 0; i < Names::SLOTS; ++i)
+      if (u32 v = endpoints.slot[i]; v && v != Names::BUSY)
+        by_name.push_back({endpoints.name(v - 1), v - 1});
+    std::sort(by_name.begin(), by_name.end());
+    for (auto [name, id] : by_name)
+      rank_of[id + 1] = by_rank.size(), by_rank.push_back(id);
+    if (by_rank.size() != ids) // a name was being added: not kept
+      ids = ~0u;
+  }
+};
+
 // Hour h's records sit together from records + h * per_hour, filled by every
-// thread in 4 KB blocks claimed with one atomic add; a thread's last block in
-// an hour is padded with SPARE. A latency of PACKED_MAX or more takes two
-// places: a record whose latency field is all ones (ESCAPE), then the raw
-// value. An hour is handed back with one call once its records are copied
-// out.
+// thread in 4 KB blocks claimed with one atomic add. A thread filing into an
+// hour counts itself in active[h] while it does; an hour is closed by setting
+// closed[h] first and then finding active[h] zero, so a thread that enters
+// a closed hour, or an hour closed while a thread was in it, is always seen
+// (by the thread or by the closer) and the pass is redone.
 constexpr u32 BLOCK = 1024;
 static u32 *records;
 static size_t per_hour;
 static std::atomic<u32> filled[HOURS];
+static std::atomic<int> active[HOURS];
+static std::atomic<bool> closed[HOURS], late;
 
 struct Parser {
   u32 *cur[HOURS] = {}, *stop[HOURS] = {};
@@ -193,10 +218,13 @@ struct Parser {
       memcpy(&at, p + 5, 8);
       if (at != stamp) [[unlikely]] {
         if (h >= 0)
-          cur[h] = c, stop[h] = lim;
+          cur[h] = c, stop[h] = lim, --active[h];
         int day = (p[8] - '0') * 10 + p[9] - '0',
             hr = (p[11] - '0') * 10 + p[12] - '0';
         h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18, stamp = at;
+        ++active[h];
+        if (closed[h]) // too late for this pass
+          return late.store(true);
         c = cur[h], lim = stop[h];
       }
       u32 method = _mm_movemask_epi8(_mm_cmpeq_epi8(
@@ -222,12 +250,12 @@ struct Parser {
       } else
         for (const char *d = e - len; d < e; ++d)
           lat = lat * 10 + *d - '0';
-      u32 key = endpoints.find(name, n, load(name), load(name + 32)) |
+      u32 key = (endpoints.find(name, n, load(name), load(name + 32)) + 1) |
                 (ne[1] == '5' ? ERR : 0);
       p = e + 1;
       if (lat >= PACKED_MAX) [[unlikely]] {
         if (lim - c < 2) // the pair stays in one block
-          std::fill(c, lim, SPARE), c = lim;
+          c = lim;
         if (c == lim)
           c = claim(h), lim = c + BLOCK;
         *c++ = ESCAPE | key, *c++ = lat;
@@ -238,16 +266,11 @@ struct Parser {
       *c++ = lat << KEY_BITS | key;
     }
     if (h >= 0)
-      cur[h] = c, stop[h] = lim;
+      cur[h] = c, stop[h] = lim, --active[h];
   }
 
   static u32 *claim(int h) {
     return records + h * per_hour + filled[h].fetch_add(BLOCK);
-  }
-
-  void seal() {
-    for (int h = 0; h < HOURS; ++h)
-      std::fill(cur[h], stop[h], SPARE);
   }
 };
 
@@ -265,68 +288,131 @@ int main() {
   if (size && mmap(log, size, 1, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED)
     return perror("mmap"), 1;
 
-  // An hour holds at most two places for every line (one is at least 39
-  // bytes) plus a part block per thread; only the pages written are backed.
-  per_hour = (size / 19 / BLOCK + nt + 1) * BLOCK;
+  // An hour holds at most two places for every line (one is at least 40
+  // bytes), a part block per thread, and after them its sorted keys, one a
+  // line; only the pages written are backed.
+  per_hour = (size / 13 / BLOCK + nt + 2) * BLOCK;
   records = (u32 *)mmap(nullptr, HOURS * per_hour * 4, 3,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  // Pieces start at line starts; first[k] is the hour of piece k's first line.
   const int pieces = 8 * nt;
   std::vector<size_t> cut(pieces + 1, size);
+  std::vector<int> first(pieces + 1, HOURS);
   cut[0] = 0;
   for (int k = 1; k < pieces; ++k)
     for (cut[k] = std::max(cut[k - 1], size * k / pieces);
          cut[k] < size && log[cut[k] - 1] != '\n';)
       ++cut[k];
-  std::atomic<int> claim_piece{0}, claim{0}, claim_text{0};
+  for (int k = 0; k < pieces; ++k)
+    if (const char *p = log + cut[k]; cut[k] < size) {
+      int day = (p[8] - '0') * 10 + p[9] - '0';
+      first[k] = (p[6] == '0' ? day - 30 : day + 1) * 24 +
+                 (p[11] - '0') * 10 + p[12] - '0' - 18;
+    }
 
-  std::vector<Parser> parsers(nt);
-  std::vector<std::string_view> names;
-  std::vector<u32> by_rank;
-  u32 most = 0;
-  struct Line {
-    u32 e, n, p50, p95, p99, errors;
-  };
   // Hour h's count[h] lines sit from lines + h * hour_bytes, each hour on
-  // whole pages of its own, handed back once the hour's text is written
-  // (freed vectors would stay resident while the output's pages fill).
-  char *lines = nullptr;
-  size_t hour_bytes = 0;
-  std::vector<u32> count(HOURS);
-  // Endpoints ranked in unsigned byte order, the order of an hour's lines.
-  // The first thread out of pieces ranks the names seen so far while the
-  // others finish theirs, and the barrier ranks again only if a name was
-  // added since (on the full log, never).
-  std::atomic_flag ranking;
-  auto rank_names = [&] {
-    std::vector<std::pair<std::string_view, u32>> by_name;
-    for (u32 i = 0; i < Names::SLOTS; ++i)
-      if (u32 v = endpoints.slot[i]; v && v != Names::BUSY)
-        by_name.push_back({endpoints.name(v - 1), v - 1});
-    std::sort(by_name.begin(), by_name.end());
-    names.clear(), by_rank.clear();
-    for (auto [name, id] : by_name)
-      by_rank.push_back(id), names.push_back(name);
+  // pages of its own, handed back once the hour's text is written.
+  struct Line {
+    u32 id, n, p50, p95, p99, errors;
   };
-  // Hours are claimed smallest first. Each is handed back on its own, so the
-  // order is free: the first twelve, whose sort scratch is touched while
-  // every record is still held, are then the smallest, and the threads still
-  // finish close together (the largest hours, which come last in clock order
-  // too, are spread over all of them).
-  std::vector<int> order(HOURS);
-  std::barrier ranked(nt, [&]() noexcept {
-    for (int h = 0; h < HOURS; ++h)
-      most = std::max(most, filled[h].load()), order[h] = h;
-    std::sort(order.begin(), order.end(),
-              [](int a, int b) { return filled[a] < filled[b]; });
-    if (names.size() != endpoints.count)
-      rank_names();
-    hour_bytes = (names.size() * sizeof(Line) + 4095) & ~size_t(4095);
-    lines = (char *)mmap(nullptr, HOURS * hour_bytes, 3,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  });
-
-  auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
+  const size_t hour_bytes = (ID_MASK * sizeof(Line) + 4095) & ~size_t(4095);
+  char *lines = (char *)mmap(nullptr, HOURS * hour_bytes, 3,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  std::vector<u32> count(HOURS);
   std::vector<u64> at(HOURS + 1);
+  auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
+
+  std::mutex lock;
+  std::vector<std::unique_ptr<Ranking>> rankings;
+  auto ranking = [&]() -> const Ranking & {
+    std::lock_guard hold(lock);
+    if (rankings.empty() || rankings.back()->ids != endpoints.ids)
+      rankings.emplace_back(new Ranking);
+    return *rankings.back();
+  };
+
+  // Hour h, closed, is sorted by (endpoint rank, latency), the rank above a
+  // 20-bit latency in one 31-bit key, by a radix sort of three passes (10, 10
+  // and 11 bits) between its records and the unused rest of its region. Every
+  // group then comes out sorted at a known place, and its percentiles are
+  // read off by index. Latencies too large for 20 bits sort last in their
+  // group with the same key; their values are kept, sorted, in a short list.
+  auto finish = [&](int h, std::vector<u64> &big) {
+    if (active[h]) // a thread is filing into it: too late for this pass
+      return late.store(true);
+    const Ranking &rank = ranking();
+    const u32 ne = rank.by_rank.size();
+    u32 *keys = records + h * per_hour, *sorted = keys + filled[h], total = 0;
+    u32 low[1024] = {}, mid[1024] = {}, top[ID_MASK + 1] = {},
+        errors[ID_MASK + 1] = {};
+    big.clear();
+    for (u32 *r = keys; r < sorted; ++r) {
+      u32 x = *r;
+      if (!(x & ID_MASK)) // a place never written, at the end of a block
+        continue;
+      if (x >> KEY_BITS == PACKED_MAX) [[unlikely]]
+        big.push_back(u64(rank.rank_of[x & ID_MASK]) << 32 | *++r);
+      u32 e = rank.rank_of[x & ID_MASK], key = e << 20 | x >> KEY_BITS;
+      errors[e] += (x & ERR) != 0;
+      ++low[key & 1023], ++mid[key >> 10 & 1023], ++top[e];
+      keys[total++] = key;
+    }
+    auto pass = [total](const u32 *from, u32 *to, u32 *at, u32 buckets,
+                        int shift, u32 mask) {
+      for (u32 b = 0, sum = 0; b < buckets; ++b)
+        sum += std::exchange(at[b], sum);
+      for (u32 j = 0; j < total; ++j)
+        to[at[from[j] >> shift & mask]++] = from[j];
+    };
+    pass(keys, sorted, low, 1024, 0, 1023);
+    pass(sorted, keys, mid, 1024, 10, 1023);
+    pass(keys, sorted, top, ne, 20, ID_MASK);
+    std::sort(big.begin(), big.end());
+    u64 sz = 0;
+    for (u32 e = 0, from = 0, b = 0; e < ne; from = top[e++]) {
+      u32 n = top[e] - from, large = 0;
+      if (!n)
+        continue;
+      while (b + large < big.size() && big[b + large] >> 32 == e)
+        ++large;
+      // Nearest rank p is index ceil(p * n / 100) - 1.
+      u32 v[3], t = 0;
+      for (u32 p : {50, 95, 99}) {
+        u32 k = (p * n + 99) / 100 - 1;
+        v[t++] = k < n - large ? sorted[from + k] & PACKED_MAX
+                               : u32(big[b + k - (n - large)]);
+      }
+      b += large;
+      Line &l = ((Line *)(lines + h * hour_bytes))[count[h]++];
+      l = {rank.by_rank[e], n, v[0], v[1], v[2], errors[e]};
+      sz += 28 + endpoints.length[l.id];
+      for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
+        sz += width(x);
+    }
+    madvise(keys, (sorted + total - keys) * 4, MADV_DONTNEED);
+    at[h] = sz;
+  };
+
+  // The pass. Each thread closes and finishes the next hour once the first
+  // piece not yet parsed starts two hours after it (or every piece is
+  // parsed, if a pass was too late), and otherwise parses the next piece.
+  std::vector<Parser> parsers(nt);
+  std::vector<char> parsed(pieces + 1);
+  int front = 0, next_piece = 0, next_hour = 0, passes = 1;
+  bool stream = true;
+  // If the pass was too late, everything is handed back and it is redone.
+  std::barrier passed(nt, [&]() noexcept {
+    if (!late)
+      return;
+    madvise(records, HOURS * per_hour * 4, MADV_DONTNEED);
+    madvise(lines, HOURS * hour_bytes, MADV_DONTNEED);
+    for (int h = 0; h < HOURS; ++h)
+      filled[h] = active[h] = count[h] = 0, closed[h] = false;
+    for (auto &p : parsers)
+      p = Parser();
+    std::fill(parsed.begin(), parsed.end(), 0);
+    front = next_piece = next_hour = 0, stream = late = false, ++passes;
+  });
   char *text = nullptr;
   // Every hour is sized: offsets, then the output mapped at its final size.
   std::barrier sized(nt, [&]() noexcept {
@@ -345,87 +431,39 @@ int main() {
   std::vector<std::thread> pool;
   for (int t = 0; t < nt; ++t)
     pool.emplace_back([&, t] {
-      for (int k; (k = claim_piece++) < pieces;) {
-        parsers[t].run(log + cut[k], log + cut[k + 1]);
-        uintptr_t a = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095),
-                  b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
-        if (b > a)
-          madvise((void *)a, b - a, MADV_DONTNEED);
-      }
-      if (!ranking.test_and_set())
-        rank_names();
-      parsers[t].seal();
-      ranked.arrive_and_wait();
-      {
-        // Each hour is sorted by (endpoint rank, latency), the rank above a
-        // 20-bit latency in one 31-bit key, by a radix sort of three passes
-        // (10, 10 and 11 bits) between the hour's own record pages and one
-        // scratch array. Every group then comes out sorted, at a known place,
-        // and its percentiles are read off by index. Latencies too large for
-        // 20 bits sort last in their group with the same key; their values
-        // are kept, sorted, in a short list.
-        const u32 ne = names.size();
-        std::vector<u32> rank_of(Names::MAX);
-        for (u32 e = 0; e < ne; ++e)
-          rank_of[by_rank[e]] = e;
-        std::unique_ptr<u32[]> scratch(new u32[most]);
-        std::vector<u64> big;
-        for (int i; (i = claim++) < HOURS;) {
-          int h = order[i];
-          u32 *keys = records + h * per_hour, *sorted = scratch.get(), total = 0;
-          u32 low[1024] = {}, mid[1024] = {}, top[Names::MAX] = {},
-              errors[Names::MAX] = {};
-          big.clear();
-          for (u32 *r = keys, *end = r + filled[h]; r < end; ++r) {
-            u32 x = *r;
-            if ((x | ID_MASK | ERR) == SPARE) [[unlikely]] {
-              if (x == SPARE)
-                continue;
-              big.push_back(u64(rank_of[x & ID_MASK]) << 32 | *++r);
-            }
-            u32 rank = rank_of[x & ID_MASK], key = rank << 20 | x >> KEY_BITS;
-            errors[rank] += (x & ERR) != 0;
-            ++low[key & 1023], ++mid[key >> 10 & 1023], ++top[rank];
-            keys[total++] = key;
+      std::vector<u64> big;
+      for (int pass = 0; pass < passes; ++pass) {
+        while (!late) {
+          int h = -1, k = -1;
+          {
+            std::lock_guard hold(lock);
+            while (front < pieces && parsed[front])
+              ++front;
+            if (next_hour < HOURS &&
+                (front == pieces || (stream && first[front] >= next_hour + 2)))
+              h = next_hour++, closed[h] = true;
+            else if (next_piece < pieces)
+              k = next_piece++;
+            else if (next_hour == HOURS)
+              break;
           }
-          auto pass = [total](const u32 *from, u32 *to, u32 *at, u32 buckets,
-                              int shift, u32 mask) {
-            for (u32 b = 0, sum = 0; b < buckets; ++b)
-              sum += std::exchange(at[b], sum);
-            for (u32 j = 0; j < total; ++j)
-              to[at[from[j] >> shift & mask]++] = from[j];
-          };
-          pass(keys, sorted, low, 1024, 0, 1023);
-          pass(sorted, keys, mid, 1024, 10, 1023);
-          pass(keys, sorted, top, ne, 20, 2047);
-          madvise(records + h * per_hour, filled[h] * 4, MADV_DONTNEED);
-          std::sort(big.begin(), big.end());
-          u64 sz = 0;
-          for (u32 e = 0, from = 0, b = 0; e < ne; from = top[e++]) {
-            u32 n = top[e] - from, large = 0;
-            if (!n)
-              continue;
-            while (b + large < big.size() && big[b + large] >> 32 == e)
-              ++large;
-            // Nearest rank p is index ceil(p * n / 100) - 1.
-            u32 v[3], t = 0;
-            for (u32 p : {50, 95, 99}) {
-              u32 k = (p * n + 99) / 100 - 1;
-              v[t++] = k < n - large ? sorted[from + k] & PACKED_MAX
-                                     : u32(big[b + k - (n - large)]);
-            }
-            b += large;
-            Line &l = ((Line *)(lines + h * hour_bytes))[count[h]++];
-            l = {e, n, v[0], v[1], v[2], errors[e]};
-            sz += 28 + names[e].size();
-            for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
-              sz += width(x);
-          }
-          at[h] = sz;
+          if (h >= 0)
+            finish(h, big);
+          else if (k >= 0) {
+            parsers[t].run(log + cut[k], log + cut[k + 1]);
+            uintptr_t a = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095),
+                      b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
+            if (b > a)
+              madvise((void *)a, b - a, MADV_DONTNEED);
+            std::lock_guard hold(lock);
+            parsed[k] = true;
+          } else
+            std::this_thread::yield();
         }
+        passed.arrive_and_wait();
       }
       sized.arrive_and_wait();
-      for (int h; (h = claim_text++) < HOURS;) {
+      for (int h = t; h < HOURS; h += nt) {
         char label[32];
         int day = (h + 18) / 24;
         snprintf(label, 32, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
@@ -433,8 +471,9 @@ int main() {
         char *o = text + at[h];
         for (u32 i = 0; i < count[h]; ++i) {
           const Line &l = ((Line *)(lines + h * hour_bytes))[i];
+          std::string_view name = endpoints.name(l.id);
           o = std::copy_n(label, 21, o);
-          o = std::copy(names[l.e].begin(), names[l.e].end(), o);
+          o = std::copy(name.begin(), name.end(), o);
           for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
             *o = ' ', o += 1 + width(x), put(o, x);
           *o++ = '\n';
