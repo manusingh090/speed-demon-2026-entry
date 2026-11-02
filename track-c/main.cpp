@@ -290,7 +290,7 @@ void parse_records(int fd, size_t from, size_t to, size_t file_size, const u8* c
     // A window holds the record cut off at the last one's end, then what the
     // read adds; 64 spare bytes before it for the eight-byte number loads and
     // 64 zeros after the data for the block loads.
-    constexpr size_t WINDOW = 16 << 10;
+    constexpr size_t WINDOW = 64 << 10;
     alignas(64) char space[64 + WINDOW + 64];
     char* const buf = space + 64;
     const char *p = buf, *end = buf;
