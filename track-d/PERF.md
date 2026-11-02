@@ -59,7 +59,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 35 | The BFS records each node's place as it claims it and where its row starts, so the id pass goes and each thread packs its own ids' offsets; the parse takes pieces in turn; the edge passes split all regions evenly | run-6a048c2af883 | 0.1273 s | 66 MiB | 70.78 |
 | 36 | Back to step 34's code (no board run of its own: superseded by the diagnostic) | | | | |
 | 36d | Diagnostic: time to the first search reported through M, time to the end of the BFS through T | run-0a5e9b7be14b | (1.184 s) | (276 MiB) | |
-| 37 | Back to step 34's code | pending | | | |
+| 37 | Back to step 34's code | run-d2d4f27e8067 (also run-5fc51c420d92) | 0.1267 (0.1361) s | 55 MiB | 71.77 (70.96) |
 
 ## What the profile said, step by step
 
@@ -188,6 +188,13 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Step 35 on the board, and step 36.** run-6a048c2af883: 0.1273 s against 0.1275 for step 34, so no time gained, and 66 MiB against 55: the per-thread lists of row starts (7 MB in all) and the 7 MB place array live during the BFS next to the old graph, the BFS queues and the new edge array, which made the BFS the peak (69 MB locally against 57). Step 36 is step 34's code again.
 
 **Third diagnostic.** With the bucket queues the search share had changed, so the box was asked again, two marks at once: the time at which the searches start goes into M as before (200 MiB plus one per millisecond), and the time at which the BFS ends goes into T, the run sleeping until 1000 ms plus four times that mark. run-0a5e9b7be14b reported 289,488,896 bytes and 1.1844 s: on the box the BFS ends about 46 ms after exec and the searches start at about 72 ms. With step 34's 0.1275 s, that is about 18 ms of parse, 28 ms of part build and BFS, 26 ms of the passes after the BFS (ids, packing, mapping, reverse graph) and 55 ms of searches, release and exit. Step 37 is step 34's code again.
+
+**Measured after step 34 and kept out.** Each was correct on all thirty datasets; none beat step 34 on the laptop, where `perf stat` cycles were the tiebreaker since twelve-thread wall times swung by 30% with other work on the machine.
+
+- *Which side grows.* Settles over the 2,000 queries: 7,123,841 growing the side with the shorter queue (as now), 7,159,369 alternating strictly, 14,316,127 growing the side with the smaller minimum key.
+- *Prefetching the group bases too* (at a push in the search, and 8 entries ahead in the BFS, where only the offset bytes were prefetched): no change in cycles.
+- *A reverse graph that mirrors the forward one.* 2.9% of edges have no edge back (measured on the sample; 8% of nodes have such an edge coming in). So the reverse graph can share the forward offsets: the slot of v -> u holds u and the weight of u -> v, found by scanning u's row (nearby in the blob order), or a dead self-loop of weight 0, and the one-way edges go into a small graph of their own. That removes the in-degree count, its prefix sum, the atomic placement and the second packing. It cost more than it saved: 1 billion more instructions and 0.8 billion more cycles, from the row scans, the side graph's offsets and the backward search's loop over two graphs.
+- *Two searches per thread, a settle of each in turn* (interleaved execution, as AMAC, Kocberber et al., VLDB 2015, and coroutine interleaving, Psaropoulos et al., VLDB 2017, do for pointer chasing): the idea is that while one search's settle waits on memory the core has the other's to work on. On the laptop it took 11% more cycles (3.45 to 3.49 against 3.08 to 3.17 billion): the second search's distance pages and queue compete for the same caches, and the hyperthread already provides the overlap.
 
 ## Tried and kept out
 
