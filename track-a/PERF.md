@@ -70,7 +70,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 62 | Step 61 with an hour closed once the first unparsed piece starts 30 minutes into the next hour, instead of two whole hours after it | run-624b12bf8ac6 | 0.0198 s | 13.8 MiB | 85.78 |
 | 63 | Step 62 with the parse in batches of 8 lines and three stages: decode and hash every line, load every line's table slot, then confirm the names and file the records | run-27928bcc100e | 0.0233 s | 14.6 MiB | 83.57 |
 | 64 | Back to step 62's code (no board run of its own: superseded by step 65) | | | | |
-| 65 | Step 62 with each hour's text unmapped (`MADV_DONTNEED` on the shared output mapping) by the thread that wrote it, right after writing it, instead of all 10 MB of it by one thread at exit | pending | | | |
+| 65 | Step 62 with each hour's text unmapped (`MADV_DONTNEED` on the shared output mapping) by the thread that wrote it, right after writing it, instead of all 10 MB of it by one thread at exit | run-030d7c2f06ec | 0.0199 s | 13.95 MiB | 85.67 |
+| 66 | Back to step 62's code | pending | | | |
 
 ## Local measurements
 
@@ -239,6 +240,8 @@ Step 58 is a new program built on that floor. The pieces are claimed in order, a
 **Step 63 on the board, and step 64.** run-27928bcc100e: 0.0233 s, 14.6 MiB, 83.57 points, against 0.0198 s for step 62. Track B's unchanged code ran its usual time in the same push (0.128 s), Track D's ran about 10% slow, so the batched parse is slower on the box as well, by more than the box's spread; its 75M extra instructions are not paid back by the overlapped loads. Step 64 is step 62's code again.
 
 **Step 64 to 65: the output's teardown.** The text goes straight into a shared mapping of the output file, about 2,500 pages, and their page-table entries were all removed by the exit, on one thread, inside the measured time (the same cost that step 18 took off the log's mapping). Now each thread drops the range of an hour's text from the mapping as soon as it has written it. On a shared mapping of a tmpfs file `MADV_DONTNEED` only removes the entries: the text stays in the file's pages, and a thread still writing a neighbouring hour into a page so dropped just maps it again with its contents. Three `perf stat -r 10` rounds: the same instructions and kernel cycles (the work only moves), wall time lower in all three (0.0348, 0.0234, 0.0217 s against 0.0437, 0.0243, 0.0225). Same hash on all eight datasets. Four lines more.
+
+**Step 65 on the board, and step 66.** run-030d7c2f06ec: 0.0199 s and 13.95 MiB against step 62's 0.0198 s and 13.8 MiB, so the output mapping's teardown was not costing the box anything it can show (its exit unmaps 2,500 entries in well under its spread). Step 66 is step 62's code again, two lines shorter.
 
 ## Tried and kept out
 

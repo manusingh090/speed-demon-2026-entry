@@ -355,10 +355,6 @@ int main() {
       *o++ = '\n';
     }
     madvise(lines + h * hour_bytes, hour_bytes, MADV_DONTNEED);
-    // The text stays in the file; dropping its mapping here, on this thread,
-    // spares the exit unmapping all of it on one.
-    uintptr_t a = uintptr_t(text + at[h]) & ~uintptr_t(4095);
-    madvise((void *)a, uintptr_t(o) - a, MADV_DONTNEED);
   };
 
   std::mutex lock;
