@@ -2,6 +2,17 @@
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
+## Where it stands
+
+Best run: **run-42430f7979bf**, 0.0228 s, 8.15 MiB, 425 counted lines, 81.93 points (step 48). The reference takes 14.44 s. The decisions that moved it most, each measured below:
+
+- **A 64-byte structural scan**: quotes, commas and LFs as bit masks, the inside of quotes from a carry-less multiply by all ones, so `""` escapes and quoted commas and LFs need no special case; text lengths come from quote counts, so nothing is unescaped.
+- **A prefetch pipeline for the three random reads** (region row, name slot, bitset word), 16 records ahead: switched off (step 9), the box went from 0.0336 to 0.0456 s.
+- **Distinct names as per-country bitsets marked by atomic OR**, the OR's old bit doubling as the count (step 7), so no counting pass.
+- **Each parsed piece unmapped by its thread** (step 21): 0.0322 to 0.0288 s.
+- **The bitsets on 2 MB pages** (step 36): nearly every mark had missed the first-level TLB.
+- **Measured and dropped**: two Rust ports, loop fission (15% slower on the box), a record-anchored parse, `pread` buffers, a rank-and-select region table, dense name numbers, guided pieces and a 2 MB-aligned file mapping.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 14.44 | 367 | 0 |
@@ -10,11 +21,11 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Shared tables populated up front instead of faulted in by twelve threads; the region lookup and the per-country sums moved into the prefetch pipeline | run-ee8f16604d56 | 0.0556 | 13.5 | 70.27 |
 | 4 | Name keys of 16 bytes (exact up to 16 bytes, first 8 bytes plus a tail hash beyond) in one 2 MB table claimed by 16-byte CAS, instead of tags, 32-byte slots and an arena; shared tables populated by all threads in parallel | run-09adfa1681cb | 0.0384 | 10.3 | 75.54 |
 | 5 | Amount decoded as one number with its dot dropped; names marked with a plain atomic OR, no test first | run-74059dd5273c | 0.0414 | 10.4 | 74.67 |
-| 6 | Records read field by field instead of by a 64-byte structural mask: a short number's comma found in one 8-byte word, a quoted field's end by jumping from quote to quote (a "" pair is an escape), so commas and LFs inside quotes cost nothing; every phase cut into pieces any thread claims | pending | | | |
+| 6 | Records read field by field instead of by a 64-byte structural mask: a short number's comma found in one 8-byte word, a quoted field's end by jumping from quote to quote (a "" pair is an escape), so commas and LFs inside quotes cost nothing; every phase cut into pieces any thread claims | not run on its own (step 7 followed before its run) | | | |
 | 7 | Distinct names counted as they are marked (the atomic OR returns the old bit), so the pass that counted the bitsets and its phase are gone | run-7c33f663bba6 | 0.0344 s | 8.8 MiB | 77.50 |
 | 8 | Shorter hops along each record: a quoted field's "" pairs stepped through on one 64-byte quote mask; the region's comma and the LF found from one 32-byte load | run-34b96c7278cc | 0.0336 s | 9.7 MiB | 77.17 |
 | 9 | Experiment: no prefetch pipeline; each record's country, name and mark looked up directly | run-2679bcc841c0 | 0.0456 s | 9.7 MiB | 74.18 |
-| 10 | Back to the code of step 8: the pipeline pays on the box too | pending | | | |
+| 10 | Back to the code of step 8: the pipeline pays on the box too | no run of its own | | | |
 | 11 | Each record prefetches the file 2 KB ahead, into the next page before the parse reaches it | run-7951b634b59d | 0.0324 s | 9.4 MiB | 77.72 |
 | 12 | The file prefetched 4 KB ahead instead of 2 KB | run-7027be66c015 | 0.0363 s | 8.9 MiB | 76.73 |
 | 13 | Two lines prefetched per record, 2 KB ahead (a record is about 61 bytes, so one a record leaves some lines out) | run-10abfda06ca4 | 0.0325 s | 9.4 MiB | 77.67 |
@@ -22,9 +33,9 @@ Every step from the reference to your final version, each with the live-board ru
 | 15 | Lookups pipelined 32 records ahead instead of 16 | run-ada2e4fafc21 | 0.0329 s | 9.0 MiB | 77.70 |
 | 16 | LAG 16 again; records.csv cut into eight pieces per thread instead of four | run-5158cda3eca9 | 0.0322 s | 8.5 MiB | 78.18 |
 | 17 | Sixteen pieces per thread | run-bdca4d9490bd | 0.0339 s | 9.2 MiB | 77.30 |
-| 18 | Back to eight pieces per thread (step 16's code) | pending | | | |
+| 18 | Back to eight pieces per thread (step 16's code) | no run of its own | | | |
 | 19 | The name bitsets on two 2 MB pages, populated in `main` before huge pages are turned off for the rest of the process | run-97ebf138523d | 0.0325 s | 9.4 MiB | 77.65 |
-| 20 | Back to step 16's code | pending | | | |
+| 20 | Back to step 16's code | no run of its own | | | |
 | 21 | Each parsed piece's file pages unmapped (`MADV_DONTNEED`) by the thread that parsed it, instead of all 202 MB at exit by one | run-ed042f9337ff | 0.0288 s | 8.7 MiB | 79.33 |
 | 22 | A rewrite of step 21: an unquoted field's comma found in one 8-byte word when near, regions.csv's pages handed back once the region table is filled, and the amount's sign folded into one expression | run-ca2f6e33b6bd | 0.0287 s | 10.1 MiB | 78.69 |
 | 23 | Back to step 21's code | run-e26eab700d90 | 0.0286 s | 8.7 MiB | 79.36 |

@@ -4,7 +4,7 @@
 // rest of the log is still being parsed.
 //
 // Parse. The log is memory-mapped and cut into line-aligned pieces, eight per
-// thread, claimed in order. The line ends of each 64-byte block are found at
+// thread, claimed in order, smaller towards the end so threads finish together. The line ends of each 64-byte block are found at
 // once, so no line waits on the parse of the one before; a line is then read
 // from both ends. The timestamp is always 27 bytes and the 72-hour span is
 // fixed, so a line's hour comes from its day and hour digits alone.

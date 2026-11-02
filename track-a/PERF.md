@@ -2,16 +2,26 @@
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
+## Where it stands
+
+Best run: **run-387221618ac3**, 0.0190 s, 14.45 MiB, 400 counted lines, 86.04 points (step 62's code; step 67 adds guided pieces, measured at 0.0193 to 0.0196 s). The reference takes 32.05 s. The decisions that moved it most, each measured below:
+
+- **One pass, hours finished while parsing** (step 58): the log is in about clock order, so an hour is sorted and sized once the parse has moved past it, and only the open hours hold records. Memory 17.4 to 13.8 MiB (step 62), with a second pass as the exact fallback when a line arrives late.
+- **Unmapping each parsed piece on its own thread** (step 18): the exit had been tearing down 58,000 page-table entries on one thread; 0.026 to 0.0215 s.
+- **Lines from a bitmap of line ends, read from both ends** (step 56), and **a 16 KB lock-free endpoint table** whose name check reuses the loads that found the name's end.
+- **Each hour radix-sorted on (endpoint rank, latency) keys** (step 57): every group comes out sorted, so p50, p95 and p99 are read off by index.
+- **Measured and dropped**: a Rust port, a streaming design, AVX2 partitioning (its tables cost more lines than its 2% gain), populating the log in calls, a batched parse (15% slower on the box), and the output's teardown moved off the exit.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
-| 1 | C++: mmap, 12 threads, records per hour in blocks, per-hour counting sort and nth_element, writer thread | pending | | | |
+| 1 | C++: mmap, 12 threads, records per hour in blocks, per-hour counting sort and nth_element, writer thread | before registration (laptop only) | | | |
 | 2 | Same design in 222 formatted lines instead of 373 | run-3c1dcbde6115 | 0.0293 | 31.8 | 79.7 |
 | 3 | One thread pool with a barrier; each hour written with pwrite at an offset handed on by the hour before, instead of per-hour strings and a writer thread; chunks released from the front of each region in 256 KB batches instead of one madvise per chunk; THP off | run-ab09a84f93b8 | 0.0310 | 20 | 80.64 |
 | 4 | Hours computed into compact per-group numbers with their exact text size, then formatted straight into the mapped output file at known offsets; endpoint names compared with one 32-byte SIMD compare | run-b962d6b976eb | 0.0301 | 20 | 80.47 |
 | 5 | Step 4 trimmed from 301 to 271 counted lines: digit width by recursion, shorter error paths, unused includes and fields dropped, the three selections as one loop | run-20c5a50e4cb0 | 0.0301 | 21 | 80.69 |
 | 6 | Rust port of step 5, same design; rustfmt-counted code trimmed from 444 to 341 lines | run-2048094dbc8d | 0.0323 | 20.9 | 79.14 |
-| 7 | Back to the C++ of step 5: on the box the Rust port was no faster and counts 349 lines against 271 | pending | | | |
+| 7 | Back to the C++ of step 5: on the box the Rust port was no faster and counts 349 lines against 271 | no run of its own | | | |
 | 8 | One lock-free endpoint table shared by all threads (no per-thread tables, no merge), names copied into one compact arena; branch-free selection for the percentiles; 13-bit record keys | run-3b736d2f0408 | 0.0279 | 21 | 81.08 |
 | 9 | Chunks handed back in 64 KB batches instead of 256 KB; every remaining chunk and each thread's sort scratch freed before the output's pages start to count | run-0fb87a6d8f1a | 0.0280 | 18.6 | 81.56 |
 | 10 | Each thread's sort scratch sized once for the largest hour (a growing buffer is remapped, which stalls every thread's page faults); endpoint names up to 64 bytes compared in two AVX2 steps | run-0ee3487c8434 | 0.0269 | 19.6 | 81.68 |
@@ -19,46 +29,46 @@ Every step from the reference to your final version, each with the live-board ru
 | 12 | Each line prefetches the log 2 KB ahead, into the next page before the parse reaches it | run-e0e1b7e99d99 | 0.0290 s | 17.9 MiB | 81.13 |
 | 13 | No prefetch (step 11's parse); an output left by an earlier run is deleted by one thread while the others parse, and the file is created once its size is known | run-4746252bf871 | 0.0263 s | 18.1 MiB | 82.16 |
 | 14 | Step 13's output handling undone; each piece's line-aligned ends found by the thread that claims it instead of all 96 by `main` before the threads start | run-04a166e09845 | 0.0264 s | 18.5 MiB | 82.01 |
-| 15 | Back to step 11's code | pending | | | |
+| 15 | Back to step 11's code | no run of its own | | | |
 | 16 | Diagnostic: each hour's sort and selections done twice, the first result thrown away (same output), so the extra time is the hour phase's cost on the box | run-7f4f12386a23 | 0.0315 s | 19.1 MiB | 79.75 |
 | 17 | Diagnostic: each piece parsed twice, the first time into a parser that is then dropped (same output) | run-f846b47b55e9 | 0.0395 s | 32.6 MiB | 75.15 |
 | 18 | Step 11's code, and each parsed piece's log pages unmapped (`MADV_DONTNEED`) by the thread that parsed it | run-1bfda4424f2e | 0.0215 s | 18.1 MiB | 84.30 |
 | 19 | Sixteen pieces per thread instead of eight | run-df667e59ec60 | 0.0246 s | 18.9 MiB | 82.67 |
 | 20 | Four pieces per thread | run-47a955df5a0a | 0.0257 s | 18.1 MiB | 82.37 |
-| 21 | Back to step 18's code (eight pieces) | pending | | | |
+| 21 | Back to step 18's code (eight pieces) | no run of its own | | | |
 | 22 | Endpoint table probed four slots at a time with AVX2 on a 44-bit tag (CRC32 of the first, middle and last eight bytes, and the length); per-hour counts kept during the parse instead of walking the chunks for the largest hour; a claim-and-count phase helper in place of `std::barrier`; all hours' lines in one block | run-8d2ebb562c15 | 0.0286 s | 17.7 MiB | 81.22 |
-| 23 | Back to step 18's code | pending | | | |
+| 23 | Back to step 18's code | no run of its own | | | |
 | 24 | Endpoint table of 8,192 slots with dense ids from a counter, a 20-bit hash tag and the length checked before the name compare; code in 308 counted lines instead of 327 | run-645ac82c679c | 0.0212 s | 18.0 MiB | 84.66 |
-| 25 | Step 24's code with its explanatory comments (no counted line changes) | pending | | | |
+| 25 | Step 24's code with its explanatory comments (no counted line changes) | no run of its own (comments only, counted lines unchanged) | | | |
 | 26 | The line's end from one 32-byte compare after the status code (a latency has at most 10 digits), so the parse keeps one mask of spaces instead of masks of spaces and LFs | run-028f1cfc1335 | 0.0227 s | 21.7 MiB | 83.14 |
-| 27 | Back to step 25's code | pending | | | |
+| 27 | Back to step 25's code | no run of its own | | | |
 | 28 | Slot index as the endpoint id (no id counter), table of 4,096 slots instead of 8,192, full CRC32 as the tag, selection with min/max shortcuts; comments dropped | run-9e40422cd8dd | 0.0214 s | 18.4 MiB | 84.48 |
-| 29 | Back to step 25's code | pending | | | |
+| 29 | Back to step 25's code | no run of its own | | | |
 | 30 | Step 28's slot-index design with the new-name path in a cold function and the tag and length checked in one compare | run-ca5c5bb4e74e | 0.0249 s | 18.1 MiB | 82.81 |
 | 31 | Step 25's code with the new-name path in a cold function and the tag and length checked in one compare | run-4495020c482a | 0.0215 s | 18.1 MiB | 84.44 |
 | 32 | Step 25's code with hours claimed largest first, each hour's record chunks dropped once copied, and the hours' lines in one mapping dropped hour by hour | run-66f7769c3c99 | 0.0246 s | 19.8 MiB | 82.60 |
-| 33 | Back to step 25's code | pending | | | |
+| 33 | Back to step 25's code | no run of its own | | | |
 | 34 | Names ranked by the first thread out of parse pieces instead of in the barrier (ranked again there only if a name was added since); each thread adds its own hours' sizes before arriving | run-c8150ed94bf1 | 0.0212 s | 18.3 MiB | 84.51 |
 | 35 | Step 34 with the last day's 24 hours claimed largest first | run-14696925a546 | 0.0216 s | 18.4 MiB | 84.21 |
 | 36 | Step 34 with the hour index reused while a line's month, day and hour bytes repeat, and the line's end from one compare after the status code | run-fc08aa106d6a | 0.0218 s | 18.4 MiB | 84.14 |
 | 37 | Diagnostic: step 36 plus, after the output is complete, one 4 KB page touched per 4 us from main's start to the end of the hour phase, so the board's M reports that time | run-325790fcd8d4 | 0.0295 s | 35.7 MiB | 77.83 |
-| 38 | Back to step 36's code | pending | | | |
+| 38 | Back to step 36's code | no run of its own | | | |
 | 39 | Step 36 with each number written backwards over its known width, two digits at a time from a 200-byte table of digit pairs, instead of `std::to_chars` | run-114c2ade0b3c | 0.0214 s | 18.7 MiB | 84.17 |
 | 40 | Step 39 with hours counted and scattered by endpoint id (ranks only order the prefix sums), and latencies of up to 7 digits found and decoded in one 64-bit word | run-cf87e55b8244 | 0.0212 s | 18.3 MiB | 84.28 |
 | 41 | Step 40 with each log piece mapped by one `MADV_POPULATE_READ` before it is parsed and each hour's output range by one `MADV_POPULATE_WRITE` before it is written | run-8757e6690a35 | 0.0228 s | 18.0 MiB | 83.49 |
 | 42 | Diagnostic: step 40's code on 6 threads instead of 12 | run-ed5a4d281ae4 | 0.0284 s | 16.6 MiB | 81.51 |
-| 43 | Back to step 40's code | pending | | | |
+| 43 | Back to step 40's code | no run of its own | | | |
 | 44 | Each hour's records in one region filled by every thread in 4 KB blocks and handed back with one call once copied into the sort scratch; hours' lines in one mapping handed back hour by hour; hours claimed smallest first | run-545cc82ae638 | 0.0229 s | 17.7 MiB | 83.60 |
 | 44b | Step 44's code again in later runs (best) | run-a5cbcba2db02 | 0.0203 s | 18.1 MiB | 84.84 |
 | 45 | New program: hours closed while the log is parsed, text written as soon as earlier hours are sized, redo with every hour open if any line is too late | run-768708337db7 | 0.0220 s | 18.5 MiB | 83.48 |
-| 46 | Back to step 44's code | pending | | | |
+| 46 | Back to step 44's code | no run of its own | | | |
 | 47 | Step 44 with the SIMD latency decoder dropped: latencies of 8 or more digits (rare) read digit by digit | run-23037798f1c8 | 0.0226 s | 17.6 MiB | 83.92 |
 | 48 | Diagnostic: step 47 with the time from main's start to the end of the parse reported through M (one page per 4 us, touched after the output is complete) | run-007acf4500a8 | 0.0261 s | 25.7 MiB | 80.58 |
-| 49 | Back to step 47's code | pending | | | |
+| 49 | Back to step 47's code | no run of its own | | | |
 | 50 | Groups of 16 or fewer sorted by Batcher's 63-pair odd-even merge network (its first 19 pairs for 8 or fewer) instead of three chained selections | run-dabeae4d5c50 | 0.0214 s | 17.4 MiB | 84.30 |
 | 51 | Step 50 with the log fetched 1 KB ahead of each line with the non-temporal prefetch hint | run-0d7c54395879 | 0.0207 s | 17.7 MiB | 84.59 |
 | 52 | Groups of more than 128 records partitioned eight at a time with AVX2 (lookup-table compress into two buffers) | run-8a311a6f0910 | 0.0203 s | 18.4 MiB | 83.96 |
-| 53 | Step 52 with the permutation tables replaced by BMI2 (`pdep` spreads the mask to bytes, `pext` gathers the lane indices) and a shorter recursion | pending | | | |
+| 53 | Step 52 with the permutation tables replaced by BMI2 (`pdep` spreads the mask to bytes, `pext` gathers the lane indices) and a shorter recursion | not run on its own (step 54 replaced it before its run) | | | |
 | 54 | Latencies of 2^19 - 1 or more stored in the hour's region as an escape record followed by the raw value, instead of 864 per-thread side vectors | run-b114f738369d | 0.0204 s | 17.4 MiB | 84.42 |
 | 55 | Step 51 (no AVX2 selection) with step 54's in-region escapes | run-2ffb5eb89fd7 | 0.0242 s | 16.75 MiB | 83.11 |
 | 56 | New parse: each 64-byte block's line ends found at once and lines taken bit by bit, each line read from both ends; a 16 KB slot table with names 128 bytes apart, confirmed by the loads that found the name's end; the hour's record cursor kept in registers | run-f533abb4fe14 | 0.0203 s | 16.9 MiB | 84.75 |

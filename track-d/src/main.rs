@@ -15,8 +15,9 @@
 //!    copying each node's edges into its own region of the new edge array as
 //!    it orders it; one pass then maps the heads to new ids and counts the
 //!    in-degrees, and the graph is reversed.
-//! 4. Bidirectional Dijkstra per query, with 4-ary heaps and distances kept in
-//!    pages handed out on first touch, as u32 unless the answer may not fit.
+//! 4. Bidirectional Dijkstra per query, with bucket queues (Dial's algorithm:
+//!    the weights are small integers) and distances kept in pages handed out
+//!    on first touch, as u32 unless the answer may not fit.
 //!    A target with no in-edge is -1 at once. The graph's pages are handed
 //!    back on every thread at the end, so the exit has little left to free.
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};

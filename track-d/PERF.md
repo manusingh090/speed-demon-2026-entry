@@ -2,15 +2,25 @@
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
+## Where it stands
+
+Best run: **run-c8d89b3d1e46**, 0.1260 s, 55.07 MiB, 705 counted lines, 71.81 points (step 34's code). The reference takes 72.69 s. The decisions that moved it most, each measured below:
+
+- **Renumbering nodes for locality**: node ids are a random relabelling, which cost about 480 ns per settled node. Compact 512-node BFS blobs (step 4) put a road neighbourhood on a few cache lines, and since step 31 the BFS copies each node's edges into the new order as it orders it.
+- **Bidirectional Dijkstra with distances in recycled 4 KB pages**: about 7.1 million settled nodes for 2,000 queries, in a few MB a thread instead of 167 MB of dense arrays.
+- **Packed offsets** (step 26): a u32 per 8 nodes plus a byte per node, 61 to 55 MiB.
+- **Dial's bucket queue instead of a 4-ary heap** (step 33): the heap's pop was 45% of the search; 0.144 to 0.1275 s.
+- **Measured and dropped**: contraction hierarchies and ALT (preprocessing costs more than all 2,000 queries), chain contraction, huge pages for the graph, a mirrored reverse graph, interleaving two searches per thread, longest-first query order, and a fused build that raised memory to 66 MiB.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 72.69 | 893 | 0 |
-| 1 | C++: parallel two-pass CSR build over mmap, Dijkstra per query on 12 threads with a binary heap, -1 for targets with no in-edge | pending | | | |
-| 2 | Nodes renumbered by level-synchronous parallel BFS, radix heap | pending | | | |
-| 3 | BFS in 12 regions without barriers, CSR copied into the new numbering | pending | | | |
-| 4 | Compact 512-node blobs chained across the map, distances in recycled 4 KB pages, final CSR placed by a third parse | pending | | | |
-| 5 | Weights kept from the second pass; CSR copied into the new numbering in two stages instead of a third parse | pending | | | |
-| 6 | malloc mmap threshold pinned, so freed build arrays really go back | pending | | | |
+| 1 | C++: parallel two-pass CSR build over mmap, Dijkstra per query on 12 threads with a binary heap, -1 for targets with no in-edge | before registration (laptop only) | | | |
+| 2 | Nodes renumbered by level-synchronous parallel BFS, radix heap | before registration (laptop only) | | | |
+| 3 | BFS in 12 regions without barriers, CSR copied into the new numbering | before registration (laptop only) | | | |
+| 4 | Compact 512-node blobs chained across the map, distances in recycled 4 KB pages, final CSR placed by a third parse | before registration (laptop only) | | | |
+| 5 | Weights kept from the second pass; CSR copied into the new numbering in two stages instead of a third parse | measured together with step 6 | | | |
+| 6 | malloc mmap threshold pinned, so freed build arrays really go back | run-e87fa4aef6e8 | 0.3766 s | 79.6 MiB | 61.04 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -48,9 +58,9 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 25 | Renumbering walks the old edge list with a cursor, so the old offsets are freed first; the old graph is freed by all threads before the reverse graph is allocated | run-c59f249b924d | 0.161 s | 61 MiB | 69.15 |
 | 26 | Edge offsets packed: a u32 per 8 nodes and a byte per node (plain u32s if a group overflows a byte), for the old, new and reverse graphs | run-388cd0d32097 | 0.157 s | 55 MiB | 69.68 |
 | 26d | Diagnostic: time to the end of the parse reported through M | run-806bba02eb3c | (0.246 s) | (222 MiB) | |
-| 27 | Back to step 26's code | pending | | | |
+| 27 | Back to step 26's code | no run of its own | | | |
 | 28 | Reverse graph counted and placed with plain increments, each thread owning its share's nodes; edges into another share handed over | run-62ef9877e352 | 0.159 s | 55 MiB | 69.41 |
-| 29 | Back to step 26's code | pending | | | |
+| 29 | Back to step 26's code | no run of its own | | | |
 | 30 | Offsets packed group by group; the distance lookup's fast path inlined, the page hand-out out of line | run-3abb5a273094 | 0.157 s | 55 MiB | 69.66 |
 | 31 | The BFS copies each node's edges into its thread's region of the new edge array as it orders it; one pass maps heads and counts in-degrees (no renumbering pass, no separate count) | run-7a0d6f42cbe9 (best run-851a07a5ae88) | 0.154 (0.151) s | 55 MiB | 69.90 (70.03) |
 | 32 | The BFS no longer prefetches its heads' claim flags | run-70e8045774b8 (best run-5084ada06aad) | 0.152 (0.144) s | 55 MiB | 70.00 (70.60) |
