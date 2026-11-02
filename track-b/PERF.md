@@ -2,19 +2,31 @@
 
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
+## Where it stands
+
+Best run: **run-be2f78572d3a**, 0.0907 s, 41.4 MiB, 1,103 counted lines, **78.70 points** (step 102's code). The reference takes 56.35 s.
+
+The decisions that mattered, in order of what they bought:
+
+- **Answer only the queries' terms** (step 1): a token that is no query term costs one hash and one table read.
+- **Bitmaps for common terms, 16-bit lists for the rest**, chosen from a sample at run time (steps 3, 11), and **phrases checked during the scan** at their rarest word, so no positions are stored (steps 16, 85 to 88).
+- **Serial work off the critical path**: reading the queries with SIMD class masks instead of byte by byte was worth 10 ms on the box (step 92); the box rewards less serial work and fewer cache misses far more than fewer instructions (steps 87 to 89).
+- **The phased design** (step 102): the corpus in phases of about 50 MiB, each answered into running per-query results, so no full index exists. 14% faster than the best single-index version (step 99) and 6.4 MiB smaller.
+- Measured and kept out: a 1 MB term table (step 90), a lower list-to-bitmap threshold (step 96), and many smaller ideas listed under each session.
+
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | The reference, unchanged | | 56.35 | 2,200 | 0 |
-| 1 | C++ rewrite: read queries first, index only their terms, 12-thread tokenize over mmap, galloping set ops, phrase check on candidates only | pending | | | |
-| 2 | Phrase check compares bytes instead of re-tokenizing and hashing candidates | pending | | | |
-| 3 | Terms in over 1/32 of docs become bitmaps, chosen from a 1/32 sample | pending | | | |
-| 4 | Keys loaded 8 bytes at a time, cheaper hash, table load 1/2 | pending | | | |
-| 5 | AVX2 scan for the phrase anchor's first letter | pending | | | |
-| 6 | BOOL results stay a bitmap once a bitmap term is OR-ed in | pending | | | |
-| 7 | SIMD class-mask tokenizer, term-table slot prefetched 8 tokens ahead | pending | | | |
-| 8 | Scan output bucketed by term range in kernel-mapped blocks, scattered bucket by bucket | pending | | | |
-| 9 | Queries stored flat instead of two vectors each | pending | | | |
-| 10 | Terms renumbered by sampled frequency; tokenizer keeps one mask per 64-byte window | pending | | | |
+| 1 | C++ rewrite: read queries first, index only their terms, 12-thread tokenize over mmap, galloping set ops, phrase check on candidates only | before registration, laptop only | | | |
+| 2 | Phrase check compares bytes instead of re-tokenizing and hashing candidates | before registration, laptop only | | | |
+| 3 | Terms in over 1/32 of docs become bitmaps, chosen from a 1/32 sample | before registration, laptop only | | | |
+| 4 | Keys loaded 8 bytes at a time, cheaper hash, table load 1/2 | before registration, laptop only | | | |
+| 5 | AVX2 scan for the phrase anchor's first letter | before registration, laptop only | | | |
+| 6 | BOOL results stay a bitmap once a bitmap term is OR-ed in | before registration, laptop only | | | |
+| 7 | SIMD class-mask tokenizer, term-table slot prefetched 8 tokens ahead | before registration, laptop only | | | |
+| 8 | Scan output bucketed by term range in kernel-mapped blocks, scattered bucket by bucket | before registration, laptop only | | | |
+| 9 | Queries stored flat instead of two vectors each | before registration, laptop only | | | |
+| 10 | Terms renumbered by sampled frequency; tokenizer keeps one mask per 64-byte window | before registration, laptop only | | | |
 | 11 | Scan output in 3-byte entries, posting lists as 16-bit per-thread offsets decoded per query | run-a75abbe64920 | 0.292 | 167 | 61.0 |
 | 12 | malloc mmap threshold pinned, so freed scan state really goes back | run-5c032275f3b6 | 0.301 | 175 | 60.5 |
 | 13 | Transparent huge pages off (the box backed partly written blocks with whole 2 MB pages) | run-e6924d8063c9 | 0.292 | 69.6 | 64.8 |
@@ -50,17 +62,17 @@ Every step from the reference to your final version, each with the live-board ru
 | 43 | Six more statements that rustfmt would wrap, written short (596 lines) | run-6c03749873e8 (with 44) | | | |
 | 44 | A token's bits cleared from the window mask by adding its lowest bit (`m & (m + (m & -m))`) instead of a checked shift | run-6c03749873e8 | 0.175 | 47.3 | 73.02 |
 | 45 | The tokenizer prefetches each term's last-document mark as it resolves the token, so the handler finds it in cache | run-56404803018d | 0.174 | 47.1 | 73.07 |
-| 46 | Term lookup without bounds checks; token ids written into room reserved once per 64-byte window | pending | | | |
+| 46 | Term lookup without bounds checks; token ids written into room reserved once per 64-byte window | no run of its own (measured with step 47's) | | | |
 | 47 | All threads unmap (`MADV_DONTNEED`) their share of docs.txt right after the scan, instead of the whole 254 MB being torn down at exit by one thread | run-47fab754c7f7 | 0.174 | 47.3 | 72.97 |
 | 48 | Diagnostic: step 46's code with every query answered twice, the first answers overwritten (same output), so the extra time is the answer phase's cost on the box | run-4cf5b8934429 | 0.193 | 47.4 | 71.87 |
 | 49 | Diagnostic: the query parse done twice, the first time into tables that are then dropped (same output) | run-6b36d19e3be3 | 0.189 | 47.2 | 72.06 |
 | 50 | Queries parsed on all threads, in line-aligned pieces joined in order, into a lock-free term table | run-0849e5ad6dd0 | 0.178 | 50.1 | 72.32 |
-| 51 | Back to step 46's code | pending | | | |
+| 51 | Back to step 46's code | no run of its own | | | |
 | 52 | Diagnostic: step 46's code with each thread scanning its share twice, the first result dropped (same output), so the extra time is the scan's cost on the box | run-6f25326f6975 | 0.311 | 50.4 | 66.45 |
 | 53 | Term table of 64-bit fingerprints: each slot holds the token's hash above its id, and no key array is kept or read | run-f0281b69a8d6 | 0.173 | 45.6 | 73.23 |
 | 54 | The tokenizer prefetches the corpus 2 KB ahead of each 64-byte window | run-ba21b3893a3a | 0.172 | 45.3 | 73.33 |
 | 55 | The tokenizer looks a token up 16 tokens after prefetching its slot instead of 8 | run-4620f81ed553 | 0.174 | 45.6 | 73.19 |
-| 56 | Back to step 54's code | pending | | | |
+| 56 | Back to step 54's code | no run of its own | | | |
 | 57 | A tighter rewrite of step 54: 64-bit hash folded from two products, the sample's marks in 16 bits, phases on one barrier-gated pool, the process ends with `_exit` (no destructors) | run-ae1b4119d492 | 0.168 | 43.8 | 73.95 |
 | 58 | Token hash from 8-byte loads masked with `bzhi`, the second to fourth words only for tokens that long, instead of a masked 32-byte AVX2 load; a token's end from the carry that clears its run; the bitmap-word OR without the multiply that zeroed it for list terms | run-5fd7a8a649de | 0.163 | 43.5 | 74.19 |
 | 59 | Queries parsed by all twelve threads: the term table cut into 64 partitions that probes never leave, each filled by one thread | run-06e637840233 | 0.188 | 48.8 | 71.91 |
@@ -104,10 +116,11 @@ Every step from the reference to your final version, each with the live-board ru
 | 97 | Step 96 with the thresholds back at 2,048 for OR and 768 otherwise; a document's buffers always grown by enough for a full window | run-c730e3fb810e | 0.115 | 48.1 | 76.92 |
 | 98 | The per-document handler's three loops as AVX2 selections, eight ids at a time; the bitmap sums back to step 93's | run-807c1ffd2504 | 0.111 | 47.9 | 77.26 |
 | 99 | The pool's threads started from a thread of their own at the start of `main`; the lists' stretches laid out from one row per term | run-71af5d224eec | 0.110 | 47.8 | 77.32 |
-| 100 | A phased design pushed as written outside this log with two small edits; withdrawn before its run | (withdrawn) | | | |
-| 101 | Back to step 99's code | (superseded by step 102 before its run) | | | |
+| 100 | A phased design pushed as written outside this log with two small edits; withdrawn before its run | no run of its own (withdrawn) | | | |
+| 101 | Back to step 99's code | no run of its own (superseded by step 102) | | | |
 | 102 | The phased design of step 100, rewritten here: new names and comments, the output in one write, query lines found with `memchr` | run-438ac1f6e97f | 0.095 | 41.1 | 78.24 |
-| 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | pending | | | |
+| 102, again | Step 102's code, measured with a later commit (5afe647) that only changed this log | run-be2f78572d3a | 0.091 | 41.4 | 78.70 |
+| 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | queued at the time of writing | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
