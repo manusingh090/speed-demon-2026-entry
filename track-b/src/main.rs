@@ -162,7 +162,7 @@ impl Doc {
         let (mut n, mask) = (LAG, t.slot.len() - 1);
         loop {
             if n + 32 > self.0.capacity().min(self.1.capacity()) {
-                (self.0.reserve(2 * n), self.1.reserve(2 * n));
+                (self.0.reserve(2 * n + 32), self.1.reserve(2 * n + 32));
             }
             let (hs, ids) = (self.0.as_mut_ptr(), self.1.as_mut_ptr());
             _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(2048).cast());
