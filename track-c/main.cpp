@@ -1,8 +1,8 @@
 // Speed Demon 2026, Track C (Join).
 //
-// regions.csv is memory-mapped, records.csv read a window at a time, and the
-// bitsets sit on 2 MB pages. Every phase is cut into pieces that any thread of
-// one pool claims; a phase starts once the one before is done:
+// Both files are memory-mapped, and the bitsets sit on 2 MB pages. Every
+// phase is cut into pieces that any thread of one pool claims; a
+// phase starts once the one before is done:
 //  1. regions.csv is split by lines; each thread flags the country codes it
 //     sees. Countries get indices 1..N in code order (0 is _UNMATCHED).
 //  2. Each thread fills its slice of a direct table region_id -> country index.
@@ -139,7 +139,7 @@ struct NameTable {
         return h;
     }
 
-    void prefetch(u64 k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[k >> (64 - BITS)]), _MM_HINT_T1); }
+    void prefetch(u64 k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[k >> (64 - BITS)]), _MM_HINT_T0); }
 
     // A slot holds the key's low 32 bits (never 0: 0 is a free slot); the
     // top bits choose the aligned group of eight it starts in. Groups are
@@ -232,14 +232,13 @@ struct Numbers {
            u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)))) << 32;
 }
 
-// Parse the records in bytes [from, to) of the file, read into a buffer a
-// window at a time. A record's region row and name
+// Parse every record that starts in [p, end). A record's region row and name
 // slot are prefetched when it is parsed; LAG records later its country is
 // read, its sums go to totals, its name is looked up and that name's bitset
 // word prefetched; LAG records after that the name is marked. So each of the
 // three random reads (region table, name table, bitsets) has a steady lead.
-void parse_records(int fd, size_t from, size_t to, size_t file_size, const u8* country_of, size_t regions,
-                   NameTable names, NamesSeen seen, Totals* totals) {
+void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
+                   size_t regions, NameTable names, NamesSeen seen, Totals* totals) {
     constexpr u64 LAG = 16;
     struct Pending {
         u64 name;
@@ -279,85 +278,64 @@ void parse_records(int fd, size_t from, size_t to, size_t file_size, const u8* c
     // commas and LFs outside quotes, go to an array in order, eight written
     // per block whether there are that many or not; then the chunk's whole
     // records are read from it, five separators each, and the next chunk
-    // starts at the first record not whole (or, if none in the chunk is, the
-    // window is refilled after it). A field's value is its bytes
+    // starts at the first record not whole. A field's value is its bytes
     // less one per quote pair, less the outer quotes of a quoted one: it has
     // 2 + 2k quotes for k escapes, or none.
     constexpr u32 CHUNK = 64;
     u32 at[CHUNK * 64 + 9];  // separator offsets from the chunk's start
     u64 qmask[CHUNK];
     u32 qbefore[CHUNK];
-    // A window holds the record cut off at the last one's end, then what the
-    // read adds; 64 spare bytes before it for the eight-byte number loads and
-    // 64 zeros after the data for the block loads.
-    constexpr size_t WINDOW = 64 << 10;
-    alignas(64) char space[64 + WINDOW + 64];
-    char* const buf = space + 64;
-    const char *p = buf, *end = buf;
-    for (size_t pos = from; pos < to;) {
-        const size_t left = end - p;
-        memmove(buf, p, left);
-        const ssize_t got = pread(fd, buf + left, std::min(WINDOW - left, to - pos), pos);
-        if (got <= 0) die("pread");
-        pos += got;
-        p = buf, end = buf + left + got;
-        memset(const_cast<char*>(end), 0, 64);
+    while (p < end) {
+        const u32 blocks = std::min<u64>(CHUNK, (end - p + 63) / 64);
+        u32 seps = 0, quotes = 0;
+        u64 inside = 0;
+        for (u32 b = 0; b < blocks; ++b) {
+            const char* block = p + 64 * b;
+            _mm_prefetch(block + 2048, _MM_HINT_T0);
+            __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
+            __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block + 32));
+            u64 q = mask64(lo, hi, '"');
+            u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0)) ^ inside;
+            inside = u64(i64(in) >> 63);
+            u64 m = (mask64(lo, hi, ',') | mask64(lo, hi, '\n')) & ~in;
+            qmask[b] = q;
+            qbefore[b] = quotes;
+            quotes += __builtin_popcountll(q);
+            u32 count = __builtin_popcountll(m), *out = at + seps;
+            for (int k = 0; k < 8; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
+            for (int k = 8; m; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
+            seps += count;
+        }
         // The final record may end at end of file without a terminator.
-        const char* file_end = pos == file_size ? end : end + 64;
-        while (p < end) {
-            const u32 blocks = std::min<u64>(CHUNK, (end - p + 63) / 64);
-            u32 seps = 0, quotes = 0;
-            u64 inside = 0;
-            for (u32 b = 0; b < blocks; ++b) {
-                const char* block = p + 64 * b;
-                __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
-                __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block + 32));
-                u64 q = mask64(lo, hi, '"');
-                u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0)) ^ inside;
-                inside = u64(i64(in) >> 63);
-                u64 m = (mask64(lo, hi, ',') | mask64(lo, hi, '\n')) & ~in;
-                qmask[b] = q;
-                qbefore[b] = quotes;
-                quotes += __builtin_popcountll(q);
-                u32 count = __builtin_popcountll(m), *out = at + seps;
-                for (int k = 0; k < 8; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
-                for (int k = 8; m; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
-                seps += count;
-            }
-            if (p + 64 * blocks >= file_end) at[seps++] = file_end - p;
-            auto quotes_before = [&](u32 x) { return qbefore[x / 64] + __builtin_popcountll(_bzhi_u64(qmask[x / 64], x % 64)); };
-            const char* chunk = p;
-            for (u32 i = 0; i + 5 <= seps && p < end; i += 5) {
-                if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
-                const char *f1 = chunk + at[i], *f2 = chunk + at[i + 1], *f3 = chunk + at[i + 2];
-                const char *f4 = chunk + at[i + 3], *eol = chunk + at[i + 4];
-                u32 q1 = quotes_before(at[i]), q2 = quotes_before(at[i + 1]), q3 = quotes_before(at[i + 2]);
-                u32 qname = q2 - q1, qnote = q3 - q2;
-                u32 name_field = f2 - f1 - 1, note_field = f3 - f2 - 1;
-                u32 quoted = qname != 0;
-                const char* name_at = f1 + 1 + quoted;
-                u32 name_raw = name_field - 2 * quoted;
-                u32 name_length = name_field - qname / 2 - quoted;
-                u32 note_length = note_field - qnote / 2 - (qnote != 0);
-                const char* amount = f4 + 1;
-                const char* amount_end = eol - (eol[-1] == '\r');
-                bool negative = *amount == '-';
-                Numbers num = numbers(p, f1, f3 + 1, f4, amount + negative, amount_end);
-                i64 cents = negative ? -i64(num.cents) : i64(num.cents);
+        if (p + 64 * blocks >= file_end) at[seps++] = file_end - p;
+        auto quotes_before = [&](u32 x) { return qbefore[x / 64] + __builtin_popcountll(_bzhi_u64(qmask[x / 64], x % 64)); };
+        const char* chunk = p;
+        for (u32 i = 0; i + 5 <= seps && p < end; i += 5) {
+            if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
+            const char *f1 = chunk + at[i], *f2 = chunk + at[i + 1], *f3 = chunk + at[i + 2];
+            const char *f4 = chunk + at[i + 3], *eol = chunk + at[i + 4];
+            u32 q1 = quotes_before(at[i]), q2 = quotes_before(at[i + 1]), q3 = quotes_before(at[i + 2]);
+            u32 qname = q2 - q1, qnote = q3 - q2;
+            u32 name_field = f2 - f1 - 1, note_field = f3 - f2 - 1;
+            u32 quoted = qname != 0;
+            const char* name_at = f1 + 1 + quoted;
+            u32 name_raw = name_field - 2 * quoted;
+            u32 name_length = name_field - qname / 2 - quoted;
+            u32 note_length = note_field - qnote / 2 - (qnote != 0);
+            const char* amount = f4 + 1;
+            const char* amount_end = eol - (eol[-1] == '\r');
+            bool negative = *amount == '-';
+            Numbers num = numbers(p, f1, f3 + 1, f4, amount + negative, amount_end);
+            i64 cents = negative ? -i64(num.cents) : i64(num.cents);
 
-                // Region ids are below 10^7 (fit u32); one past the table means none.
-                u32 r = num.region < regions ? num.region : u32(regions);
-                // The region row and the name slot are fetched to L2 only: a line
-                // fetched to L1 holds one of the core's few fill buffers until it
-                // arrives, and the bitset word's write prefetch needs them more.
-                _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T1);
-                advance();
-                u64 key = NameTable::key(name_at, name_raw);
-                pending[n++ % LAG] = {key, r, num.id, name_length, note_length, cents};
-                names.prefetch(key);
-                p = eol + 1;
-            }
-            if (p == chunk) break;  // the rest is cut off by the window's end
+            // Region ids are below 10^7 (fit u32); one past the table means none.
+            u32 r = num.region < regions ? num.region : u32(regions);
+            _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
+            advance();
+            u64 key = NameTable::key(name_at, name_raw);
+            pending[n++ % LAG] = {key, r, num.id, name_length, note_length, cents};
+            names.prefetch(key);
+            p = eol + 1;
         }
     }
     for (last = n; n < last + 2 * LAG; ++n) advance();
@@ -456,13 +434,9 @@ int main() {
     // records.csv: skip the BOM and header, then split after CRLFs into eight
     // pieces per thread, claimed in turn, so a thread whose pieces are slow
     // (more first sightings of names) is evened out by the others.
-    size_t start = static_cast<const char*>(memchr(records, '\n', size)) - records + 1;
+    size_t start = size ? static_cast<const char*>(memchr(records, '\n', size)) - records + 1 : 0;
     const int pieces = 8 * nthreads;
     std::vector<size_t> cut = split(records, start, size, pieces, "\r\n");
-    // The pieces are read, not mapped: on the box, mapping and unmapping
-    // the file's pages cost more than copying them.
-    munmap(const_cast<char*>(records), size + 4096);
-    const int records_fd = open("/data/records.csv", O_RDONLY);
     NameTable names;
 
     // Populate tables and flag countries; populate bitsets and fill the region
@@ -487,8 +461,16 @@ int main() {
             });
             new (&totals[t]) CountryTotals();
             parse.run([&](int k) {
-                parse_records(records_fd, cut[k], cut[k + 1], size, country_of, nregions, names, seen,
-                              totals[t].data());
+                // Map the piece's pages in one call rather than by a fault
+                // every 16 pages as the parse reaches them.
+                uintptr_t from = uintptr_t(records + cut[k]) & ~uintptr_t(4095);
+                madvise(reinterpret_cast<void*>(from), uintptr_t(records + cut[k + 1]) - from, MADV_POPULATE_READ);
+                parse_records(records + cut[k], records + cut[k + 1], records + size, country_of, nregions, names,
+                              seen, totals[t].data());
+                // The piece is not read again: its pages are unmapped now, by
+                // this thread, instead of all of the file's at exit by one.
+                uintptr_t to = uintptr_t(records + cut[k + 1]) & ~uintptr_t(4095);
+                if (to > from) madvise(reinterpret_cast<void*>(from), to - from, MADV_DONTNEED);
             });
         });
     for (auto& th : pool) th.join();
@@ -509,8 +491,12 @@ int main() {
             sum.amount_max = std::max(sum.amount_max, t.amount_max);
         }
         if (sum.count == 0) continue;
-        u32 k = c ? codes[c - 1] : 0;
-        out += c ? std::string{char('A' + (k >> 10)), char('A' + (k >> 5 & 31)), char('A' + (k & 31))} : "_UNMATCHED";
+        if (c == 0) {
+            out += "_UNMATCHED";
+        } else {
+            u32 k = codes[c - 1];
+            out += {char('A' + (k >> 10)), char('A' + (k >> 5 & 31)), char('A' + (k & 31))};
+        }
         for (u64 v : {sum.count, sum.id_sum}) out += ' ' + std::to_string(v);
         for (i64 v : {sum.amount_sum, sum.amount_min, sum.amount_max}) put_money(out, v);
         for (u64 v : {sum.distinct, sum.name_bytes, sum.note_bytes}) out += ' ' + std::to_string(v);
