@@ -69,7 +69,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 61 | Step 58 with the output mapped up front and cut to size at the end, hours sized in order as they finish, and a thread with nothing else to do writing the next hour whose offset is known, up to 3 MB of such early text | run-b6a6e9ff5b18 | 0.0226 s | 14.5 MiB | 84.15 |
 | 62 | Step 61 with an hour closed once the first unparsed piece starts 30 minutes into the next hour, instead of two whole hours after it | run-624b12bf8ac6 | 0.0198 s | 13.8 MiB | 85.78 |
 | 63 | Step 62 with the parse in batches of 8 lines and three stages: decode and hash every line, load every line's table slot, then confirm the names and file the records | run-27928bcc100e | 0.0233 s | 14.6 MiB | 83.57 |
-| 64 | Back to step 62's code | pending | | | |
+| 64 | Back to step 62's code (no board run of its own: superseded by step 65) | | | | |
+| 65 | Step 62 with each hour's text unmapped (`MADV_DONTNEED` on the shared output mapping) by the thread that wrote it, right after writing it, instead of all 10 MB of it by one thread at exit | pending | | | |
 
 ## Local measurements
 
@@ -236,6 +237,8 @@ Step 58 is a new program built on that floor. The pieces are claimed in order, a
 **Step 62 on the board, and step 63.** run-624b12bf8ac6: 0.0198 s, 13.8 MiB (the lowest Track A memory so far, 0.9 MiB under step 58's), 85.78 points, the best Track A run so far; Tracks B, C and D ran their usual times in the same push, so it is a clean run. Time is level with step 58's (0.0196 and 0.0197 s), so the early text does not show on the box, while the earlier closing takes memory down. Step 63 puts the batched parse of step 59's notes on the box: it was level on the laptop (75M more instructions, the same cycles), but the box's cores have twice the laptop's out-of-order window per thread, which is what such a batch relies on to overlap eight lines' table loads. Same hash on all eight datasets.
 
 **Step 63 on the board, and step 64.** run-27928bcc100e: 0.0233 s, 14.6 MiB, 83.57 points, against 0.0198 s for step 62. Track B's unchanged code ran its usual time in the same push (0.128 s), Track D's ran about 10% slow, so the batched parse is slower on the box as well, by more than the box's spread; its 75M extra instructions are not paid back by the overlapped loads. Step 64 is step 62's code again.
+
+**Step 64 to 65: the output's teardown.** The text goes straight into a shared mapping of the output file, about 2,500 pages, and their page-table entries were all removed by the exit, on one thread, inside the measured time (the same cost that step 18 took off the log's mapping). Now each thread drops the range of an hour's text from the mapping as soon as it has written it. On a shared mapping of a tmpfs file `MADV_DONTNEED` only removes the entries: the text stays in the file's pages, and a thread still writing a neighbouring hour into a page so dropped just maps it again with its contents. Three `perf stat -r 10` rounds: the same instructions and kernel cycles (the work only moves), wall time lower in all three (0.0348, 0.0234, 0.0217 s against 0.0437, 0.0243, 0.0225). Same hash on all eight datasets. Four lines more.
 
 ## Tried and kept out
 
