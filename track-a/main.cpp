@@ -47,7 +47,8 @@ constexpr int HOURS = 72; // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
 // 5xx flag. Latencies of 2^19 us or more (about 3% of lines) do not fit and go
 // to a side list with their key instead.
 constexpr u32 KEY_BITS = 13, ERR = 1u << 12, ID_MASK = ERR - 1,
-              PACKED_MAX = (1u << 19) - 1, SPARE = ~0u;
+              PACKED_MAX = (1u << 19) - 1, ESCAPE = PACKED_MAX << KEY_BITS,
+              SPARE = ~0u;
 
 // Bit i is set when byte i of the 32 at p equals c.
 inline u32 eq32(const char *p, char c) {
@@ -266,9 +267,10 @@ static Names endpoints;
 
 // Hour h's records sit together from records + h * per_hour, filled by every
 // thread in 4 KB blocks claimed with one atomic add; a thread's last block in
-// an hour is padded with SPARE, which no record can equal (a latency field of
-// all ones goes to the side list). An hour is handed back with one call once
-// its records are copied out.
+// an hour is padded with SPARE. A latency of PACKED_MAX or more takes two
+// places: a record whose latency field is all ones (ESCAPE), then the raw
+// value. An hour is handed back with one call once its records are copied
+// out.
 constexpr u32 BLOCK = 1024;
 static u32 *records;
 static size_t per_hour;
@@ -277,7 +279,6 @@ static std::atomic<u32> filled[HOURS];
 struct Parser {
   u32 *cur[HOURS] = {}, *stop[HOURS] = {};
   int h = 0;
-  std::vector<std::pair<u32, u32>> wide[HOURS];
 
   // Lines arrive in about clock order, so the hour index is worked out only
   // when the line's "MM-DDTHH" bytes differ from the line before's.
@@ -316,11 +317,16 @@ struct Parser {
           lat = lat * 10 + ne[5 + len] - '0';
       u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
       p = ne + 6 + len;
+      u32 *&c = cur[h];
       if (__builtin_expect(lat >= PACKED_MAX, 0)) {
-        wide[h].push_back({lat, key});
+        if (stop[h] - c < 2) // the pair stays in one block
+          std::fill(c, stop[h], SPARE), c = stop[h];
+        if (c == stop[h])
+          c = records + h * per_hour + filled[h].fetch_add(BLOCK),
+          stop[h] = c + BLOCK;
+        *c++ = ESCAPE | key, *c++ = lat;
         continue;
       }
-      u32 *&c = cur[h];
       if (c == stop[h])
         c = records + h * per_hour + filled[h].fetch_add(BLOCK),
         stop[h] = c + BLOCK;
@@ -348,9 +354,9 @@ int main() {
   if (size && mmap(log, size, 1, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED)
     return perror("mmap"), 1;
 
-  // An hour holds at most every line (one is at least 39 bytes) plus a part
-  // block per thread; only the pages written are ever backed.
-  per_hour = (size / 39 / BLOCK + nt + 1) * BLOCK;
+  // An hour holds at most two places for every line (one is at least 39
+  // bytes) plus a part block per thread; only the pages written are backed.
+  per_hour = (size / 19 / BLOCK + nt + 1) * BLOCK;
   records = (u32 *)mmap(nullptr, HOURS * per_hour * 4, 3,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   const int pieces = 8 * nt;
@@ -397,12 +403,8 @@ int main() {
   // too, are spread over all of them).
   std::vector<int> order(HOURS);
   std::barrier ranked(nt, [&]() noexcept {
-    for (int h = 0; h < HOURS; ++h) {
-      u32 n = filled[h];
-      for (auto &ps : parsers)
-        n += ps.wide[h].size();
-      most = std::max(most, n), order[h] = h;
-    }
+    for (int h = 0; h < HOURS; ++h)
+      most = std::max(most, filled[h].load()), order[h] = h;
     std::sort(order.begin(), order.end(),
               [](int a, int b) { return filled[a] < filled[b]; });
     if (names.size() != endpoints.count)
@@ -415,11 +417,11 @@ int main() {
   // Calls f(endpoint id, 5xx flag, latency) for every record of hour h.
   auto each = [&](int h, auto &&f) {
     for (u32 *r = records + h * per_hour, *e = r + filled[h]; r < e; ++r)
-      if (*r != SPARE)
+      if (__builtin_expect((*r | ID_MASK | ERR) == SPARE, 0)) {
+        if (*r != SPARE) // an escape: the raw latency follows
+          f(*r & ID_MASK, *r & ERR, r[1]), ++r;
+      } else
         f(*r & ID_MASK, *r & ERR, *r >> KEY_BITS);
-    for (auto &ps : parsers)
-      for (auto [lat, key] : ps.wide[h])
-        f(key & ID_MASK, key & ERR, lat);
   };
   auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
   std::vector<u64> at(HOURS + 1);
