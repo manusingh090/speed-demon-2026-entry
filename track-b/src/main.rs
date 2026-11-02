@@ -14,13 +14,12 @@ extern "C" {
 }
 
 const THREADS: usize = 12;
-static T1: OnceLock<std::time::Instant> = OnceLock::new();
 const NONE: u32 = u32::MAX;
 const BUCKETS: usize = 32;
 const GAP: u32 = 15;
 const ID_BITS: u32 = 18;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
-const BIG: usize = 768;
+const BIG: usize = 384;
 
 fn map(path: &str) -> &'static [u8] {
     let file = std::fs::File::open(path).expect(path);
@@ -258,7 +257,7 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
             });
             List(a)
         }
-        (List(a), _, List(b)) if a.len() + b.len() > if op == b'O' { 2048 } else { BIG } => {
+        (List(a), _, List(b)) if a.len() + b.len() > BIG => {
             let mut bits = vec![0u64; words];
             b.iter().for_each(|&d| bits[d as usize / 64] |= 1 << (d % 64));
             apply(List(a), op, Bits(Cow::Owned(bits)), words)
@@ -289,27 +288,38 @@ fn apply<'a>(cur: Docs<'a>, op: u8, term: Docs<'a>, words: usize) -> Docs<'a> {
     }
 }
 
+// Count and position sum of a bitmap, four words at a time. Nibble tables give
+// each byte's bits set (n) and the sum of their places (p, a high nibble's
+// counting from 4); n is weighed by the byte's place in its word and, summed
+// per word, by the word's index.
 unsafe fn bit_sums(b: &[u64]) -> (u64, u64) {
-    const NIB: [u8; 16] = [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4];
-    let nib = _mm256_broadcastsi128_si256(_mm_loadu_si128(NIB.as_ptr().cast()));
-    let (low, z) = (_mm256_set1_epi8(0x0F), _mm256_setzero_si256());
-    let h = |v: __m256i| _mm256_shuffle_epi8(nib, _mm256_and_si256(v, low));
-    let pop = |v: __m256i| _mm256_sad_epu8(_mm256_add_epi8(h(v), h(_mm256_srli_epi16::<4>(v))), z);
-    let sel = |k: usize| _mm256_set1_epi64x(!(u64::MAX / ((1u64 << (1 << k)) + 1)) as i64);
-    let (mut acc, mut word) = ([z; 8], _mm256_setr_epi64x(0, 1, 2, 3));
+    const NIB: [[u8; 16]; 3] = [
+        [0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4],
+        [0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4, 5, 5, 6, 6],
+        [0, 4, 5, 9, 6, 10, 11, 15, 7, 11, 12, 16, 13, 17, 18, 22],
+    ];
+    let [pop, low_at, high_at] = NIB.map(|t| _mm256_broadcastsi128_si256(_mm_loadu_si128(t.as_ptr().cast())));
+    let (z, nib, sh) = (_mm256_setzero_si256(), _mm256_set1_epi8(15), |t, x| _mm256_shuffle_epi8(t, x));
+    let place = _mm256_set1_epi64x(0x0706_0504_0302_0100);
+    let (mut count, mut words, mut bytes, mut places) = (z, z, z, z);
+    let mut word = _mm256_setr_epi64x(0, 1, 2, 3);
     for q in b.chunks_exact(4) {
         let v = _mm256_loadu_si256(q.as_ptr().cast());
-        let c = pop(v);
-        acc[6] = _mm256_add_epi64(acc[6], c);
-        acc[7] = _mm256_add_epi64(acc[7], _mm256_mul_epu32(c, word));
-        for k in 0..6 {
-            acc[k] = _mm256_add_epi64(acc[k], pop(_mm256_and_si256(v, sel(k))));
-        }
+        let lo = _mm256_and_si256(v, nib);
+        let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(v), nib);
+        let n = _mm256_add_epi8(sh(pop, lo), sh(pop, hi));
+        let c = _mm256_sad_epu8(n, z);
+        count = _mm256_add_epi64(count, c);
+        words = _mm256_add_epi64(words, _mm256_mul_epu32(c, word));
+        let by_byte = _mm256_maddubs_epi16(n, place);
+        bytes = _mm256_add_epi32(bytes, _mm256_madd_epi16(by_byte, _mm256_set1_epi16(1)));
+        let p = _mm256_add_epi8(sh(low_at, lo), sh(high_at, hi));
+        places = _mm256_add_epi64(places, _mm256_sad_epu8(p, z));
         word = _mm256_add_epi64(word, _mm256_set1_epi64x(4));
     }
-    let total = |k: usize| -> u64 { std::mem::transmute::<_, [u64; 4]>(acc[k]).iter().sum() };
-    let sum = 64 * total(7) + (0..6).map(|k| total(k) << k).sum::<u64>();
-    (total(6), sum)
+    let total = |v: __m256i| -> u64 { std::mem::transmute::<_, [u64; 4]>(v).iter().sum() };
+    let bytes = std::mem::transmute::<_, [u32; 8]>(bytes).map(|x| x as u64);
+    (total(count), 64 * total(words) + 8 * bytes.iter().sum::<u64>() + total(places))
 }
 
 // v in decimal after a space (or none, first on a line), without the
@@ -429,7 +439,6 @@ impl Units {
 }
 
 fn main() {
-    let t0 = std::time::Instant::now();
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
     let n = (qtext.len() / 8).next_power_of_two().max(4);
@@ -476,12 +485,6 @@ fn main() {
         })
         .collect();
     let nterms = terms.n;
-    let ti = std::time::Instant::now();
-    {
-        let pages = t0.elapsed().as_micros() as usize / 4;
-        let p = unsafe { mmap(std::ptr::null_mut(), pages * 4096 + 4096, 3, 0x22, -1, 0) };
-        (0..pages).for_each(|k| unsafe { std::ptr::write_volatile(p.add(k * 4096), 1) });
-    }
     let text = map("/data/docs.txt");
     let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
     for c in &mut cut[1..THREADS] {
@@ -515,7 +518,6 @@ fn main() {
             });
             (n as usize, df)
         });
-        T1.set(std::time::Instant::now()).ok();
         let sampled: usize = samples.iter().map(|s| s.0).sum();
         let mut df = vec![0u32; nterms + 1];
         for (_, d) in samples {
@@ -736,6 +738,5 @@ fn main() {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
     std::io::Write::flush(&mut out).unwrap();
-    std::thread::sleep((*T1.get().unwrap() - ti) * 10);
     unsafe { _exit(0) };
 }
