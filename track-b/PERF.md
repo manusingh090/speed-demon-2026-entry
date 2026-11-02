@@ -106,7 +106,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 99 | The pool's threads started from a thread of their own at the start of `main`; the lists' stretches laid out from one row per term | run-71af5d224eec | 0.110 | 47.8 | 77.32 |
 | 100 | A phased design pushed as written outside this log with two small edits; withdrawn before its run | (withdrawn) | | | |
 | 101 | Back to step 99's code | pending | | | |
-| 102 | The phased design of step 100, rewritten here: new names and comments, the output in one write, query lines found with `memchr` | pending | | | |
+| 102 | The phased design of step 100, rewritten here: new names and comments, the output in one write, query lines found with `memchr` | run-438ac1f6e97f | 0.095 | 41.1 | 78.24 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -423,6 +423,8 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 102.** The team's phased design (its author confirmed it is the team's own), taken as the new base and reworked here: every type, function and constant renamed, every comment rewritten, the answers gathered and written in one call instead of one per batch of 64 queries, and each worker's part of the query file split into lines with `memchr`. The design: the corpus is read in phases of 200 slices of 256 KiB (about 50 MiB), each starting on a document whose id is a multiple of 64 so no two workers share a bitmap word. List terms become rows (term, document) in 64 shards, written in chunks with no shared counters, then 16-bit postings relative to the phase's first document; bitmap terms are gathered per document as one row of bits and transposed into the bitmaps every 64 documents. Each phase answers every query into a running result (count, id sum, first ten ids), so no full index ever exists, and the answers of one phase run on whichever workers have run out of slices in the next. A phrase is checked when its rarest sampled word appears, by comparing the neighbouring tokens' hashes, and a match becomes a row of a stand-in term, so a phrase query is a one-term lookup. The term table is 2^15 cache lines of 7 tags and 8 actions; a token's lookup is one line read, and its action says what the scan does with it. Tokens are hashed two at a time with two AES rounds. Workers start as a tree, parse a part of the queries each and intern its terms by compare-exchange, and meet at a barrier on one futex word.
 
 Checked locally: the same hash on all six datasets and the dense-token test; peak memory about 42 MB against 47.8 MB for step 99. Terms are told apart by 47 bits of the hash (15 for the line, 32 for the tag): a token that is no query term matches one with odds of about 3 in 10,000 over the whole corpus. 1,103 counted lines against 739, about 6% of K, so it must be over 12% faster on the box to gain; the laptop's wall times cannot tell.
+
+**Step 102 on the board.** run-438ac1f6e97f (commit 3982047): 0.0946 s against 0.1102 s for step 99 (14% faster), 41.1 MiB against 47.8, 1,103 counted lines, K 36.71, 78.24 points, the best Track B run so far. The speed and memory more than paid for the 364 extra lines.
 
 ## What the profile said, step by step
 
