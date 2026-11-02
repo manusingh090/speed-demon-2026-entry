@@ -139,7 +139,7 @@ struct NameTable {
         return h;
     }
 
-    void prefetch(u64 k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[k >> (64 - BITS)]), _MM_HINT_T0); }
+    void prefetch(u64 k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[k >> (64 - BITS)]), _MM_HINT_T1); }
 
     // A slot holds the key's low 32 bits (never 0: 0 is a free slot); the
     // top bits choose the aligned group of eight it starts in. Groups are
@@ -330,7 +330,10 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
 
             // Region ids are below 10^7 (fit u32); one past the table means none.
             u32 r = num.region < regions ? num.region : u32(regions);
-            _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
+            // The region row and the name slot are fetched to L2 only: a line
+            // fetched to L1 holds one of the core's few fill buffers until it
+            // arrives, and the bitset word's write prefetch needs them more.
+            _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T1);
             advance();
             u64 key = NameTable::key(name_at, name_raw);
             pending[n++ % LAG] = {key, r, num.id, name_length, note_length, cents};
