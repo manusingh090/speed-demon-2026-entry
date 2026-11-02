@@ -525,24 +525,24 @@ fn main() {
             (false, true) => 3,
             (false, false) => 4,
         };
-        let pack = |i: usize| (class(i) as u64) << 56 | (!df[i] as u64) << 24 | i as u64;
-        let mut packed: Vec<u64> = (0..nterms).map(pack).collect();
-        packed.sort_unstable();
-        let at_most = |c| packed.partition_point(|&k| (k >> 56) as usize <= c);
-        let [nbits, a0, lists, nkeep] = [0, 1, 2, 3].map(at_most);
-        let mut new = vec![0; nterms];
-        for (r, &k) in packed.iter().enumerate() {
-            new[k as usize & 0xFF_FFFF] = r as u32;
-        }
+        // Terms are numbered by class, in query order within one.
+        let mut at = [0; 6];
+        (0..nterms).for_each(|i| at[class(i) + 1] += 1);
+        (1..6).for_each(|c| at[c] += at[c - 1]);
+        let [nbits, a0, lists, nkeep] = [at[1], at[2], at[3], at[4]];
+        let new: Vec<u32> = (0..nterms).map(|i| (at[class(i)], at[class(i)] += 1).0 as u32).collect();
         terms.renumber(&new);
         ids.iter_mut().for_each(|id| *id = new[*id as usize]);
-        anchored.iter_mut().for_each(|a| a.0 = new[a.0 as usize]);
-        anchored.sort_unstable();
-        // Every anchor has a phrase, so its last one marks where the next's start.
+        // The anchors' phrases, anchor by anchor in query order.
         let mut astart = vec![0; nkeep - a0 + 1];
-        for (k, a) in anchored.iter().enumerate() {
-            astart[a.0 as usize - a0 + 1] = k + 1;
+        anchored.iter().for_each(|a| astart[new[a.0 as usize] as usize - a0 + 1] += 1);
+        (1..astart.len()).for_each(|k| astart[k] += astart[k - 1]);
+        let (mut at, mut sorted) = (astart.clone(), vec![(0, 0, 0); anchored.len()]);
+        for &(a, q, j) in &anchored {
+            let k = &mut at[new[a as usize] as usize - a0];
+            (sorted[*k], *k) = ((new[a as usize], q, j), *k + 1);
         }
+        let anchored = sorted;
         (nbits, a0, lists, nkeep, anchored, astart)
     };
     // Each anchor's first phrase in one 16-byte head, read where the anchor
