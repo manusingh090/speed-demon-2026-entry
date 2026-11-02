@@ -109,11 +109,12 @@ u64 digits(const char* s, const char* e) { return fold(load8(e - 8), e - s); }
 // Names, interned by their raw bytes between the quotes. Escaping is one to
 // one, so equal raw bytes mean equal values (and the empty name is one value
 // whether quoted or not). A name's key is a 64-bit hash of those bytes and
-// their length; two of the 100,000 pool names share one with a chance of
-// about 3 in 10^10. A key's slot in the open-addressed table is the name's id;
-// an empty slot is claimed with a compare-and-swap. At 8 bytes a slot the
-// table is 1 MB, small enough to stay in a core's L2 while the input streams
-// past, and eight slots share a cache line, so a probe rarely leaves it.
+// their length. A key's slot in the open-addressed table is the name's id; an
+// empty slot is claimed with a compare-and-swap. A slot keeps 32 bits of the
+// key and the slot's group 14 more, so two names are confused only if they
+// share those 32 bits and meet in one group: with 100,000 names and about ten
+// keys per group probed, a chance of about 1 in 10,000 per dataset. At 4 bytes
+// a slot the table is 512 KB, and eight slots share a cache line.
 class NameTable {
 public:
     static constexpr u32 BITS = 17, SLOTS = 1 << BITS;  // the pool holds 100,000 names
