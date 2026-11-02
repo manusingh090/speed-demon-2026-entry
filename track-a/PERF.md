@@ -59,7 +59,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 51 | Step 50 with the log fetched 1 KB ahead of each line with the non-temporal prefetch hint | run-0d7c54395879 | 0.0207 s | 17.7 MiB | 84.59 |
 | 52 | Groups of more than 128 records partitioned eight at a time with AVX2 (lookup-table compress into two buffers) | run-8a311a6f0910 | 0.0203 s | 18.4 MiB | 83.96 |
 | 53 | Step 52 with the permutation tables replaced by BMI2 (`pdep` spreads the mask to bytes, `pext` gathers the lane indices) and a shorter recursion | pending | | | |
-| 54 | Latencies of 2^19 - 1 or more stored in the hour's region as an escape record followed by the raw value, instead of 864 per-thread side vectors | pending | | | |
+| 54 | Latencies of 2^19 - 1 or more stored in the hour's region as an escape record followed by the raw value, instead of 864 per-thread side vectors | run-b114f738369d | 0.0204 s | 17.4 MiB | 84.42 |
+| 55 | Step 51 (no AVX2 selection) with step 54's in-region escapes | pending | | | |
 
 ## Local measurements
 
@@ -201,6 +202,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 **Step 52 on the board, and step 53.** run-8a311a6f0910: 0.0203 s (level with the best run), 18.4 MiB, but 439 lines against 362, 83.96 points: the two 256-entry permutation tables and their generator cost 77 formatted lines, which took about as much from K as the 2% faster run gave. Step 53 keeps the method and drops the tables: the 8-bit compare mask is spread to one byte per lane with `pdep` and the lane indices are gathered with `pext` (the standard table-free AVX2 compress on BMI2 hardware), and the recursion is shorter. The standalone test passed again (600,000 ranks); there it is slightly slower than the tables but still faster than the chained selections (10.8 against 16.9 ms at 1,000 values, 8.2 against 15.8 ms at 9,000). Same hash on all six datasets and 10 repeated full runs; peak 18.3 MB locally, level with step 51. 398 counted lines against 432.
 
 **Step 53 to 54: memory.** About 3% of latencies do not fit a record's 19 bits. They went to side vectors, one per thread per hour (864 in all), whose growth slack and malloc arenas stay resident. They now go into the hour's own region as two places, a record whose latency field is all ones (the escape) and then the raw value, kept in one block; the scan of an hour reads the raw value after an escape. The common path is unchanged (a first version that tested for the second place on every line cost 54M more instructions). Same hash on all six datasets, the two disordered logs and 10 repeated full runs. Peak 17.8 to 17.9 MB against 18.2 to 18.3 MB locally; user cycles level with step 53, 0.18M more branch misses from the escape test in the hour scans. A branch-free form of that test (select the raw value or the field, then step over it) cost 10% more cycles and was dropped.
+
+**Step 54 on the board, and step 55.** run-b114f738369d: 0.0204 s, 17.4 MiB, 406 lines, 84.42 points. Lined up, the AVX2 selection of steps 52 to 54 bought about 2% of time on the box (0.0203 to 0.0204 s against step 51's 0.0207 s), about 1% of K, for about 40 formatted lines, about 1.6% of K, so it goes; the in-region escapes of step 54 cost one line for 0.4 to 0.6 MB, so they stay. Step 55 is step 51 with step 54's escapes: same hash on all six datasets and 10 repeated full runs, peak 17.7 MB against 18.3 MB for step 51 locally, 356 counted lines.
 
 ## Tried and kept out
 
