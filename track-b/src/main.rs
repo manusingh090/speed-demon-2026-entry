@@ -14,6 +14,7 @@ extern "C" {
 }
 
 const THREADS: usize = 12;
+static T1: OnceLock<std::time::Instant> = OnceLock::new();
 const NONE: u32 = u32::MAX;
 const BUCKETS: usize = 32;
 const GAP: u32 = 15;
@@ -408,9 +409,10 @@ impl Units {
 }
 
 fn main() {
+    let t0 = std::time::Instant::now();
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
-    let n = (qtext.len() / 16).next_power_of_two().max(4);
+    let n = (qtext.len() / 8).next_power_of_two().max(4);
     // Mapped on its own and handed back after the scan. Every token's lookup
     // lands on a random line of it, so it is put on 2 MB pages (one TLB entry
     // instead of 512), faulted in before huge pages are turned off for the rest,
@@ -446,6 +448,11 @@ fn main() {
         })
         .collect();
     let nterms = terms.n;
+    {
+        let pages = t0.elapsed().as_micros() as usize / 4;
+        let p = unsafe { mmap(std::ptr::null_mut(), pages * 4096 + 4096, 3, 0x22, -1, 0) };
+        (0..pages).for_each(|k| unsafe { std::ptr::write_volatile(p.add(k * 4096), 1) });
+    }
     let text = map("/data/docs.txt");
     let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
     for c in &mut cut[1..THREADS] {
@@ -479,6 +486,7 @@ fn main() {
             });
             (n as usize, df)
         });
+        T1.set(std::time::Instant::now()).ok();
         let sampled: usize = samples.iter().map(|s| s.0).sum();
         let mut df = vec![0u32; nterms + 1];
         for (_, d) in samples {
@@ -530,6 +538,7 @@ fn main() {
     let words = ndocs.div_ceil(256) * 4;
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
     let found = Mutex::new(vec![]);
+    let serial = T1.get().unwrap().elapsed();
     let scans = on_threads(|t| {
         let (mut mine, mut kept, mut anchors) = (vec![], vec![0; 1 << 12], vec![0; 1 << 12]);
         let mut buckets: Vec<Units> = (0..BUCKETS).map(|_| Units::default()).collect();
@@ -696,5 +705,6 @@ fn main() {
         std::io::Write::write_all(&mut out, c.into_inner().unwrap().as_bytes()).unwrap();
     }
     std::io::Write::flush(&mut out).unwrap();
+    std::thread::sleep(serial * 10);
     unsafe { _exit(0) };
 }

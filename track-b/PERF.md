@@ -94,7 +94,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 87 | Tokenizer rewritten around a linear hash buffer and a one-multiply hash; the per-document handler split into three short loops | run-152f40943619 | 0.141 | 45.3 | 75.32 |
 | 88 | Token ends found once per window, byte masks from a table, no mark prefetch, each anchor's first phrase in a prefetched 16-byte head | run-18961f21c438 | 0.128 | 45.1 | 76.23 |
 | 89 | The scan writes every list-term occurrence, with no per-term marks or counts; the lists are counted and deduplicated from its output | run-1406c8e99675 | 0.124 | 46.8 | 76.32 |
-| 90 | Term table of 1 MB instead of 2 MB (load 0.58) | pending | | | |
+| 90 | Term table of 1 MB instead of 2 MB (load 0.58) | run-9fbf4b590d0c | 0.133 | 48.4 | 75.40 |
+| 91 | Measurement only: step 89's code, the query parse kept as memory (a page per 4 us) and the serial setup after the sample as ten times its length in wait | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -365,6 +366,10 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 89 on the board.** run-1406c8e99675: 0.1243 s against 0.128 s, 46.8 MiB (within the 45 to 47 MiB step 88's runs spread over), 76.32, the best Track B run so far.
 
 **Step 90.** The term table is sized from the query file at 16 bytes per slot instead of 8: 128K slots (1 MB) for the 75,747 terms instead of 256K. Step 46 found a 1 MB table 3% slower, when the tokenizer was bound by instructions; now that the box answers to misses, it is worth trying again: with the list marks gone from the scan, the table, the anchors' heads and the bitmap words fit a core's 1.25 MB L2 together. On the laptop: 35M more instructions (longer probes), last-level misses 17M against 21M to 23M, user cycles within noise. No change in lines. Same hash on all six datasets.
+
+**Step 90 on the board.** run-9fbf4b590d0c: 0.1335 s against 0.1243 s, 48.4 MiB: the longer probes cost the box more than the misses saved, so fewer laptop misses is not a sure sign either. The 2 MB table is back.
+
+**Step 91** measures the time before the scan, which step 84 put at about 17 ms, now 13% of the run: step 89's code, with the time from the start of `main` to the end of the term inserts kept as memory (one touched 4 KB page per 4 us, held to the exit), and the time from the end of the sample to the start of the scan (summing the sampled counts, choosing anchors, sorting and renumbering the terms, the anchors' heads, the bitmaps' allocation) added before the exit as a wait ten times as long.
 
 ## What the profile said, step by step
 
