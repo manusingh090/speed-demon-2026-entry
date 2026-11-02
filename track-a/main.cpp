@@ -351,6 +351,11 @@ int main() {
     snprintf(label, 32, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
              day < 2 ? 30 + day : day - 1, (h + 18) % 24);
     char *o = text + at[h];
+    // The hour's pages of the output, backed in one call rather than one
+    // fault each.
+    auto first_page = uintptr_t(o) & ~uintptr_t(4095);
+    madvise((void *)first_page, uintptr_t(text + at[h + 1]) - first_page,
+            MADV_POPULATE_WRITE);
     for (u32 i = 0; i < count[h]; ++i) {
       const Line &l = ((Line *)(lines + h * hour_bytes))[i];
       std::string_view name = endpoints.name(l.id);
