@@ -28,7 +28,6 @@
 #include <string>
 #include <mutex>
 #include <new>
-#include <optional>
 #include <span>
 #include <string_view>
 #include <sys/mman.h>
@@ -49,56 +48,32 @@ using i64 = int64_t;
     _exit(1);
 }
 
-// Zero-filled anonymous memory on 4 KB pages; pages are charged only once
-// touched.
+// Zero-filled anonymous memory; pages are charged only once touched. A huge
+// block sits on 2 MB pages (whole ones, aligned); the rest refuse them, as
+// the box runs huge pages always on.
+constexpr size_t HUGE_PAGE = 2 << 20;
 template <class T>
-T* zeroed(size_t n) {
-    void* p = mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+T* zeroed(size_t n, bool huge = false) {
+    const size_t bytes = huge ? (n * sizeof(T) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1) : n * sizeof(T);
+    auto* p = static_cast<char*>(mmap(nullptr, bytes + huge * HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (p == MAP_FAILED) die("mmap");
-    madvise(p, n * sizeof(T), MADV_NOHUGEPAGE);
-    return static_cast<T*>(p);
+    if (huge) p = reinterpret_cast<char*>((uintptr_t(p) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
+    madvise(p, bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+    return reinterpret_cast<T*>(p);
 }
 
 // A table that every thread writes all over is populated up front: faulting
 // it in page by page from twelve threads at once made the threads queue on
 // the kernel's page-table locks, and each page was faulted twice, once on its
 // first read (the shared zero page) and again on its first write. Thread t of
-// n populates its share of the n pieces in one call.
+// n populates its share of the pages in one call. On 2 MB pages each page is
+// one thread's: threads faulting one at once would each get a page allocated,
+// all but one then freed.
 template <class T>
-void populate_share(T* p, size_t n, int t, int nthreads) {
-    const size_t pages = (n * sizeof(T) + 4095) / 4096, from = pages * t / nthreads, to = pages * (t + 1) / nthreads;
-    if (to > from) madvise(reinterpret_cast<char*>(p) + from * 4096, (to - from) * 4096, MADV_POPULATE_WRITE);
+void populate_share(T* p, size_t n, int t, int nthreads, size_t page = 4096) {
+    const size_t pages = (n * sizeof(T) + page - 1) / page, from = pages * t / nthreads, to = pages * (t + 1) / nthreads;
+    if (to > from) madvise(reinterpret_cast<char*>(p) + from * page, (to - from) * page, MADV_POPULATE_WRITE);
 }
-
-// The bitsets and the threads' totals are carved out of one zero-filled block
-// on 2 MB pages: for 240 countries they fill two of them almost exactly
-// (4,048 of 4,096 KB). A record's mark lands at random in 3.9 MB, and on 4 KB
-// pages nearly every one missed the first-level TLB. Each 2 MB page is
-// populated by one thread: threads faulting one at once would each get a page
-// allocated, all but one then freed.
-constexpr size_t HUGE_PAGE = 2 << 20;
-struct HugeBlock {
-    char *start, *next, *end;
-
-    explicit HugeBlock(size_t bytes) {
-        bytes = (bytes + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1);
-        auto* p = static_cast<char*>(mmap(nullptr, bytes + HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-        if (p == MAP_FAILED) die("mmap");
-        start = next = reinterpret_cast<char*>((uintptr_t(p) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
-        end = start + bytes;
-        madvise(start, bytes, MADV_HUGEPAGE);
-    }
-    template <class T>
-    T* take(size_t n) {
-        T* p = reinterpret_cast<T*>(next);
-        next += (n * sizeof(T) + 63) & ~size_t(63);
-        return p;
-    }
-    // Thread t of n populates pages t, t + n, ...
-    void populate(int t, int n) const {
-        for (char* p = start + t * HUGE_PAGE; p < end; p += n * HUGE_PAGE) madvise(p, HUGE_PAGE, MADV_POPULATE_WRITE);
-    }
-};
 
 // Map a file over a spare zero page, so 64-byte loads past its end are safe.
 const char* map_file(const char* path, size_t& size) {
@@ -440,15 +415,20 @@ int main() {
     NamesSeen seen;
     using CountryTotals = std::array<Totals, 256>;
     std::span<CountryTotals> totals;  // set up by each thread
-    std::optional<HugeBlock> block;
+    char* block = nullptr;  // the bitsets, then the totals
+    size_t block_bytes = 0;
     auto number_countries = [&] {
         for (u32 k = 0; k < present.size(); ++k)
             if (present[k]) codes.push_back(k), index_of[k] = codes.size();
         if (codes.size() > 255) die("more than 255 countries");
         const size_t rows = (codes.size() + 1) * NamesSeen::WORDS;
-        block.emplace(rows * sizeof(u64) + nthreads * sizeof(CountryTotals));
-        seen.bits = block->take<std::atomic<u64>>(rows);
-        totals = {block->take<CountryTotals>(nthreads), size_t(nthreads)};
+        // On 2 MB pages: for 240 countries the bitsets and totals fill two
+        // of them almost exactly (4,048 of 4,096 KB). A record's mark lands
+        // at random in 3.9 MB, and on 4 KB pages nearly every one missed the
+        // first-level TLB.
+        block = zeroed<char>(block_bytes = rows * sizeof(u64) + nthreads * sizeof(CountryTotals), true);
+        seen.bits = reinterpret_cast<std::atomic<u64>*>(block);
+        totals = {reinterpret_cast<CountryTotals*>(block + rows * sizeof(u64)), size_t(nthreads)};
     };
 
     // records.csv: skip the BOM and header, then split after CRLFs into eight
@@ -473,7 +453,7 @@ int main() {
             });
             std::call_once(numbered, number_countries);
             fill.run([&](int k) {
-                block->populate(k, nthreads);
+                populate_share(block, block_bytes, k, nthreads, HUGE_PAGE);
                 for (const char* p = regions + rcut[k]; p < regions + rcut[k + 1];) {
                     auto [id, c] = region_line(p);
                     country_of[id] = index_of[c];
