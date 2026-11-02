@@ -122,6 +122,7 @@ The decisions that mattered, in order of what they bought:
 | 102, again | Step 102's code, measured with a later commit (5afe647) that only changed this log | run-be2f78572d3a | 0.091 | 41.4 | 78.70 |
 | 103 | Slices of 1 MiB instead of 256 KiB (50 to a phase, still about 50 MiB), a sample of 3 slices instead of 12 | run-e1bf8b3072c9 | 0.097 | 39.9 | 77.93 |
 | 104 | Back to step 102's code (256 KiB slices, 200 to a phase, a 12-slice sample) | no run of its own | | | |
+| 105 | Slices of 128 KiB, 400 to a phase, a 24-slice sample (the same 3 MiB); shorter names (6 fewer counted lines) | queued at the time of writing | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -444,6 +445,8 @@ Checked locally: the same hash on all six datasets and the dense-token test; pea
 **Step 103.** The team's next settings for the phased design: workers take 1 MiB slices of the corpus instead of 256 KiB, 50 to a phase (still about 50 MiB), so a worker claims a quarter as often and starts a quarter as many slice boundaries (each one a search for the next line whose id is a multiple of 64); the sample is 3 of these slices, the same 3 MiB as twelve before. Same hash on all six datasets and the dense-token test.
 
 **Step 103 on the board.** run-e1bf8b3072c9: 0.0973 s at 39.9 MiB, against 0.0946 and 0.0907 s at 41.1 and 41.4 MiB for step 102's code: 1.5 MiB less, but slower (fewer, larger slices leave the last workers of a phase with more to finish while the others wait), so 77.93 points against 78.24 and 78.70. Step 104 is step 102's code again.
+
+**Step 105.** If larger slices lost because a phase waits on its last workers, smaller ones should gain: 128 KiB slices, 400 to a phase (still about 50 MiB), and a sample of 24 of them (the same 3 MiB). Ideas from the literature were checked first and mostly found in place already (bucket prefetch ahead of the probe, branch-free SIMD tokenizing, per-thread page faulting, fused bitmap count and id sum); sharing work between queries with a common prefix would save 282 of 60,168 BOOL steps, so it stays out. The longest names were also shortened, 6 fewer counted lines (1,097). Same hash on all six datasets and the dense-token test.
 
 ## What the profile said, step by step
 
