@@ -552,15 +552,10 @@ fn main() {
         drop_pages(&filed[t].words, 0, 1);
         let (mut ord, mut seeds, mut heavy2) = (Vec::with_capacity(n / nt + BLOB), Vec::new(), Vec::new());
         let (mut scan, mut at) = (share(n, t, nt).start, t * m);
-        // Fetch the offsets 8 queue entries ahead, the edges 4 ahead and the
-        // claim flags of their heads 2 ahead.
+        // Fetch the offsets 8 queue entries ahead and the edges 4 ahead.
         let ahead = |ord: &Vec<u32>, i: usize| {
             ord.get(i + 8).map(|&u| prefetch(&first.rel[u as usize]));
             ord.get(i + 4).map(|&u| prefetch(&link[first.at(u as usize) as usize]));
-            ord.get(i + 2).map(|&u| {
-                let u = u as usize;
-                (first.at(u)..first.at(u + 1)).for_each(|e| prefetch(&claimed[(link[e as usize] & hmask) as usize]))
-            });
         };
         // Copies u's edge words to the region; returns them for the caller.
         let mut copy = |u: usize, at: &mut usize| {
