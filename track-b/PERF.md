@@ -105,7 +105,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 98 | The per-document handler's three loops as AVX2 selections, eight ids at a time; the bitmap sums back to step 93's | run-807c1ffd2504 | 0.111 | 47.9 | 77.26 |
 | 99 | The pool's threads started from a thread of their own at the start of `main`; the lists' stretches laid out from one row per term | run-71af5d224eec | 0.110 | 47.8 | 77.32 |
 | 100 | A phased design pushed as written outside this log with two small edits; withdrawn before its run | (withdrawn) | | | |
-| 101 | Back to step 99's code | pending | | | |
+| 101 | Back to step 99's code | (superseded by step 102 before its run) | | | |
 | 102 | The phased design of step 100, rewritten here: new names and comments, the output in one write, query lines found with `memchr` | run-438ac1f6e97f | 0.095 | 41.1 | 78.24 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
