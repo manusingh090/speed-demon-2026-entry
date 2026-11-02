@@ -3,13 +3,14 @@
 // One pool of threads does everything in three phases.
 //
 // Parse. The log is memory-mapped and cut into line-aligned pieces, eight per
-// thread, claimed in turn. The timestamp is always 27 bytes and the 72-hour
-// span is fixed, so a line's hour comes from its day and hour digits alone.
-// One 64-byte scan after the timestamp finds the endpoint's ends and the
-// line's end. Endpoints are interned in one lock-free table shared by all
-// threads, and each line files a 4-byte record (latency, endpoint id, 5xx
-// flag) under its hour. A thread unmaps each piece once parsed, so the exit
-// does not tear the whole mapping down on one thread.
+// thread, claimed in turn. The line ends of each 64-byte block are found at
+// once, so no line waits on the parse of the one before; a line is then read
+// from both ends. The timestamp is always 27 bytes and the 72-hour span is
+// fixed, so a line's hour comes from its day and hour digits alone.
+// Endpoints are interned in one lock-free table shared by all threads, and
+// each line files a 4-byte record (latency, endpoint id, 5xx flag) under its
+// hour. A thread unmaps each piece once parsed, so the exit does not tear the
+// whole mapping down on one thread.
 //
 // Between the phases the last thread to arrive sorts the names, so each
 // endpoint id gets its rank in output order.
@@ -43,18 +44,11 @@
 using u32 = uint32_t;
 using u64 = uint64_t;
 constexpr int HOURS = 72; // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
-// A record packs the latency above a 13-bit key: a 12-bit endpoint id and the
-// 5xx flag. Latencies of 2^19 us or more (about 3% of lines) do not fit and go
-// to a side list with their key instead.
-constexpr u32 KEY_BITS = 13, ERR = 1u << 12, ID_MASK = ERR - 1,
-              PACKED_MAX = (1u << 19) - 1, ESCAPE = PACKED_MAX << KEY_BITS,
+// A record packs the latency above a 12-bit key: an 11-bit endpoint id and the
+// 5xx flag. Latencies of 2^20 - 1 us or more (about 1% of lines) do not fit.
+constexpr u32 KEY_BITS = 12, ERR = 1u << 11, ID_MASK = ERR - 1,
+              PACKED_MAX = (1u << 20) - 1, ESCAPE = PACKED_MAX << KEY_BITS,
               SPARE = ~0u;
-
-// Bit i is set when byte i of the 32 at p equals c.
-inline u32 eq32(const char *p, char c) {
-  __m256i v = _mm256_loadu_si256((const __m256i *)p);
-  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
-}
 
 // The number of decimal digits in x, from its bit length.
 inline u32 width(u32 x) {
@@ -148,65 +142,78 @@ inline void percentiles(u32 *a, u32 n, const u32 *r, u32 *v) {
     v[t] = a[r[t]];
 }
 
-// The first c at or after s; one is known to follow.
-inline const char *next_byte(const char *s, char c) {
-  for (;; s += 32)
-    if (u32 m = eq32(s, c))
-      return s + __builtin_ctz(m);
+inline __m256i load(const char *p) {
+  return _mm256_loadu_si256((const __m256i *)p);
 }
 
-// Endpoint names to dense ids, one table for all threads. Open addressing on
-// a CRC of the name's first and last eight bytes. A slot holds 20 bits of the
-// hash, the id, the length and the name's offset in the arena, so a probe
-// compares names only when hash bits and length agree. A new name is copied
-// into the arena and published with one compare-and-swap; a thread that loses
-// the race compares against the winner's name.
-struct Names {
-  static constexpr u32 SLOTS = 1 << 13, ARENA = 1 << 19;
-  std::atomic<u64> slot[SLOTS];
-  std::atomic<u32> used{0}, next_id{0}, count{0};
-  char arena[ARENA + 64];
+// Bit i is set when byte i of the 64 in a and b equals the same byte of x, y.
+inline u64 eq64(__m256i a, __m256i b, __m256i x, __m256i y) {
+  return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, x))) |
+         u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, y)))) << 32;
+}
 
-  std::string_view name(u64 v) const {
-    return {arena + (v & 0xFFFFF), size_t((v >> 20) & 0xFFF)};
+// Endpoint names to dense ids, one table for all threads. A slot of the
+// open-addressing table (16 KB, so it stays in the core's first cache) holds
+// a name's id plus one, found by a CRC of the name's first and last eight
+// bytes. Names sit 128 bytes apart, each followed by a space, as a name in a
+// line is: the name and its space match a stored one exactly when the names
+// are equal, so a name of up to 63 bytes is confirmed by the same two 32-byte
+// loads that found its end. A new name is claimed with one compare-and-swap
+// (the slot holds BUSY until the name is written), so no thread reads a
+// half-written name.
+struct Names {
+  static constexpr u32 SLOTS = 1 << 13, MAX = 2047, STRIDE = 128,
+                       BUSY = 0xFFFF;
+  std::atomic<uint16_t> slot[SLOTS];
+  std::atomic<u32> ids{0}, count{0};
+  uint8_t length[MAX];
+  alignas(64) char text[(MAX + 1) * STRIDE];
+
+  std::string_view name(u32 id) const {
+    return {text + id * STRIDE, length[id]};
   }
 
-  u32 operator()(std::string_view s) {
-    u64 a, b = 0, n = s.size();
-    memcpy(&a, s.data(), 8);
-    if (n >= 8)
-      memcpy(&b, s.data() + n - 8, 8);
-    else
-      a &= (u64(1) << 8 * n) - 1;
-    u64 h = _mm_crc32_u64(_mm_crc32_u64(n, a), b);
-    for (u32 i = h;; ++i) {
-      u32 j = i % SLOTS;
-      u64 v = slot[j].load(std::memory_order_acquire);
-      if (!v) {
-        u32 at = used.fetch_add(n), id = next_id.fetch_add(1);
-        memcpy(arena + at, s.data(), n);
-        u64 nv = (u64(h >> 12) << 44) | (u64(id) << 32) | (n << 20) | at;
-        if (slot[j].compare_exchange_strong(v, nv))
-          return ++count, id;
-      }
-      if ((v >> 44) == (h >> 12) && ((v >> 20) & 0xFFF) == n &&
-          same(name(v), s))
-        return u32(v >> 32) & 0xFFF;
+  // The id of the name of length n at s, whose first 64 bytes are v0, v1.
+  u32 find(const char *s, u32 n, __m256i v0, __m256i v1) {
+    u64 a, b;
+    memcpy(&a, s, 8), memcpy(&b, s + n - 8, 8);
+    if (n < 8)
+      a = _bzhi_u64(a, 8 * n), b = 0;
+    for (u32 h = _mm_crc32_u64(_mm_crc32_u64(n, a), b);; ++h) {
+      u32 v = slot[h % SLOTS].load(std::memory_order_acquire);
+      if (v - 1 >= MAX) [[unlikely]]
+        return insert(h, s, n);
+      const char *e = text + (v - 1) * STRIDE;
+      u64 eq = eq64(v0, v1, load(e), load(e + 32));
+      if (n < 64 ? (~eq & _bzhi_u64(~u64(0), n + 1)) == 0
+                 : ~eq == 0 && (~eq64(load(s + 64), load(s + 96),
+                                      load(e + 64), load(e + 96)) &
+                                _bzhi_u64(~u64(0), n - 63)) == 0)
+        return v - 1;
     }
   }
 
-  // 64 bytes can always be read from either name (the rest of the line and
-  // the spare page follow one, the arena's spare bytes the other), so a name
-  // of up to 64 bytes is compared in two steps.
-  static bool same(std::string_view x, std::string_view s) {
-    if (s.size() > 64)
-      return x == s;
-    auto eq = [&](int i) {
-      __m256i a = _mm256_loadu_si256((const __m256i *)(x.data() + i));
-      __m256i b = _mm256_loadu_si256((const __m256i *)(s.data() + i));
-      return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)));
-    };
-    return (~(eq(0) | u64(eq(32)) << 32) & (~u64(0) >> (64 - s.size()))) == 0;
+  [[gnu::noinline]] u32 insert(u32 h, const char *s, u32 n) {
+    for (;;) {
+      std::atomic<uint16_t> &at = slot[h % SLOTS];
+      uint16_t v = at.load(std::memory_order_acquire);
+      if (v == BUSY)
+        continue;
+      if (v == 0) {
+        if (!at.compare_exchange_strong(v, BUSY))
+          continue;
+        u32 id = ids++;
+        if (id >= MAX)
+          _exit(3);
+        memcpy(text + id * STRIDE, s, n);
+        text[id * STRIDE + n] = ' ', length[id] = n;
+        at.store(id + 1, std::memory_order_release);
+        return ++count, id;
+      }
+      if (length[v - 1] == n && !memcmp(text + (v - 1) * STRIDE, s, n))
+        return v - 1;
+      ++h;
+    }
   }
 };
 static Names endpoints;
@@ -224,60 +231,86 @@ static std::atomic<u32> filled[HOURS];
 
 struct Parser {
   u32 *cur[HOURS] = {}, *stop[HOURS] = {};
-  int h = 0;
 
   // Lines arrive in about clock order, so the hour index is worked out only
-  // when the line's "MM-DDTHH" bytes differ from the line before's.
+  // when the line's "MM-DDTHH" bytes differ from the line before's, and the
+  // hour's place in its records stays in registers until then.
+  //
+  // The line ends of each 64-byte block are found at once and the lines taken
+  // from them bit by bit, so a line's start does not wait on the parse of the
+  // line before and the core overlaps several lines. A line is read from both
+  // ends: the method and the name from its start, the latency (at most 10
+  // digits after the last space) and the status back from its LF.
   void run(const char *p, const char *end) {
-    for (u64 stamp = 0, at; p < end;) {
+    const __m256i space = _mm256_set1_epi8(' '), lf = _mm256_set1_epi8('\n');
+    const __m128i space16 = _mm256_castsi256_si128(space);
+    u32 *c = nullptr, *lim = nullptr;
+    int h = -1;
+    u64 stamp = 0, at;
+    const char *block = p;
+    for (u64 ends = eq64(load(block), load(block + 32), lf, lf); p < end;
+         ends &= ends - 1) {
+      while (!ends) {
+        // The log streams through once; fetching it 1 KB ahead with the
+        // non-temporal hint keeps it from pushing the endpoint table and the
+        // names out of the core's caches.
+        _mm_prefetch(block + 1024, _MM_HINT_NTA);
+        block += 64, ends = eq64(load(block), load(block + 32), lf, lf);
+      }
+      const char *e = block + __builtin_ctzll(ends);
       memcpy(&at, p + 5, 8);
-      if (at != stamp) {
+      if (at != stamp) [[unlikely]] {
+        if (h >= 0)
+          cur[h] = c, stop[h] = lim;
         int day = (p[8] - '0') * 10 + p[9] - '0',
             hr = (p[11] - '0') * 10 + p[12] - '0';
         h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18, stamp = at;
+        c = cur[h], lim = stop[h];
       }
-      // The log streams through once; fetching it 1 KB ahead with the
-      // non-temporal hint keeps it from pushing the endpoint table and the
-      // names out of the core's caches.
-      _mm_prefetch(p + 1024, _MM_HINT_NTA);
-      const char *m = p + 28;
-      u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
-      const char *name = m + __builtin_ctzll(sp) + 1;
-      sp &= sp - 1;
-      const char *ne = sp ? m + __builtin_ctzll(sp) : next_byte(m + 64, ' ');
-      // After " SSS " come the latency's digits (bit 0x10 set) and the LF
-      // (clear). Up to 7 digits are decoded in one word: moved to its top,
-      // so the bytes below read as leading zeros, then combined 2, 4 and 8
-      // at a time with multiplies. Longer ones (rare) go digit by digit.
-      u64 w, digits;
-      memcpy(&w, ne + 5, 8);
-      u32 len, lat;
-      if (u64 lf = ~w & 0x1010101010101010) {
-        len = __builtin_ctzll(lf) >> 3;
-        digits = (w << (64 - 8 * len)) & 0x0F0F0F0F0F0F0F0F;
+      u32 method = _mm_movemask_epi8(_mm_cmpeq_epi8(
+          _mm_loadu_si128((const __m128i *)(p + 28)), space16));
+      u32 tail = _mm_movemask_epi8(_mm_cmpeq_epi8(
+          _mm_loadu_si128((const __m128i *)(e - 16)), space16));
+      const char *name = p + 29 + __builtin_ctz(method);
+      u32 len = __builtin_clz(tail) - 16; // digits after the last space
+      const char *ne = e - len - 5;       // the space before the status
+      u32 n = ne - name;
+      // Up to 8 digits are decoded in one word: the 8 bytes before the LF,
+      // with those below the digits cleared so they read as leading zeros,
+      // combined 2, 4 and 8 at a time with multiplies. Longer ones (rare) go
+      // digit by digit.
+      u32 lat = 0;
+      if (len <= 8) [[likely]] {
+        u64 digits;
+        memcpy(&digits, e - 8, 8);
+        digits = digits >> (64 - 8 * len) << (64 - 8 * len) & 0x0F0F0F0F0F0F0F0F;
         digits = (digits * 2561) >> 8 & 0x00FF00FF00FF00FF;
         digits = (digits * 6553601) >> 16 & 0x0000FFFF0000FFFF;
         lat = (digits * 42949672960001) >> 32;
       } else
-        for (len = lat = 0; ne[5 + len] != '\n'; ++len)
-          lat = lat * 10 + ne[5 + len] - '0';
-      u32 key = endpoints({name, size_t(ne - name)}) | (ne[1] == '5' ? ERR : 0);
-      p = ne + 6 + len;
-      u32 *&c = cur[h];
-      if (__builtin_expect(lat >= PACKED_MAX, 0)) {
-        if (stop[h] - c < 2) // the pair stays in one block
-          std::fill(c, stop[h], SPARE), c = stop[h];
-        if (c == stop[h])
-          c = records + h * per_hour + filled[h].fetch_add(BLOCK),
-          stop[h] = c + BLOCK;
+        for (const char *d = e - len; d < e; ++d)
+          lat = lat * 10 + *d - '0';
+      u32 key = endpoints.find(name, n, load(name), load(name + 32)) |
+                (ne[1] == '5' ? ERR : 0);
+      p = e + 1;
+      if (lat >= PACKED_MAX) [[unlikely]] {
+        if (lim - c < 2) // the pair stays in one block
+          std::fill(c, lim, SPARE), c = lim;
+        if (c == lim)
+          c = claim(h), lim = c + BLOCK;
         *c++ = ESCAPE | key, *c++ = lat;
         continue;
       }
-      if (c == stop[h])
-        c = records + h * per_hour + filled[h].fetch_add(BLOCK),
-        stop[h] = c + BLOCK;
+      if (c == lim) [[unlikely]]
+        c = claim(h), lim = c + BLOCK;
       *c++ = lat << KEY_BITS | key;
     }
+    if (h >= 0)
+      cur[h] = c, stop[h] = lim;
+  }
+
+  static u32 *claim(int h) {
+    return records + h * per_hour + filled[h].fetch_add(BLOCK);
   }
 
   void seal() {
@@ -335,8 +368,8 @@ int main() {
   auto rank_names = [&] {
     std::vector<std::pair<std::string_view, u32>> by_name;
     for (u32 i = 0; i < Names::SLOTS; ++i)
-      if (u64 v = endpoints.slot[i])
-        by_name.push_back({endpoints.name(v), u32(v >> 32) & 0xFFF});
+      if (u32 v = endpoints.slot[i]; v && v != Names::BUSY)
+        by_name.push_back({endpoints.name(v - 1), v - 1});
     std::sort(by_name.begin(), by_name.end());
     names.clear(), by_rank.clear();
     for (auto [name, id] : by_name)
@@ -401,7 +434,7 @@ int main() {
       parsers[t].seal();
       ranked.arrive_and_wait();
       {
-        const u32 ne = names.size(), ids = endpoints.next_id;
+        const u32 ne = names.size(), ids = endpoints.ids;
         std::vector<u32> start(ids), errors(ids), cursor(ids);
         std::unique_ptr<u32[]> latency(new u32[most]);
         for (int i; (i = claim++) < HOURS;) {

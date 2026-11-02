@@ -61,6 +61,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 53 | Step 52 with the permutation tables replaced by BMI2 (`pdep` spreads the mask to bytes, `pext` gathers the lane indices) and a shorter recursion | pending | | | |
 | 54 | Latencies of 2^19 - 1 or more stored in the hour's region as an escape record followed by the raw value, instead of 864 per-thread side vectors | run-b114f738369d | 0.0204 s | 17.4 MiB | 84.42 |
 | 55 | Step 51 (no AVX2 selection) with step 54's in-region escapes | run-2ffb5eb89fd7 | 0.0242 s | 16.75 MiB | 83.11 |
+| 56 | New parse: each 64-byte block's line ends found at once and lines taken bit by bit, each line read from both ends; a 16 KB slot table with names 128 bytes apart, confirmed by the loads that found the name's end; the hour's record cursor kept in registers | pending | | | |
 
 ## Local measurements
 
@@ -207,6 +208,8 @@ Also measured after step 32 and kept out, same hash on all six datasets each tim
 
 **Step 55 on the board.** run-2ffb5eb89fd7: 16.75 MiB, the lowest Track A memory so far, but 0.0242 s, 17% slower than step 51's 0.0207 s, in a run where the other tracks ran their usual times. That is beyond the spread seen for unchanged A code, so this push only logs it and gives the same code a second run before deciding.
 The second run of the same code (run-4998b051e55d, from a later commit) took 0.0210 s at 17.2 MiB, 84.51 points, so the first was noise; step 55's code stays.
+
+**Step 55 to 56: a new parse.** A fresh profile of step 55 (laptop, `perf annotate`): the parse is 60% of user cycles at about 127 instructions a line, with values spilled to the stack around the `memcmp` call for long names and the hour's record cursor reloaded from memory on every line. More to the point, each line's start waited on a chain of about 40 cycles through the line before it: the load at the timestamp, the 64-byte space scan, the load after the name, the digit count, and only then the next line's address. Two rewrites, each correct on all eight local datasets (full, sample, tiny, the worked example, an empty log, the seed-9 sample and the two disordered logs). (1) Fewer instructions: the hour's cursor and block end live in registers and are saved only when the hour changes; the endpoint table is 8,192 two-byte slots (16 KB, so it stays in the first-level cache) holding id plus one, with names 128 bytes apart, each followed by a space as in the line, so the name and its space equal a stored one exactly when the names are equal, and the two 32-byte loads that found the name's end also confirm it; no library call is left in the loop. 593M user instructions against 688M, but the same user cycles (350 to 363M against 352 to 378M). (2) No chain between lines: each 64-byte block's LFs are found with one compare, lines are taken bit by bit, and a line is read from both ends: the method and name from the front, the latency (the digits after the last space, found in the 16 bytes before the LF) and the status back from the LF. 637M instructions, user cycles again level. The laptop's parse is held by its memory and its virtual machine's page walks, which neither change touches; the box (step 42: its parse is bound by its own work, the second thread of each core worth a third) has to judge. Step 56 is (2).
 
 ## Tried and kept out
 
