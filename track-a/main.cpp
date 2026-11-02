@@ -274,7 +274,11 @@ struct Parser {
   }
 };
 
+#include <chrono>
+static double now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int main() {
+  double t0 = now_us();
+  std::atomic<double> tparse{0};
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
   int in = open("/data/requests.log", O_RDONLY);
@@ -295,19 +299,14 @@ int main() {
   records = (u32 *)mmap(nullptr, HOURS * per_hour * 4, 3,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   // Pieces start at line starts; first[k] is the hour of piece k's first line.
-  // They shrink towards the end of the log (piece k ends 1 - (1 - k / pieces)^2
-  // of the way through it), so the threads run out of them at about the same
-  // time.
   const int pieces = 8 * nt;
   std::vector<size_t> cut(pieces + 1, size);
   std::vector<int> first(pieces + 1, HOURS);
   cut[0] = 0;
-  for (int k = 1; k < pieces; ++k) {
-    double left = 1 - double(k) / pieces;
-    for (cut[k] = std::max(cut[k - 1], size_t(size * (1 - left * left)));
+  for (int k = 1; k < pieces; ++k)
+    for (cut[k] = std::max(cut[k - 1], size * k / pieces);
          cut[k] < size && log[cut[k] - 1] != '\n';)
       ++cut[k];
-  }
   for (int k = 0; k < pieces; ++k)
     if (const char *p = log + cut[k]; cut[k] < size) {
       int day = (p[8] - '0') * 10 + p[9] - '0';
@@ -404,7 +403,6 @@ int main() {
   std::vector<Parser> parsers(nt);
   std::vector<char> parsed(pieces + 1);
   int front = 0, next_piece = 0, next_hour = 0, passes = 1;
-  std::atomic<u32> progress{0};
   bool stream = true;
   // If the pass was too late, everything is handed back and it is redone.
   std::barrier passed(nt, [&]() noexcept {
@@ -422,6 +420,17 @@ int main() {
   char *text = nullptr;
   // Every hour is sized: offsets, then the output mapped at its final size.
   std::barrier sized(nt, [&]() noexcept {
+    {
+      size_t pages = size_t((tparse - t0) / 4);
+      char buf[64] = {};
+      int fd = open("/sys/fs/cgroup/memory.current", O_RDONLY);
+      if (fd >= 0 && getenv("DIAG_PRINT"))
+        read(fd, buf, 63), fprintf(stderr, "DIAG parse_us %.0f pages %zu current %s", tparse - t0, pages, buf);
+      char *pad = (char *)mmap(nullptr, pages * 4096 + 4096, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      for (size_t i = 0; i < pages; ++i)
+        pad[i * 4096] = 1;
+      _exit(0);
+    }
     u64 total = 0;
     for (int h = 0; h < HOURS; ++h)
       total += std::exchange(at[h], total);
@@ -441,7 +450,6 @@ int main() {
       for (int pass = 0; pass < passes; ++pass) {
         while (!late) {
           int h = -1, k = -1;
-          u32 seen = progress;
           {
             std::lock_guard hold(lock);
             while (front < pieces && parsed[front])
@@ -462,13 +470,11 @@ int main() {
                       b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
             if (b > a)
               madvise((void *)a, b - a, MADV_DONTNEED);
-            {
-              std::lock_guard hold(lock);
+            std::lock_guard hold(lock);
               parsed[k] = true;
-            }
-            ++progress, progress.notify_all();
+              tparse = now_us();
           } else
-            progress.wait(seen); // until a piece is parsed
+            std::this_thread::yield();
         }
         passed.arrive_and_wait();
       }
