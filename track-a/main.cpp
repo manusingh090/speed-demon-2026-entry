@@ -76,6 +76,14 @@ inline void put(char *end, u32 x) {
     end[-1] = '0' + x;
 }
 
+// The hour of the line at p, counted from the span's first: its timestamp is
+// always 27 bytes, so the day and hour digits are enough.
+inline int hour_of(const char *p) {
+  int day = (p[8] - '0') * 10 + p[9] - '0';
+  return (p[6] == '0' ? day - 30 : day + 1) * 24 + (p[11] - '0') * 10 + p[12] -
+         '0' - 18;
+}
+
 inline __m256i load(const char *p) {
   return _mm256_loadu_si256((const __m256i *)p);
 }
@@ -219,9 +227,7 @@ struct Parser {
       if (at != stamp) [[unlikely]] {
         if (h >= 0)
           cur[h] = c, stop[h] = lim, --active[h];
-        int day = (p[8] - '0') * 10 + p[9] - '0',
-            hr = (p[11] - '0') * 10 + p[12] - '0';
-        h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18, stamp = at;
+        h = hour_of(p), stamp = at;
         ++active[h];
         if (closed[h]) // too late for this pass
           return late.store(true);
@@ -274,11 +280,7 @@ struct Parser {
   }
 };
 
-#include <chrono>
-static double now_us() { return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int main() {
-  double t0 = now_us();
-  std::atomic<double> tparse{0};
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
   int in = open("/data/requests.log", O_RDONLY);
@@ -308,11 +310,8 @@ int main() {
          cut[k] < size && log[cut[k] - 1] != '\n';)
       ++cut[k];
   for (int k = 0; k < pieces; ++k)
-    if (const char *p = log + cut[k]; cut[k] < size) {
-      int day = (p[8] - '0') * 10 + p[9] - '0';
-      first[k] = (p[6] == '0' ? day - 30 : day + 1) * 24 +
-                 (p[11] - '0') * 10 + p[12] - '0' - 18;
-    }
+    if (cut[k] < size)
+      first[k] = hour_of(log + cut[k]);
 
   // Hour h's count[h] lines sit from lines + h * hour_bytes, each hour on
   // pages of its own, handed back once the hour's text is written.
@@ -323,8 +322,37 @@ int main() {
   char *lines = (char *)mmap(nullptr, HOURS * hour_bytes, 3,
                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   std::vector<u32> count(HOURS);
-  std::vector<u64> at(HOURS + 1);
   auto ppm = [](const Line &l) { return u32(u64(l.errors) * 1000000 / l.n); };
+  // Hour h's text takes bytes[h] and starts at at[h], known once every
+  // earlier hour is finished (the first `sized` hours).
+  std::vector<u64> at(HOURS + 1), bytes(HOURS);
+  std::vector<char> finished(HOURS);
+  int sized = 0, next_text = 0;
+  u64 early = 0;
+  // The output is mapped at a size no output reaches (a group's line is less
+  // than one and a half times its log line) and cut to size at the end, so
+  // an hour's text can be written as soon as its offset is known.
+  const size_t room = 3 * size + 4096;
+  char *text = (char *)mmap(nullptr, room, 3, MAP_SHARED, out, 0);
+  if (ftruncate(out, room) || text == MAP_FAILED)
+    return perror("output"), 1;
+  auto write = [&](int h) {
+    char label[32];
+    int day = (h + 18) / 24;
+    snprintf(label, 32, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
+             day < 2 ? 30 + day : day - 1, (h + 18) % 24);
+    char *o = text + at[h];
+    for (u32 i = 0; i < count[h]; ++i) {
+      const Line &l = ((Line *)(lines + h * hour_bytes))[i];
+      std::string_view name = endpoints.name(l.id);
+      o = std::copy_n(label, 21, o);
+      o = std::copy(name.begin(), name.end(), o);
+      for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
+        *o = ' ', o += 1 + width(x), put(o, x);
+      *o++ = '\n';
+    }
+    madvise(lines + h * hour_bytes, hour_bytes, MADV_DONTNEED);
+  };
 
   std::mutex lock;
   std::vector<std::unique_ptr<Ranking>> rankings;
@@ -394,7 +422,10 @@ int main() {
         sz += width(x);
     }
     madvise(keys, (sorted + total - keys) * 4, MADV_DONTNEED);
-    at[h] = sz;
+    std::lock_guard hold(lock);
+    bytes[h] = sz, finished[h] = true;
+    for (; sized < HOURS && finished[sized]; ++sized)
+      at[sized + 1] = at[sized] + bytes[sized];
   };
 
   // The pass. Each thread closes and finishes the next hour once the first
@@ -411,45 +442,20 @@ int main() {
     madvise(records, HOURS * per_hour * 4, MADV_DONTNEED);
     madvise(lines, HOURS * hour_bytes, MADV_DONTNEED);
     for (int h = 0; h < HOURS; ++h)
-      filled[h] = active[h] = count[h] = 0, closed[h] = false;
+      filled[h] = active[h] = count[h] = finished[h] = 0, closed[h] = false;
+    sized = next_text = early = 0;
     for (auto &p : parsers)
       p = Parser();
     std::fill(parsed.begin(), parsed.end(), 0);
     front = next_piece = next_hour = 0, stream = late = false, ++passes;
   });
-  char *text = nullptr;
-  // Every hour is sized: offsets, then the output mapped at its final size.
-  std::barrier sized(nt, [&]() noexcept {
-    {
-      size_t pages = size_t((tparse - t0) / 4);
-      char buf[64] = {};
-      int fd = open("/sys/fs/cgroup/memory.current", O_RDONLY);
-      if (fd >= 0 && getenv("DIAG_PRINT"))
-        read(fd, buf, 63), fprintf(stderr, "DIAG parse_us %.0f pages %zu current %s", tparse - t0, pages, buf);
-      char *pad = (char *)mmap(nullptr, pages * 4096 + 4096, 3, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      for (size_t i = 0; i < pages; ++i)
-        pad[i * 4096] = 1;
-      _exit(0);
-    }
-    u64 total = 0;
-    for (int h = 0; h < HOURS; ++h)
-      total += std::exchange(at[h], total);
-    at[HOURS] = total;
-    if (!total)
-      return;
-    if (ftruncate(out, total) ||
-        (text = (char *)mmap(nullptr, total, 3, MAP_SHARED, out, 0)) ==
-            MAP_FAILED)
-      _exit(1);
-  });
-
   std::vector<std::thread> pool;
   for (int t = 0; t < nt; ++t)
     pool.emplace_back([&, t] {
       std::vector<u64> big;
       for (int pass = 0; pass < passes; ++pass) {
         while (!late) {
-          int h = -1, k = -1;
+          int h = -1, k = -1, g = -1;
           {
             std::lock_guard hold(lock);
             while (front < pieces && parsed[front])
@@ -459,11 +465,15 @@ int main() {
               h = next_hour++, closed[h] = true;
             else if (next_piece < pieces)
               k = next_piece++;
+            else if (next_text < sized && early + bytes[next_text] <= 3000000)
+              g = next_text++, early += bytes[g];
             else if (next_hour == HOURS)
               break;
           }
           if (h >= 0)
             finish(h, big);
+          else if (g >= 0)
+            write(g);
           else if (k >= 0) {
             parsers[t].run(log + cut[k], log + cut[k + 1]);
             uintptr_t a = (uintptr_t(log + cut[k]) + 4095) & ~uintptr_t(4095),
@@ -471,33 +481,26 @@ int main() {
             if (b > a)
               madvise((void *)a, b - a, MADV_DONTNEED);
             std::lock_guard hold(lock);
-              parsed[k] = true;
-              tparse = now_us();
+            parsed[k] = true;
           } else
             std::this_thread::yield();
         }
         passed.arrive_and_wait();
       }
-      sized.arrive_and_wait();
-      for (int h = t; h < HOURS; h += nt) {
-        char label[32];
-        int day = (h + 18) / 24;
-        snprintf(label, 32, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11,
-                 day < 2 ? 30 + day : day - 1, (h + 18) % 24);
-        char *o = text + at[h];
-        for (u32 i = 0; i < count[h]; ++i) {
-          const Line &l = ((Line *)(lines + h * hour_bytes))[i];
-          std::string_view name = endpoints.name(l.id);
-          o = std::copy_n(label, 21, o);
-          o = std::copy(name.begin(), name.end(), o);
-          for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)})
-            *o = ' ', o += 1 + width(x), put(o, x);
-          *o++ = '\n';
+      // The rest of the text, every hour's offset now known.
+      for (;;) {
+        int g;
+        {
+          std::lock_guard hold(lock);
+          if ((g = next_text++) >= HOURS)
+            break;
         }
-        madvise(lines + h * hour_bytes, hour_bytes, MADV_DONTNEED);
+        write(g);
       }
     });
   for (auto &th : pool)
     th.join();
+  if (ftruncate(out, at[HOURS]))
+    return perror("output"), 1;
   close(out);
 }
