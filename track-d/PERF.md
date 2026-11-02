@@ -4,7 +4,7 @@ Every step from the reference to your final version, each with the live-board ru
 
 ## Where it stands
 
-Best run: **run-c8d89b3d1e46**, 0.1260 s, 55.07 MiB, 705 counted lines, 71.81 points (step 34's code). The reference takes 72.69 s. The decisions that moved it most, each measured below:
+Best run: **run-360759fad852**, 0.1243 s, 55.41 MiB, 707 counted lines, 71.92 points (step 38's code; step 34's best was run-c8d89b3d1e46, 0.1260 s and 71.81). The reference takes 72.69 s. The decisions that moved it most, each measured below:
 
 - **Renumbering nodes for locality**: node ids are a random relabelling, which cost about 480 ns per settled node. Compact 512-node BFS blobs (step 4) put a road neighbourhood on a few cache lines, and since step 31 the BFS copies each node's edges into the new order as it orders it.
 - **Bidirectional Dijkstra with distances in recycled 4 KB pages**: about 7.1 million settled nodes for 2,000 queries, in a few MB a thread instead of 167 MB of dense arrays.
@@ -70,7 +70,7 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 36 | Back to step 34's code (no board run of its own: superseded by the diagnostic) | | | | |
 | 36d | Diagnostic: time to the first search reported through M, time to the end of the BFS through T | run-0a5e9b7be14b | (1.184 s) | (276 MiB) | |
 | 37 | Back to step 34's code | run-d2d4f27e8067 (also run-5fc51c420d92) | 0.1267 (0.1361) s | 55 MiB | 71.77 (70.96) |
-| 38 | Distance pages of 128 instead of 512; the search recomputes only the settled side's smallest key | pending | | | |
+| 38 | Distance pages of 128 instead of 512; the search recomputes only the settled side's smallest key | run-360759fad852 | 0.1243 s | 55.4 MiB | 71.92 |
 
 ## What the profile said, step by step
 
@@ -216,6 +216,7 @@ Also measured at this step and kept out:
 
 - *Not queueing a node that cannot win.* A node whose length plus the other side's smallest queued key is at least the best meeting would never be settled before the search stops, so it need not be queued (its meeting with the other side is still recorded). Pushes fell from 8,653,549 to 8,158,512 (minus 5.7%), but cycles moved by 0.4%, inside the noise, so the four lines stayed out.
 - *Prefetching the next node's neighbours' distance slots* at the end of each settle, once its edges have had a settle's time to arrive: 3 to 7% more cycles.
+- *Faulting pages in ahead of random writes.* Page faults were 10% of all cycles, and part of that was threads waiting on one page-table lock while writing the same 2 MB of an array at random places (the part build's edge array, the in-degree counts, the reverse edges, the id map). Each thread asked for its own share of those arrays first with `MADV_POPULATE_WRITE`. With all four, 1.6% fewer cycles over seven rounds, but the peak rose from 55 to 60 MB, since the id map's and the reverse edges' pages then arrived while older arrays were still alive. Leaving out the id map and freeing the old id map in the same phase that faults in the reverse edges brought the peak back to 56 MB, and then the gain was gone: 0.5% fewer cycles over five rounds, the same wall time (0.1254 against 0.1252 s), for about 14 more lines. Kept out.
 - Two facts from the generator and the data that bound what is left: queries pick a Dijkstra rank in octaves 1 to 16, so the few searches of rank 65,536 to 131,071 do most of the 7.1 million settles; and only 6,016 of the 5 million edges repeat a (u, v) pair and 508 are self-loops, so removing duplicates would save nothing. On the laptop the threads finish the searches within about 5 ms of each other.
 
 ## Tried and kept out
