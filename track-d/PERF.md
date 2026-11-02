@@ -57,7 +57,9 @@ Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`
 | 33 | The searches' 4-ary heaps replaced by circular bucket queues (Dial's algorithm), with a heap only for keys 2048 or more ahead | run-f1ffaa1199a3 | 0.1375 s | 55 MiB | 70.73 |
 | 34 | 4096 buckets and a plain list for keys beyond them (the heap goes); the big build arrays handed back on every thread | run-a2ac8acf23d1 (also run-34f406eb7523) | 0.1275 (0.1294) s | 55 MiB | 71.69 (71.47) |
 | 35 | The BFS records each node's place as it claims it and where its row starts, so the id pass goes and each thread packs its own ids' offsets; the parse takes pieces in turn; the edge passes split all regions evenly | run-6a048c2af883 | 0.1273 s | 66 MiB | 70.78 |
-| 36 | Back to step 34's code | pending | | | |
+| 36 | Back to step 34's code (no board run of its own: superseded by the diagnostic) | | | | |
+| 36d | Diagnostic: time to the first search reported through M, time to the end of the BFS through T | run-0a5e9b7be14b | (1.184 s) | (276 MiB) | |
+| 37 | Back to step 34's code | pending | | | |
 
 ## What the profile said, step by step
 
@@ -184,6 +186,8 @@ Locally, six `perf stat -r 5` rounds against step 21: median 0.167 against 0.178
 **Step 34 to 35: barriers.** Each build phase ends at a barrier, so it lasts as long as its slowest thread. Lap timers with each thread's finish time showed the parse's threads finishing anywhere from 10 to 29 ms on the laptop (equal byte ranges, unequal page-fault luck), and the mapping and reverse-fill passes spreading by up to 2x, since each worked on its own thread's chain and the BFS hands threads unequal numbers of nodes. Now the file is cut into 8 pieces per thread, taken in turn; the BFS claimer of a node also stores its place (index in the thread's chain times 16 plus the thread), from which the new id follows once the chain lengths are known, and records where each node's row starts, so the id pass and the plain offsets array go and each thread packs the offsets of its own ids; and the mapping and reverse fill split the concatenated regions evenly. A first version claimed nodes by compare-exchange on the 7 MB place array itself, which made the BFS's claim checks miss cache (BFS 33 to 37 ms against 20 to 30); claims stay on the 1.7 MB flags. Same settles (7,123,857), same hash on all thirty datasets; on the laptop the twelve-thread rounds could not separate it from step 34, so the box decides.
 
 **Step 35 on the board, and step 36.** run-6a048c2af883: 0.1273 s against 0.1275 for step 34, so no time gained, and 66 MiB against 55: the per-thread lists of row starts (7 MB in all) and the 7 MB place array live during the BFS next to the old graph, the BFS queues and the new edge array, which made the BFS the peak (69 MB locally against 57). Step 36 is step 34's code again.
+
+**Third diagnostic.** With the bucket queues the search share had changed, so the box was asked again, two marks at once: the time at which the searches start goes into M as before (200 MiB plus one per millisecond), and the time at which the BFS ends goes into T, the run sleeping until 1000 ms plus four times that mark. run-0a5e9b7be14b reported 289,488,896 bytes and 1.1844 s: on the box the BFS ends about 46 ms after exec and the searches start at about 72 ms. With step 34's 0.1275 s, that is about 18 ms of parse, 28 ms of part build and BFS, 26 ms of the passes after the BFS (ids, packing, mapping, reverse graph) and 55 ms of searches, release and exit. Step 37 is step 34's code again.
 
 ## Tried and kept out
 

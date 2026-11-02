@@ -479,7 +479,6 @@ fn main() {
         prctl(41, 1, 0, 0, 0); // PR_SET_THP_DISABLE
         mallopt(-3, 1 << 16); // M_MMAP_THRESHOLD
     }
-    let clock = std::time::Instant::now(); // diagnostic run: see the end of main
     let nt = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 12);
     let qtext = map("/data/queries.txt");
     let mut queries = Vec::new();
@@ -668,7 +667,6 @@ fn main() {
             }
         }
     });
-    let mark2 = clock.elapsed().as_secs_f64() * 1e3;
     drop(filed);
 
     // New ids: each thread's chain in turn (every node is in one), then at
@@ -750,7 +748,6 @@ fn main() {
     rheavy.sort_unstable();
     let roff = Offs::pack(nt, &roff_v[..n2 + 1]);
 
-    let mark = clock.elapsed().as_secs_f64() * 1e3;
     // 4. Queries sorted so neighbouring searches share cached pages.
     let mut order: Vec<usize> = (0..ends.len()).collect();
     order.sort_unstable_by_key(|&q| ends[q]);
@@ -789,13 +786,4 @@ fn main() {
     // INF prints as -1 (u64::MAX as i64); every real distance is below 2^63.
     let out: String = ans.iter().map(|&a| format!("{}\n", a as i64)).collect();
     std::fs::write("/out/distances.txt", out).unwrap();
-    // Diagnostic run: the board reports peak memory, so touch 200 MiB plus
-    // one MiB per millisecond that had passed at the mark; and it reports the
-    // time, so sleep until 1000 ms plus four times the second mark.
-    let mut pad = vec![0u8; (200 + mark as usize) << 20];
-    pad.iter_mut().step_by(4096).for_each(|b| *b = 1);
-    std::hint::black_box(&pad);
-    drop(pad);
-    let until = std::time::Duration::from_secs_f64((1000.0 + 4.0 * mark2) / 1e3);
-    std::thread::sleep(until.saturating_sub(clock.elapsed()));
 }
