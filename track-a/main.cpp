@@ -295,14 +295,19 @@ int main() {
   records = (u32 *)mmap(nullptr, HOURS * per_hour * 4, 3,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   // Pieces start at line starts; first[k] is the hour of piece k's first line.
+  // They shrink towards the end of the log (piece k ends 1 - (1 - k / pieces)^2
+  // of the way through it), so the threads run out of them at about the same
+  // time.
   const int pieces = 8 * nt;
   std::vector<size_t> cut(pieces + 1, size);
   std::vector<int> first(pieces + 1, HOURS);
   cut[0] = 0;
-  for (int k = 1; k < pieces; ++k)
-    for (cut[k] = std::max(cut[k - 1], size * k / pieces);
+  for (int k = 1; k < pieces; ++k) {
+    double left = 1 - double(k) / pieces;
+    for (cut[k] = std::max(cut[k - 1], size_t(size * (1 - left * left)));
          cut[k] < size && log[cut[k] - 1] != '\n';)
       ++cut[k];
+  }
   for (int k = 0; k < pieces; ++k)
     if (const char *p = log + cut[k]; cut[k] < size) {
       int day = (p[8] - '0') * 10 + p[9] - '0';
@@ -399,6 +404,7 @@ int main() {
   std::vector<Parser> parsers(nt);
   std::vector<char> parsed(pieces + 1);
   int front = 0, next_piece = 0, next_hour = 0, passes = 1;
+  std::atomic<u32> progress{0};
   bool stream = true;
   // If the pass was too late, everything is handed back and it is redone.
   std::barrier passed(nt, [&]() noexcept {
@@ -435,6 +441,7 @@ int main() {
       for (int pass = 0; pass < passes; ++pass) {
         while (!late) {
           int h = -1, k = -1;
+          u32 seen = progress;
           {
             std::lock_guard hold(lock);
             while (front < pieces && parsed[front])
@@ -455,10 +462,13 @@ int main() {
                       b = uintptr_t(log + cut[k + 1]) & ~uintptr_t(4095);
             if (b > a)
               madvise((void *)a, b - a, MADV_DONTNEED);
-            std::lock_guard hold(lock);
-            parsed[k] = true;
+            {
+              std::lock_guard hold(lock);
+              parsed[k] = true;
+            }
+            ++progress, progress.notify_all();
           } else
-            std::this_thread::yield();
+            progress.wait(seen); // until a piece is parsed
         }
         passed.arrive_and_wait();
       }
