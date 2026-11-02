@@ -7,12 +7,12 @@
 //     sees. Countries get indices 1..N in code order (0 is _UNMATCHED).
 //  2. Each thread fills its slice of a direct table region_id -> country index.
 //  3. records.csv is split at CRLFs: the generator never writes a CR inside
-//     quotes, so the byte after a CRLF always starts a record. The file is
-//     classified 64 bytes at a time into masks of quotes and of the commas and
-//     LFs outside quotes, and the separators listed a chunk at a time; each
-//     record then takes five of them. A text field's length comes from its
-//     quote count, and the id, region and amount are decoded together in one
-//     vector. Sums go to the thread's own per-country totals. Names go through
+//     quotes, so the byte after a CRLF always starts a record. A record is
+//     read from its start: a 64-byte window gives masks of its quotes and of
+//     the commas outside quotes, so the ends of its id, name and note; one
+//     32-byte load after the note finds the region, amount and terminator. A
+//     text field's length comes from its quote count, and the id, region and
+//     amount are decoded together in one vector. Sums go to the thread's own per-country totals. Names go through
 //     a shared lock-free intern table to ids, which are marked in one bitset
 //     per country; both steps are prefetched records ahead. A mark that sets a
 //     new bit adds one to the country's distinct names.
@@ -37,6 +37,7 @@
 #include <vector>
 
 using u8 = uint8_t;
+using u16 = uint16_t;
 using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
@@ -69,9 +70,9 @@ T* zeroed(size_t n, bool huge = false) {
 // one thread's: threads faulting one at once would each get a page allocated,
 // all but one then freed.
 template <class T>
-void populate_share(T* p, size_t n, int t, int nthreads, size_t page = 4096, int advice = MADV_POPULATE_WRITE) {
+void populate_share(T* p, size_t n, int t, int nthreads, size_t page = 4096) {
     const size_t pages = (n * sizeof(T) + page - 1) / page, from = pages * t / nthreads, to = pages * (t + 1) / nthreads;
-    if (to > from) madvise(const_cast<char*>(reinterpret_cast<const char*>(p)) + from * page, (to - from) * page, advice);
+    if (to > from) madvise(reinterpret_cast<char*>(p) + from * page, (to - from) * page, MADV_POPULATE_WRITE);
 }
 
 // Map a file over a spare zero page, so 64-byte loads past its end are safe.
@@ -232,12 +233,39 @@ struct Numbers {
            u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, v)))) << 32;
 }
 
+// The first three commas outside quotes from p, a record's start: after the
+// id, the name and the note, 16 bits each in at; the quotes before the second
+// and third, 32 bits each in quotes. For the one record in ten whose note
+// ends past 64 bytes.
+struct Commas {
+    u64 at, quotes;
+};
+
+[[gnu::noinline]] Commas far_commas(const char* p) {
+    u64 carry = 0, at = 0, quotes = 0;
+    u32 seen = 0, got = 0;
+    for (u32 off = 0;; off += 64) {
+        __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + off));
+        __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + off + 32));
+        u64 q = mask64(lo, hi, '"');
+        u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0)) ^ carry;
+        carry = u64(i64(in) >> 63);
+        for (u64 sep = mask64(lo, hi, ',') & ~in; sep && got < 3; sep = _blsr_u64(sep), ++got) {
+            u32 x = __builtin_ctzll(sep);
+            at |= u64(off + x) << 16 * got;
+            if (got) quotes |= u64(seen + __builtin_popcountll(_bzhi_u64(q, x))) << 32 * (got - 1);
+        }
+        if (got == 3) return {at, quotes};
+        seen += __builtin_popcountll(q);
+    }
+}
+
 // Parse every record that starts in [p, end). A record's region row and name
 // slot are prefetched when it is parsed; LAG records later its country is
 // read, its sums go to totals, its name is looked up and that name's bitset
 // word prefetched; LAG records after that the name is marked. So each of the
 // three random reads (region table, name table, bitsets) has a steady lead.
-void parse_records(const char* p, const char* end, const char* file_end, const u8* country_of,
+void parse_records(const char* p, const char* end, const u8* country_of,
                    size_t regions, NameTable names, NamesSeen seen, Totals* totals) {
     constexpr u64 LAG = 16;
     struct Pending {
@@ -268,74 +296,59 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
         }
     };
 
-    // The file is read a chunk of 64-byte blocks at a time, each chunk from
-    // a record's start. A block is classified at once: a bit mask each of
-    // quotes, commas and LFs; the bytes inside quotes are those after an odd
-    // number of quotes, the prefix XOR of the quote mask (a carry-less
-    // multiply by all ones), carried from block to block (a "" pair turns
-    // quoting off and on again, so it needs no care). The separators, the
-    // commas and LFs outside quotes, go to an array in order, eight written
-    // per block whether there are that many or not; then the chunk's whole
-    // records are read from it, five separators each, and the next chunk
-    // starts at the first record not whole. A field's value is its bytes
-    // less one per quote pair, less the outer quotes of a quoted one: it has
-    // 2 + 2k quotes for k escapes, or none.
-    constexpr u32 CHUNK = 64;
-    u32 at[CHUNK * 64 + 9];  // separator offsets from the chunk's start
-    u64 qmask[CHUNK];
-    u32 qbefore[CHUNK];
+    // A record is read from its start: a 64-byte window gives a bit mask of
+    // its quotes and of its commas; the bytes inside quotes are those after
+    // an odd number of quotes, the prefix XOR of the quote mask (a carry-less
+    // multiply by all ones: a "" pair turns quoting off and on again, so it
+    // needs no care), and the first three commas outside them end the id,
+    // name and note. A field's value is its bytes less one per quote pair,
+    // less the outer quotes of a quoted one: it has 2 + 2k quotes for k
+    // escapes, or none. The rest, region and amount, holds no quotes and is
+    // at most 19 bytes with its terminator: one 32-byte load after the note
+    // finds its comma, its LF (or the end of the file, a zero byte) and a
+    // byte order mark after it.
+    if (p < end && u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
     while (p < end) {
-        const u32 blocks = std::min<u64>(CHUNK, (end - p + 63) / 64);
-        u32 seps = 0, quotes = 0;
-        u64 inside = 0;
-        for (u32 b = 0; b < blocks; ++b) {
-            const char* block = p + 64 * b;
-            _mm_prefetch(block + 2048, _MM_HINT_T0);
-            __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block));
-            __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(block + 32));
-            u64 q = mask64(lo, hi, '"');
-            u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0)) ^ inside;
-            inside = u64(i64(in) >> 63);
-            u64 m = (mask64(lo, hi, ',') | mask64(lo, hi, '\n')) & ~in;
-            qmask[b] = q;
-            qbefore[b] = quotes;
-            quotes += __builtin_popcountll(q);
-            u32 count = __builtin_popcountll(m), *out = at + seps;
-            for (int k = 0; k < 8; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
-            for (int k = 8; m; ++k) out[k] = 64 * b + __builtin_ctzll(m), m = _blsr_u64(m);
-            seps += count;
+        u32 f1, f2, f3, q2, q3;  // the three commas, and the quotes before the last two
+        __m256i lo = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        __m256i hi = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32));
+        u64 q = mask64(lo, hi, '"');
+        u64 in = _mm_cvtsi128_si64(_mm_clmulepi64_si128(_mm_cvtsi64_si128(q), _mm_set1_epi8(-1), 0));
+        u64 s1 = mask64(lo, hi, ',') & ~in, s2 = _blsr_u64(s1), s3 = _blsr_u64(s2);
+        if (s3) [[likely]] {
+            f1 = __builtin_ctzll(s1), f2 = __builtin_ctzll(s2), f3 = __builtin_ctzll(s3);
+            q2 = __builtin_popcountll(_bzhi_u64(q, f2)), q3 = __builtin_popcountll(_bzhi_u64(q, f3));
+        } else {
+            Commas c = far_commas(p);
+            f1 = u16(c.at), f2 = u16(c.at >> 16), f3 = u16(c.at >> 32), q2 = u32(c.quotes), q3 = u32(c.quotes >> 32);
         }
-        // The final record may end at end of file without a terminator.
-        if (p + 64 * blocks >= file_end) at[seps++] = file_end - p;
-        auto quotes_before = [&](u32 x) { return qbefore[x / 64] + __builtin_popcountll(_bzhi_u64(qmask[x / 64], x % 64)); };
-        const char* chunk = p;
-        for (u32 i = 0; i + 5 <= seps && p < end; i += 5) {
-            if (u8(*p) == 0xEF) p += 3;  // a byte order mark before the id
-            const char *f1 = chunk + at[i], *f2 = chunk + at[i + 1], *f3 = chunk + at[i + 2];
-            const char *f4 = chunk + at[i + 3], *eol = chunk + at[i + 4];
-            u32 q1 = quotes_before(at[i]), q2 = quotes_before(at[i + 1]), q3 = quotes_before(at[i + 2]);
-            u32 qname = q2 - q1, qnote = q3 - q2;
-            u32 name_field = f2 - f1 - 1, note_field = f3 - f2 - 1;
-            u32 quoted = qname != 0;
-            const char* name_at = f1 + 1 + quoted;
-            u32 name_raw = name_field - 2 * quoted;
-            u32 name_length = name_field - qname / 2 - quoted;
-            u32 note_length = note_field - qnote / 2 - (qnote != 0);
-            const char* amount = f4 + 1;
-            const char* amount_end = eol - (eol[-1] == '\r');
-            bool negative = *amount == '-';
-            Numbers num = numbers(p, f1, f3 + 1, f4, amount + negative, amount_end);
-            i64 cents = negative ? -i64(num.cents) : i64(num.cents);
+        // An id has no quotes, so the name's are those before f2.
+        u32 qname = q2, qnote = q3 - q2;
+        u32 name_field = f2 - f1 - 1, note_field = f3 - f2 - 1;
+        u32 quoted = qname != 0;
+        const char* name_at = p + f1 + 1 + quoted;
+        u32 name_raw = name_field - 2 * quoted;
+        u32 name_length = name_field - qname / 2 - quoted;
+        u32 note_length = note_field - qnote / 2 - (qnote != 0);
 
-            // Region ids are below 10^7 (fit u32); one past the table means none.
-            u32 r = num.region < regions ? num.region : u32(regions);
-            _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
-            advance();
-            u64 key = NameTable::key(name_at, name_raw);
-            pending[n++ % LAG] = {key, r, num.id, name_length, note_length, cents};
-            names.prefetch(key);
-            p = eol + 1;
-        }
+        const char* tail = p + f3 + 1;
+        __m256i t = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(tail));
+        auto bytes = [&](char c) { return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(t, _mm256_set1_epi8(c)))); };
+        u32 comma = __builtin_ctz(bytes(',')), e = __builtin_ctz(bytes('\n') | bytes(0));
+        u32 cr = _bzhi_u32(bytes('\r'), e) != 0, bom = u64(bytes(char(0xEF))) >> (e + 1) & 1;
+        const char* amount = tail + comma + 1;
+        bool negative = *amount == '-';
+        Numbers num = numbers(p, p + f1, tail, tail + comma, amount + negative, tail + e - cr);
+        i64 cents = negative ? -i64(num.cents) : i64(num.cents);
+
+        // Region ids are below 10^7 (fit u32); one past the table means none.
+        u32 r = num.region < regions ? num.region : u32(regions);
+        _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
+        advance();
+        u64 key = NameTable::key(name_at, name_raw);
+        pending[n++ % LAG] = {key, r, num.id, name_length, note_length, cents};
+        names.prefetch(key);
+        p = tail + e + 1 + 3 * bom;
     }
     for (last = n; n < last + 2 * LAG; ++n) advance();
 }
@@ -464,13 +477,13 @@ int main() {
                 // every 16 pages as the parse reaches them.
                 uintptr_t from = uintptr_t(records + cut[k]) & ~uintptr_t(4095);
                 madvise(reinterpret_cast<void*>(from), uintptr_t(records + cut[k + 1]) - from, MADV_POPULATE_READ);
-                parse_records(records + cut[k], records + cut[k + 1], records + size, country_of, nregions, names,
+                parse_records(records + cut[k], records + cut[k + 1], country_of, nregions, names,
                               seen, totals[t].data());
+                // The piece is not read again: its pages are unmapped now, by
+                // this thread, instead of all of the file's at exit by one.
+                uintptr_t to = uintptr_t(records + cut[k + 1]) & ~uintptr_t(4095);
+                if (to > from) madvise(reinterpret_cast<void*>(from), to - from, MADV_DONTNEED);
             });
-            // The file's pages are unmapped by all threads, a share each,
-            // instead of by one at exit. Once, after the parse: each call
-            // interrupts every other thread (a TLB shootdown).
-            populate_share(records, size, t, nthreads, 4096, MADV_DONTNEED);
         });
     for (auto& th : pool) th.join();
 
