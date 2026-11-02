@@ -98,7 +98,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 91 | Measurement only: step 89's code, the query parse kept as memory (a page per 4 us) and the serial setup after the sample as ten times its length in wait | run-d59c352f1a2a | 0.188 | 55.2 | 71.04 |
 | 92 | Queries read with the documents' 64-byte class masks; one vector probe for lookups and inserts; anchor starts in one pass | run-fa63626812c0 | 0.114 | 46.9 | 77.15 |
 | 93 | Terms numbered by class alone (a counting pass instead of a sort on class and sampled count); anchor records placed by counting | run-c7b706580cc0 | 0.116 | 46.9 | 77.02 |
-| 94 | Measurement only: step 93's code, the time to the scan's start kept as memory (a page per 4 us) and the answers added as five times their length in wait | pending | | | |
+| 94 | Measurement only: step 93's code, the time to the scan's start kept as memory (a page per 4 us) and the answers added as five times their length in wait | run-ca5cec96736f | 0.265 | 63.0 | 66.70 |
+| 95 | Measurement only: step 93's code with the answers written in one call, the time to the end of the term inserts kept as memory and the time from there to the sample's end added ten times as a wait | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -385,6 +386,10 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 93 on the board.** run-c7b706580cc0: 0.1157 s, against 0.1144 and 0.1154 s for step 92's code: within the spread, so the setup's 1 to 2 ms are not visible on their own.
 
 **Step 94** measures where the run goes now: step 93's code, with the time from the start of `main` to the start of the scan kept as memory (one touched 4 KB page per 4 us), and the time to answer the queries added before the exit as a wait five times as long.
+
+**Step 94 on the board.** run-ca5cec96736f: 0.2650 s and 63.0 MiB against 0.1157 s and 46.9 MiB. 16.1 MiB more is 4,120 pages, so the scan starts about 16.5 ms after `main` does; 149 ms more time, less about 5 ms for touching those 16 MB, is five times about 29 ms of answering. So of the box's 116 ms, about 16.5 go before the scan and about 29 to the answers: the scan and the building of the lists are near 60 ms, and the answers, which step 76 put at 18 ms, are now the largest single phase. The laptop's answers (about 16 ms) run twice as fast, near the ratio of the clocks.
+
+**Step 95** splits the 16.5 ms: step 93's code with the answers written through a 2 MB buffer in one call instead of 198 (no new lines), the time from the start of `main` to the end of the term inserts kept as memory, and the time from there to the end of the sample (mapping `docs.txt`, starting the eleven threads, sampling 1/64 of each share) added before the exit as ten times as long a wait.
 
 Tried for the answers and kept out: an AND or NOT of a list with a long list term of comparable length (10,083 operations, 29M documents, the largest single cost of answering at about 40% of the set operations' cycles) through a per-thread scratch bitmap marked straight from the term's stored stretches, filtered without a branch per document, and cleared word by word afterwards, instead of decoding the term into a vector and setting a fresh zeroed bitmap: 150M to 180M more instructions and the same cycles.
 
