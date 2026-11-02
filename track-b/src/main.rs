@@ -410,7 +410,7 @@ impl Units {
 fn main() {
     unsafe { mallopt(-3, 1 << 16) };
     let qtext = map("/data/queries.txt");
-    let n = (qtext.len() / 8).next_power_of_two().max(4);
+    let n = (qtext.len() / 16).next_power_of_two().max(4);
     // Mapped on its own and handed back after the scan. Every token's lookup
     // lands on a random line of it, so it is put on 2 MB pages (one TLB entry
     // instead of 512), faulted in before huge pages are turned off for the rest,

@@ -93,7 +93,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 86 | Back to step 80's code | run-26e4b60b0e60 | 0.139 | 44.7 | 75.58 |
 | 87 | Tokenizer rewritten around a linear hash buffer and a one-multiply hash; the per-document handler split into three short loops | run-152f40943619 | 0.141 | 45.3 | 75.32 |
 | 88 | Token ends found once per window, byte masks from a table, no mark prefetch, each anchor's first phrase in a prefetched 16-byte head | run-18961f21c438 | 0.128 | 45.1 | 76.23 |
-| 89 | The scan writes every list-term occurrence, with no per-term marks or counts; the lists are counted and deduplicated from its output | pending | | | |
+| 89 | The scan writes every list-term occurrence, with no per-term marks or counts; the lists are counted and deduplicated from its output | run-1406c8e99675 | 0.124 | 46.8 | 76.32 |
+| 90 | Term table of 1 MB instead of 2 MB (load 0.58) | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -360,6 +361,10 @@ A rewrite without posting lists was then built and measured, as the leader's 26 
 **Step 88 on the board.** Three runs of its code: run-1e5be3c9effb 0.1286 s, run-18961f21c438 0.1279 s (76.23, the best Track B run so far) and run-21f2d520c01d 0.1288 s, against 0.139 to 0.141 s for steps 86 and 87. The box answers to cache misses where it did not answer to instructions alone.
 
 **Step 89.** Counting the scan's work on the full data: 36.3M tokens, 16.5M of them bitmap terms and 11.0M list terms, of which 10.94M are new to their document. So the per-thread mark array (2 bytes per list term, 107 KB, read and written at a random place for every list-term token) removed 0.7% of the postings, and the per-term counts cost a second random update for each. Both are gone from the scan: it writes a unit for every list-term occurrence. Building the lists now takes two passes over each thread's 32 streams: the first counts each term's documents, skipping a repeat of the document just seen for that term (a term's units are in document order, so a repeat in a document follows its first), and the second writes them the same way; the table of last documents is one bucket's terms, 1,670 entries, in L1. On the laptop: instructions the same (5,164M), last-level misses 21.5M against 26.7M, L1 misses 102M against 118M, user cycles 6 to 10% fewer in two interleaved rounds. 693 counted lines. Same hash on all six datasets.
+
+**Step 89 on the board.** run-1406c8e99675: 0.1243 s against 0.128 s, 46.8 MiB (within the 45 to 47 MiB step 88's runs spread over), 76.32, the best Track B run so far.
+
+**Step 90.** The term table is sized from the query file at 16 bytes per slot instead of 8: 128K slots (1 MB) for the 75,747 terms instead of 256K. Step 46 found a 1 MB table 3% slower, when the tokenizer was bound by instructions; now that the box answers to misses, it is worth trying again: with the list marks gone from the scan, the table, the anchors' heads and the bitmap words fit a core's 1.25 MB L2 together. On the laptop: 35M more instructions (longer probes), last-level misses 17M against 21M to 23M, user cycles within noise. No change in lines. Same hash on all six datasets.
 
 ## What the profile said, step by step
 
