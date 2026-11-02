@@ -325,15 +325,14 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
             const char* amount_end = eol - (eol[-1] == '\r');
             bool negative = *amount == '-';
             Numbers num = numbers(p, f1, f3 + 1, f4, amount + negative, amount_end);
-            u64 id = num.id, region = num.region;
             i64 cents = negative ? -i64(num.cents) : i64(num.cents);
 
             // Region ids are below 10^7 (fit u32); one past the table means none.
-            u32 r = region < regions ? u32(region) : u32(regions);
+            u32 r = num.region < regions ? num.region : u32(regions);
             _mm_prefetch(reinterpret_cast<const char*>(country_of + r), _MM_HINT_T0);
             advance();
             u64 key = NameTable::key(name_at, name_raw);
-            pending[n++ % LAG] = {key, r, u32(id), name_length, note_length, cents};
+            pending[n++ % LAG] = {key, r, num.id, name_length, note_length, cents};
             names.prefetch(key);
             p = eol + 1;
         }
@@ -344,14 +343,14 @@ void parse_records(const char* p, const char* end, const char* file_end, const u
 // 15-bit code of a three-letter country; numeric order is alphabetical order.
 u32 code(const char* p) { return (p[0] - 'A') << 10 | (p[1] - 'A') << 5 | (p[2] - 'A'); }
 
-// The region line "id,ABC" at p, moving p to the next line. An id has at most
-// 7 digits, so the comma is the lowest zero byte of the line's first 8 bytes
-// XOR ','.
+// The region line "id,ABC" at p, moving p to the next line (the file has LF
+// endings and three-letter codes only, spec 2.3). An id has at most 7 digits,
+// so the comma is the lowest zero byte of the line's first 8 bytes XOR ','.
 std::pair<u64, u32> region_line(const char*& p) {
     u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2C;
     const char* comma = p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
     std::pair<u64, u32> line{digits(p, comma), code(comma + 1)};
-    for (p = comma + 4; *p++ != '\n';) {}
+    p = comma + 5;
     return line;
 }
 
