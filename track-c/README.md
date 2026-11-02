@@ -28,5 +28,5 @@ None. Standard library and compiler intrinsics only.
 
 ## With another 24 hours
 
-- Mark the bitsets without locked operations: give each thread a share of the countries and hand it the (country, name) pairs through per-thread queues. A probe of the cost of the lock is in PERF.md.
+- Mark the bitsets without locked operations: give each thread a share of the countries and hand it the (country, name) pairs through per-thread queues. A probe on the board (PERF.md step 38) puts the lock at 4.5% of the time, so this pays only if the queues cost well under that and the extra code stays small.
 - Memory: the leaders run under 7.35 MB, where the memory term is capped. That needs denser name ids (3.0 MB of bitsets instead of 3.9) and a packed region table (0.5 MB instead of 1), each of which cost time on the laptop.
