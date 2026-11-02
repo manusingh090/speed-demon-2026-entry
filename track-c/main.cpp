@@ -73,18 +73,13 @@ void populate_share(T* p, size_t n, int t, int nthreads, size_t page = 4096) {
 }
 
 // Map a file over a spare zero page, so 64-byte loads past its end are safe.
-// The mapping starts on a 2 MB boundary and asks for huge pages: where the
-// page cache holds the file in 2 MB folios, the kernel can then map each with
-// one entry instead of 512.
 const char* map_file(const char* path, size_t& size) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) die(path);
     size = lseek(fd, 0, SEEK_END);
     auto* p = static_cast<char*>(
-        mmap(nullptr, size + 4096 + HUGE_PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
-    p = reinterpret_cast<char*>((uintptr_t(p) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
+        mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) die("mmap");
-    madvise(p, size, MADV_HUGEPAGE);
     close(fd);
     return p;
 }
